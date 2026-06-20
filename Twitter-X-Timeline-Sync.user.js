@@ -14,7 +14,7 @@
 // @description:ko Twitter/X에서 마지막 읽기 위치를 추적하고 동기화합니다. 수동 및 자동 옵션 포함. 새로운 게시물을 확인하면서 현재 위치를 잃지 않도록 이상적입니다. 트윗 ID를 사용하여 정확한 위치 지정을 하고, 리포스트를 지원합니다。
 // @icon https://x.com/favicon.ico
 // @namespace https://github.com/Copiis/x-timeline-sync
-// @version 2026.6.15j
+// @version 2026.6.20a
 // @author Copiis
 // @license MIT
 // @match https://x.com/*
@@ -735,6 +735,52 @@
     // === UI / Activation Control ===
     let isScriptActivated = false;
     let popup = null;
+
+    function dismissActionPopup() {
+        if (popup && popup.parentNode) {
+            popup.parentNode.removeChild(popup);
+        }
+        popup = null;
+    }
+
+    function showActionPopup(messageKey, params = {}) {
+        const lang = getUserLanguage();
+        const message = getTranslatedMessage(messageKey, lang, params);
+
+        if (!popup) {
+            popup = document.createElement('div');
+            Object.assign(popup.style, {
+                position: 'fixed',
+                top: '20px',
+                left: '50%',
+                transform: 'translateX(-50%)',
+                backgroundColor: 'rgba(0, 0, 0, 0.9)',
+                color: '#ffffff',
+                padding: '10px 20px',
+                borderRadius: '8px',
+                fontSize: '14px',
+                boxShadow: '0 0 10px rgba(246, 146, 25, 0.8)',
+                zIndex: '10000',
+                maxWidth: '500px',
+                whiteSpace: 'pre-wrap',
+                transition: 'opacity 0.3s ease',
+                opacity: '0'
+            });
+            if (document.body) {
+                document.body.appendChild(popup);
+                setTimeout(() => { if (popup) popup.style.opacity = '1'; }, 50);
+            }
+        }
+
+        if (popup) {
+            popup.textContent = message;
+        }
+        return popup;
+    }
+
+    function updateActionPopup(messageKey, params = {}) {
+        return showActionPopup(messageKey, params);
+    }
     let pendingNewPosts = 0;
     let currentPost = null;   // wird aktuell kaum genutzt
 
@@ -781,7 +827,8 @@
     const AUTO_DOWNLOAD_KEY = 'autoDownloadEnabled';
     let autoDownloadEnabled = GM_getValue(AUTO_DOWNLOAD_KEY, false);
 
-    async function saveLastReadPost(postData) {
+    async function saveLastReadPost(postData, options = {}) {
+    const { force = false } = options;
     if (!postData || !postData.account || !postData.tweetId) {
         log('Save', 'Ungültige Daten – Speichern abgebrochen', postData);
         return;
@@ -790,7 +837,7 @@
     const storageKey = STORAGE_KEY(postData.account);
 
     const currentDataStr = GM_getValue(storageKey, null);
-    if (currentDataStr) {
+    if (!force && currentDataStr) {
         try {
             const current = JSON.parse(currentDataStr);
             if (current && current.tweetId) {
@@ -1364,7 +1411,22 @@
 
     window.addEventListener('load', initializeWhenDOMReady);
 
-    function updateHighlightedPost() {
+    function applyHighlightToPost(postElement) {
+        if (!postElement || !postElement.isConnected) return false;
+        if (lastHighlightedPost && lastHighlightedPost !== postElement) {
+            lastHighlightedPost.style.boxShadow = 'none';
+        }
+        postElement.style.boxShadow = '0 0 20px 10px rgba(246, 146, 25, 0.9)';
+        lastHighlightedPost = postElement;
+        return true;
+    }
+
+    function updateHighlightedPost(preferredElement = null) {
+        if (preferredElement && applyHighlightToPost(preferredElement)) {
+            debugLog('Highlight', 'Glühender Rand auf bevorzugtes Element gesetzt');
+            return;
+        }
+
         if (!lastReadPost || !lastReadPost.tweetId || !lastReadPost.authorHandler) {
             debugLog('Highlight', 'Keine gültige Leseposition für Rahmen.');
             return;
@@ -1375,15 +1437,47 @@
             return tweetId === lastReadPost.tweetId && author === lastReadPost.authorHandler;
         });
         if (lastReadElement) {
-            if (lastHighlightedPost && lastHighlightedPost !== lastReadElement) {
-                lastHighlightedPost.style.boxShadow = 'none';
-            }
-            lastReadElement.style.boxShadow = '0 0 20px 10px rgba(246, 146, 25, 0.9)';
-            lastHighlightedPost = lastReadElement;
+            applyHighlightToPost(lastReadElement);
             debugLog('Highlight', 'Glühender Rand auf Leseposition gesetzt');
+        } else if (lastHighlightedPost && lastHighlightedPost.isConnected) {
+            debugLog('Highlight', 'Leseposition nicht per ID im DOM, behalte aktuellen Rahmen');
         } else {
             debugLog('Highlight', 'Leseposition nicht im DOM, Rahmen nicht gesetzt');
         }
+    }
+
+    async function adoptFallbackPost(postElement) {
+        if (!postElement) return;
+
+        const account = await getCurrentUserHandle();
+        const tweetId = getPostTweetId(postElement);
+        const authorHandler = getPostAuthorHandler(postElement);
+        const timestamp = getPostTimestamp(postElement);
+        const repostFlag = isRepost(postElement);
+
+        if (!tweetId || !authorHandler || !timestamp) {
+            log('Fallback', 'Konnte Fallback-Post nicht übernehmen – unvollständige Daten');
+            applyHighlightToPost(postElement);
+            return;
+        }
+
+        lastReadPost = {
+            account,
+            tweetId,
+            authorHandler,
+            timestamp,
+            isRepost: repostFlag,
+            readAt: repostFlag ? new Date().toISOString() : undefined,
+            adoptedFromFallback: true
+        };
+        if (repostFlag && !lastReadPost.readAt) {
+            lastReadPost.readAt = lastReadPost.timestamp;
+        }
+
+        applyHighlightToPost(postElement);
+        await saveLastReadPost(lastReadPost, { force: true });
+        activateRestoreSuppression(tweetId);
+        log('Fallback', `Lesestelle übernommen: @${authorHandler} ${tweetId}`);
     }
 
     function activateRestoreSuppression(tweetId) {
@@ -1941,10 +2035,12 @@
             scrollState.stagnantScrollCount++;
             if (scrollState.stagnantScrollCount > CONFIG.MAX_STAGNANT_SCROLLS) {
                 log('Search', 'Suche abgebrochen: Keine neuen Posts nach Stagnation (MAX_STAGNANT_SCROLLS).');
-                showPopup('tweetIdNotFound', 5000);
-                findAndSetClosestPost();
                 searchControl.isSearching = false;
-                if (popup) popup.remove();
+                updateActionPopup('tweetIdNotFound', {
+                    authorHandler: lastReadPost?.authorHandler,
+                    tweetId: lastReadPost?.tweetId
+                });
+                findAndSetClosestPost();
 
                 // Sicherer Cleanup über Callback (vermeidet ReferenceError auf lokale Variablen)
                 if (typeof onStagnationCleanup === 'function') {
@@ -1975,9 +2071,21 @@
      */
     function shouldAbortSearch(reason = '', currentScrollCount = 0, onCleanup = null) {
         const logPrefix = reason ? `[${reason}] ` : '';
-        const doCleanup = () => {
+        const doCleanup = (dismissPopup = true) => {
             searchControl.isSearching = false;
-            if (popup) popup.remove();
+            if (dismissPopup) dismissActionPopup();
+            if (typeof onCleanup === 'function') {
+                try { onCleanup(); } catch (e) { /* ignore cleanup errors */ }
+            }
+        };
+
+        const startFallbackSearch = () => {
+            searchControl.isSearching = false;
+            updateActionPopup('tweetIdNotFound', {
+                authorHandler: lastReadPost?.authorHandler,
+                tweetId: lastReadPost?.tweetId
+            });
+            findAndSetClosestPost();
             if (typeof onCleanup === 'function') {
                 try { onCleanup(); } catch (e) { /* ignore cleanup errors */ }
             }
@@ -1985,29 +2093,25 @@
 
         if (searchControl.isSearchCancelled) {
             debugLog('Search', `${logPrefix}Suche abgebrochen durch Benutzer.`);
-            doCleanup();
+            doCleanup(true);
             return true;
         }
 
         if (!searchControl.isSearching) {
             debugLog('Search', `${logPrefix}Suche bereits beendet.`);
-            doCleanup();
+            doCleanup(true);
             return true;
         }
 
         if (currentScrollCount > CONFIG.MAX_SCROLL_ATTEMPTS) {
             log('Search', `${logPrefix}Maximale Scroll-Versuche erreicht, starte Fallback.`);
-            showPopup('tweetIdNotFound', 5000);
-            findAndSetClosestPost();
-            doCleanup();
+            startFallbackSearch();
             return true;
         }
 
         if (scrollState.totalLoadedPosts > CONFIG.MAX_LOADED_POSTS_BEFORE_FALLBACK) {
             debugLog('Search', `${logPrefix}Über ${CONFIG.MAX_LOADED_POSTS_BEFORE_FALLBACK} Posts geladen – Suche abgebrochen.`);
-            showPopup('tweetIdNotFound', 5000);
-            findAndSetClosestPost();
-            doCleanup();
+            startFallbackSearch();
             return true;
         }
 
@@ -2136,7 +2240,7 @@
                     }
 
                     searchControl.isSearching = false;
-                    if (popup) popup.remove();
+                    dismissActionPopup();
                     window.removeEventListener('keydown', handleSpaceKey);
                     io.disconnect();
                 }
@@ -2146,11 +2250,11 @@
     function handleSpaceKey(event) {
         if (event.code === 'Space' && (searchControl.isSearching || searchControl.isFallbackSearching)) {
             searchControl.isSearchCancelled = true;
+            dismissActionPopup();
             showPopup('fallbackSearchCancelled', 5000);
             debugLog('Search', 'Suche gestoppt durch Benutzer.');
             searchControl.isSearching = false;
             searchControl.isFallbackSearching = false;
-            if (popup) popup.remove();
             window.removeEventListener('keydown', handleSpaceKey);
             io.disconnect();
         }
@@ -2218,7 +2322,7 @@
                 }
 
                 searchControl.isSearching = false;
-                if (popup) popup.remove();
+                dismissActionPopup();
                 window.removeEventListener('keydown', handleSpaceKey);
                 io.disconnect();
                 found = true;
@@ -2252,10 +2356,12 @@
                 debugLog('Search', 'Lesestelle älter als geladene Posts → Phase 2 (nach unten)');
             } else if (scrollState.hasCompletedCycle && scrollState.scrollCyclePhase === 2) {
                 debugLog('Search', 'Zyklus abgeschlossen, keine passende Position gefunden.');
-                showPopup('tweetIdNotFound', 5000);
-                findAndSetClosestPost();
                 searchControl.isSearching = false;
-                if (popup) popup.remove();
+                updateActionPopup('tweetIdNotFound', {
+                    authorHandler: lastReadPost?.authorHandler,
+                    tweetId: lastReadPost?.tweetId
+                });
+                findAndSetClosestPost();
                 window.removeEventListener('keydown', handleSpaceKey);
                 io.disconnect();
                 return;
@@ -2357,11 +2463,12 @@
     return step;
 }
 
-    function scrollToPostWithHighlight(post) {
+    function scrollToPostWithHighlight(post, onComplete = null) {
     if (!post) {
         log('Search', 'Kein Beitrag zum Scrollen.');
         searchControl.isSearching = false;
         searchControl.isFallbackSearching = false;
+        if (onComplete) onComplete();
         return;
     }
     searchControl.isAutoScrolling = true;
@@ -2397,11 +2504,7 @@
 
         debugLog('Position', `rect.top:${rect.top} scrollY:${scrollY} targetY:${targetY} Versuch:${positionAttempts+1}`);
 
-        if (lastHighlightedPost && lastHighlightedPost !== post) {
-            lastHighlightedPost.style.boxShadow = 'none';
-        }
-        post.style.boxShadow = '0 0 20px 10px rgba(246, 146, 25, 0.9)';
-        lastHighlightedPost = post;
+        applyHighlightToPost(post);
 
         window.scrollTo({ top: targetY, behavior: 'smooth' });
 
@@ -2412,7 +2515,8 @@
             if (deviation <= CONFIG.POSITION_CORRECTION_TOLERANCE) {
                 debugLog('Position', `Beitrag auf ${offset}px positioniert (gut).`);
                 searchControl.isAutoScrolling = false;
-                updateHighlightedPost();
+                updateHighlightedPost(post);
+                if (onComplete) onComplete();
             } else if (positionAttempts < maxPositionAttempts - 1) {
                 positionAttempts++;
                 const correction = (newRect.top - offset) * 0.8;
@@ -2421,9 +2525,9 @@
                 setTimeout(tryPositionPost, 550);
             } else {
                 log('Position', 'Maximale Positionierungsversuche erreicht. rect.top:', newRect.top);
-                showPopup('postDeletedFallback', 5000);
                 searchControl.isAutoScrolling = false;
-                updateHighlightedPost();
+                updateHighlightedPost(post);
+                if (onComplete) onComplete();
             }
         }, 850);
     };
@@ -2453,7 +2557,14 @@
 
     const targetTime = new Date(lastReadPost.timestamp).getTime();
     const targetId = BigInt(lastReadPost.tweetId);
-    popup = createSearchPopup(lastReadPost);
+    if (!popup) {
+        popup = createSearchPopup(lastReadPost);
+    } else {
+        updateActionPopup('tweetIdNotFound', {
+            authorHandler: lastReadPost.authorHandler,
+            tweetId: lastReadPost.tweetId
+        });
+    }
     if (!popup) {
         log('Search', 'Popup konnte nicht erstellt werden.');
         searchControl.isFallbackSearching = false;
@@ -2463,11 +2574,11 @@
     function handleSpaceKey(event) {
         if (event.code === 'Space' && (searchControl.isSearching || searchControl.isFallbackSearching)) {
             searchControl.isSearchCancelled = true;
+            dismissActionPopup();
             showPopup('fallbackSearchCancelled', 5000);
             debugLog('Fallback', 'Suche gestoppt durch Benutzer.');
             searchControl.isSearching = false;
             searchControl.isFallbackSearching = false;
-            if (popup) popup.remove();
             window.removeEventListener('keydown', handleSpaceKey);
         }
     }
@@ -2480,7 +2591,7 @@
         if (searchControl.isSearchCancelled) {
             debugLog('Fallback', 'Suche abgebrochen durch Benutzer.');
             searchControl.isFallbackSearching = false;
-            if (popup) popup.remove();
+            dismissActionPopup();
             window.removeEventListener('keydown', handleSpaceKey);
             return;
         }
@@ -2541,13 +2652,7 @@
                 bringAttempts++;
             }
 
-            // Jetzt ist der Post deutlich näher.
-            // Statt nur einmal scrollToPostWithHighlight aufzurufen, machen wir eine dedizierte finale Zentrierungs-Phase.
-            // Das gibt uns mehr Kontrolle und reduziert "Sprung und dann Stopp ohne gute Position".
-            scrollToPostWithHighlight(closest.element);
-
-            // Zusätzliche finale Feinjustierung, falls nach dem ersten Aufruf noch nicht gut genug zentriert
-            await new Promise(resolve => setTimeout(resolve, 1200)); // Warte auf Abschluss des vorherigen Scrolls + Layout
+            await new Promise(resolve => scrollToPostWithHighlight(closest.element, resolve));
 
             let finalAttempts = 0;
             const maxFinalAttempts = 4;
@@ -2556,20 +2661,21 @@
                 const finalDeviation = Math.abs(finalRect.top - CONFIG.RESTORE_SCROLL_OFFSET);
 
                 if (finalDeviation <= 40) {
-                    break; // Gut genug
+                    break;
                 }
 
-                // Kleiner Korrektur-Scroll
                 const correction = (finalRect.top - CONFIG.RESTORE_SCROLL_OFFSET) * 0.7;
                 window.scrollBy({ top: -correction, behavior: 'smooth' });
                 await new Promise(resolve => setTimeout(resolve, 700));
                 finalAttempts++;
             }
 
+            await adoptFallbackPost(closest.element);
+
             log('Search', `Zeitlich nächsten Post gefunden (Diff: ${Math.round(timeDiff / 60000)} min) — Fallback.`);
-            showPopup('postDeletedFallback', 5000);
+            dismissActionPopup();
+            showPopup('postDeletedFallback', 8000);
             searchControl.isFallbackSearching = false;
-            if (popup) popup.remove();
             window.removeEventListener('keydown', handleSpaceKey);
             return;
         }
@@ -2587,52 +2693,22 @@
     }
 
     log('Search', 'Maximale Versuche erreicht, keine passende Position gefunden.');
-    showPopup('tweetIdNotFound', 5000);
+    dismissActionPopup();
+    showPopup('tweetIdNotFound', 8000);
     searchControl.isFallbackSearching = false;
-    if (popup) popup.remove();
     window.removeEventListener('keydown', handleSpaceKey);
 }
 
     function createSearchPopup(position) {
-    const lang = getUserLanguage();
-    const message = getTranslatedMessage(searchControl.isFallbackSearching ? 'tweetIdNotFound' : 'searchPopup', lang, { authorHandler: position.authorHandler, tweetId: position.tweetId });
-
-    let localPopup = document.createElement('div');
-    localPopup.style.position = 'fixed';
-    localPopup.style.top = '20px';
-    localPopup.style.left = '50%';
-    localPopup.style.transform = 'translateX(-50%)';
-    localPopup.style.backgroundColor = 'rgba(0, 0, 0, 0.9)';
-    localPopup.style.color = '#ffffff';
-    localPopup.style.padding = '10px 20px';
-    localPopup.style.borderRadius = '8px';
-    localPopup.style.fontSize = '14px';
-    localPopup.style.boxShadow = '0 0 10px rgba(246, 146, 25, 0.8)';
-    localPopup.style.zIndex = '10000';
-    localPopup.style.transition = 'opacity 1s ease';
-    localPopup.style.opacity = '0';
-    localPopup.textContent = message;
-
-    if (document.body) {
-        document.body.appendChild(localPopup);
-        setTimeout(() => { localPopup.style.opacity = '1'; }, 100);
-
-        setTimeout(() => {
-            if (localPopup) {
-                localPopup.style.opacity = '0';
-                setTimeout(() => {
-                    if (localPopup && localPopup.parentNode) {
-                        localPopup.parentNode.removeChild(localPopup);
-                    }
-                }, 1200);
-            }
-        }, 5000);
-
-        return localPopup;
-    } else {
+    const messageKey = searchControl.isFallbackSearching ? 'tweetIdNotFound' : 'searchPopup';
+    const actionPopup = showActionPopup(messageKey, {
+        authorHandler: position.authorHandler,
+        tweetId: position.tweetId
+    });
+    if (!actionPopup) {
         log('Search', 'document.body nicht verfügbar für createSearchPopup.');
-        return null;
     }
+    return actionPopup;
 }
 
     function isNearTimelineTop() {
