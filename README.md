@@ -9,7 +9,7 @@ Userscript für Tampermonkey — Leseposition auf X/Twitter synchronisieren.
 Raw-URL (GreasyFork Code-Synchronisation + direkte Installation):
 
 ```
-https://raw.githubusercontent.com/Copiis/x-timeline-sync/main/Twitter-X-Timeline-Sync.user.js
+https://raw.githubusercontent.com/Copiis/x-timeline-sync/master/Twitter-X-Timeline-Sync.user.js
 ```
 
 ## Entwicklung
