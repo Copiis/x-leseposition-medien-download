@@ -14,7 +14,7 @@
 // @description:ko Twitter/X에서 마지막 읽기 위치를 추적하고 동기화합니다. 수동 및 자동 옵션 포함. 새로운 게시물을 확인하면서 현재 위치를 잃지 않도록 이상적입니다. 트윗 ID를 사용하여 정확한 위치 지정을 하고, 리포스트를 지원합니다。
 // @icon https://x.com/favicon.ico
 // @namespace https://github.com/Copiis/x-timeline-sync
-// @version 2026.6.20c
+// @version 2026.6.20d
 // @author Copiis
 // @license MIT
 // @match https://x.com/*
@@ -1414,14 +1414,43 @@
         if (!postElement || !postElement.isConnected) return false;
         if (lastHighlightedPost && lastHighlightedPost !== postElement) {
             lastHighlightedPost.style.boxShadow = 'none';
+            lastHighlightedPost.style.outline = 'none';
         }
-        postElement.style.boxShadow = '0 0 20px 10px rgba(246, 146, 25, 0.9)';
+        const glow = '0 0 20px 10px rgba(246, 146, 25, 0.9)';
+        postElement.style.setProperty('box-shadow', glow, 'important');
+        postElement.style.setProperty('outline', '3px solid rgba(246, 146, 25, 0.95)', 'important');
         lastHighlightedPost = postElement;
         return true;
     }
 
+    function resolveFreshPostElement(postElement, tweetId = null, authorHandler = null) {
+        if (postElement && postElement.isConnected) return postElement;
+        const id = tweetId || (postElement ? getPostTweetId(postElement) : null);
+        const author = authorHandler || (postElement ? getPostAuthorHandler(postElement) : null);
+        return findPostElementInDOM(id, author);
+    }
+
+    function scheduleHighlightRetries(tweetId, authorHandler, delays = [0, 300, 900, 2000]) {
+        delays.forEach(delay => {
+            setTimeout(() => {
+                const el = findPostElementInDOM(tweetId, authorHandler);
+                if (el) {
+                    applyHighlightToPost(el);
+                    debugLog('Highlight', `Rahmen gesetzt (Retry nach ${delay}ms)`);
+                }
+            }, delay);
+        });
+    }
+
     function updateHighlightedPost(preferredElement = null) {
-        if (preferredElement && applyHighlightToPost(preferredElement)) {
+        const freshPreferred = preferredElement
+            ? resolveFreshPostElement(
+                preferredElement,
+                getPostTweetId(preferredElement),
+                getPostAuthorHandler(preferredElement)
+            )
+            : null;
+        if (freshPreferred && applyHighlightToPost(freshPreferred)) {
             debugLog('Highlight', 'Glühender Rand auf bevorzugtes Element gesetzt');
             return;
         }
@@ -1430,11 +1459,7 @@
             debugLog('Highlight', 'Keine gültige Leseposition für Rahmen.');
             return;
         }
-        const lastReadElement = Array.from(document.querySelectorAll('article')).find(post => {
-            const tweetId = getPostTweetId(post);
-            const author = getPostAuthorHandler(post);
-            return tweetId === lastReadPost.tweetId && author === lastReadPost.authorHandler;
-        });
+        const lastReadElement = findPostElementInDOM(lastReadPost.tweetId, lastReadPost.authorHandler);
         if (lastReadElement) {
             applyHighlightToPost(lastReadElement);
             debugLog('Highlight', 'Glühender Rand auf Leseposition gesetzt');
@@ -1473,9 +1498,14 @@
             lastReadPost.readAt = lastReadPost.timestamp;
         }
 
-        applyHighlightToPost(postElement);
+        const freshElement = resolveFreshPostElement(postElement, tweetId, authorHandler);
+        if (freshElement) {
+            applyHighlightToPost(freshElement);
+        }
+
         await saveLastReadPost(lastReadPost, { force: true });
         activateRestoreSuppression(tweetId);
+        scheduleHighlightRetries(tweetId, authorHandler);
         log('Fallback', `Lesestelle übernommen: @${authorHandler} ${tweetId}`);
     }
 
@@ -1795,6 +1825,18 @@
         const href = linkElement.getAttribute('href');
         const match = href.match(/\/status\/(\d+)/);
         return match ? match[1] : null;
+    }
+
+    function findPostElementInDOM(tweetId, authorHandler = null) {
+        if (!tweetId) return null;
+        return Array.from(document.querySelectorAll('article')).find(post => {
+            const id = getPostTweetId(post);
+            if (id !== tweetId) return false;
+            if (authorHandler) {
+                return getPostAuthorHandler(post) === authorHandler;
+            }
+            return true;
+        }) || null;
     }
 
     function getPostTimestamp(post) {
@@ -2470,9 +2512,12 @@
         if (onComplete) onComplete();
         return;
     }
+    const anchorTweetId = getPostTweetId(post);
+    const anchorAuthor = getPostAuthorHandler(post);
     searchControl.isAutoScrolling = true;
     const maxPositionAttempts = CONFIG.MAX_POSITION_ATTEMPTS;
     let positionAttempts = 0;
+    let lastMeasuredTop = null;
     const tryPositionPost = () => {
         // Special handling for the very first attempt: do a rough bring-into-view first.
         // This dramatically improves success rate when the post is still far away after the fallback's searching jumps.
@@ -2495,38 +2540,55 @@
         doPrecisePositioning();
     };
 
+    const finishPositioning = (reason) => {
+        debugLog('Position', reason);
+        searchControl.isAutoScrolling = false;
+        const freshPost = resolveFreshPostElement(post, anchorTweetId, anchorAuthor);
+        updateHighlightedPost(freshPost || post);
+        if (onComplete) onComplete();
+    };
+
     const doPrecisePositioning = () => {
-        const rect = post.getBoundingClientRect();
+        const activePost = resolveFreshPostElement(post, anchorTweetId, anchorAuthor) || post;
+        const rect = activePost.getBoundingClientRect();
         const scrollY = window.scrollY;
         const offset = CONFIG.RESTORE_SCROLL_OFFSET;
         const targetY = scrollY + rect.top - offset;
 
         debugLog('Position', `rect.top:${rect.top} scrollY:${scrollY} targetY:${targetY} Versuch:${positionAttempts+1}`);
 
-        applyHighlightToPost(post);
+        applyHighlightToPost(activePost);
+
+        // Post bereits am/über dem Ziel (z. B. rect.top=0) → nicht weiter nach oben scrollen
+        if (rect.top <= offset) {
+            finishPositioning(`Beitrag bereits nah am Ziel (rect.top=${rect.top}, Ziel=${offset}px).`);
+            return;
+        }
 
         window.scrollTo({ top: targetY, behavior: 'smooth' });
 
         setTimeout(() => {
-            const newRect = post.getBoundingClientRect();
+            const freshPost = resolveFreshPostElement(post, anchorTweetId, anchorAuthor) || post;
+            const newRect = freshPost.getBoundingClientRect();
             const deviation = Math.abs(newRect.top - offset);
+            const isWellPositioned = deviation <= CONFIG.POSITION_CORRECTION_TOLERANCE
+                || newRect.top <= offset;
+            const isStuckAtTop = lastMeasuredTop !== null
+                && Math.abs(newRect.top - lastMeasuredTop) < 2
+                && newRect.top <= offset + 5;
 
-            if (deviation <= CONFIG.POSITION_CORRECTION_TOLERANCE) {
-                debugLog('Position', `Beitrag auf ${offset}px positioniert (gut).`);
-                searchControl.isAutoScrolling = false;
-                updateHighlightedPost(post);
-                if (onComplete) onComplete();
+            if (isWellPositioned || isStuckAtTop) {
+                finishPositioning(`Beitrag positioniert (rect.top=${newRect.top}, Ziel=${offset}px).`);
             } else if (positionAttempts < maxPositionAttempts - 1) {
                 positionAttempts++;
+                lastMeasuredTop = newRect.top;
                 const correction = (newRect.top - offset) * 0.8;
                 window.scrollBy({ top: -correction, behavior: 'smooth' });
                 debugLog('Position', `Korrigiere um ${-correction}px (Versuch ${positionAttempts+1})`);
                 setTimeout(tryPositionPost, 550);
             } else {
                 log('Position', 'Maximale Positionierungsversuche erreicht. rect.top:', newRect.top);
-                searchControl.isAutoScrolling = false;
-                updateHighlightedPost(post);
-                if (onComplete) onComplete();
+                finishPositioning('Positionierung mit Toleranz abgeschlossen.');
             }
         }, 850);
     };
@@ -2651,15 +2713,21 @@
                 bringAttempts++;
             }
 
+            const fallbackTweetId = closest.tweetId;
+            const fallbackAuthor = closest.authorHandler;
+
             await new Promise(resolve => scrollToPostWithHighlight(closest.element, resolve));
 
             let finalAttempts = 0;
             const maxFinalAttempts = 4;
             while (finalAttempts < maxFinalAttempts) {
-                const finalRect = closest.element.getBoundingClientRect();
+                const freshClosest = resolveFreshPostElement(closest.element, fallbackTweetId, fallbackAuthor);
+                if (!freshClosest) break;
+
+                const finalRect = freshClosest.getBoundingClientRect();
                 const finalDeviation = Math.abs(finalRect.top - CONFIG.RESTORE_SCROLL_OFFSET);
 
-                if (finalDeviation <= 40) {
+                if (finalDeviation <= CONFIG.FALLBACK_POSITION_TOLERANCE || finalRect.top <= CONFIG.RESTORE_SCROLL_OFFSET) {
                     break;
                 }
 
@@ -2669,7 +2737,8 @@
                 finalAttempts++;
             }
 
-            await adoptFallbackPost(closest.element);
+            const freshFallbackElement = resolveFreshPostElement(closest.element, fallbackTweetId, fallbackAuthor);
+            await adoptFallbackPost(freshFallbackElement || closest.element);
 
             log('Search', `Zeitlich nächsten Post gefunden (Diff: ${Math.round(timeDiff / 60000)} min) — Fallback.`);
             dismissActionPopup();
