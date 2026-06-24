@@ -14,7 +14,7 @@
 // @description:ko Twitter/X에서 마지막 읽기 위치를 추적하고 동기화합니다. 수동 및 자동 옵션 포함. 새로운 게시물을 확인하면서 현재 위치를 잃지 않도록 이상적입니다. 트윗 ID를 사용하여 정확한 위치 지정을 하고, 리포스트를 지원합니다。
 // @icon https://x.com/favicon.ico
 // @namespace https://github.com/Copiis/x-timeline-sync
-// @version 2026.6.20d
+// @version 2026.6.24a
 // @author Copiis
 // @license MIT
 // @match https://x.com/*
@@ -73,9 +73,9 @@
         MAX_SEARCH_STEP_VH: 3.8,             // Deutlich größere Sprünge erlaubt für weit entfernte Lesestellen (vorher zu konservativ)
     };
 
-        function isRepost(postElement) {
-        if (!postElement) return false;
+    const repostCache = new WeakMap();
 
+    function detectRepost(postElement) {
         // Flexibleres Pattern: Matcht charakteristische Teile des Repost-Icon-Pfads
         // (X ändert die exakte minifizierte Form gelegentlich)
         const repostPathPattern = /M4\.75 3\.79l4\.603.*zm11\.5 2\.71H11V4h5\.25|repost-arrow|repost-icon/i;
@@ -151,6 +151,14 @@
         }
 
         return false;
+    }
+
+    function isRepost(postElement) {
+        if (!postElement) return false;
+        if (repostCache.has(postElement)) return repostCache.get(postElement);
+        const result = detectRepost(postElement);
+        repostCache.set(postElement, result);
+        return result;
     }
 
     function getReposterHandler(postElement) {
@@ -1783,7 +1791,7 @@
     }
 
     function getTopVisiblePost() {
-  const posts = document.querySelectorAll("article[data-testid='tweet'], div[data-testid='cellInnerDiv']");
+  const posts = document.querySelectorAll("article[data-testid='tweet']");
   let topPost = null;
   let minTop = Infinity;
   const vh = window.innerHeight || document.documentElement.clientHeight;
@@ -1792,6 +1800,7 @@
   for (let i = 0; i < posts.length; i++) {
     const post = posts[i];
     const rect = post.getBoundingClientRect();
+    if (rect.height < 5) continue; // leere/virtualisierte Platzhalter überspringen
     let effectiveTop = rect.top;
 
     // Spezialbehandlung für Antworten (Replies):
@@ -2827,11 +2836,34 @@
 
     function getNewPostsIndicator() {
 
+    const postIndicatorPattern = /\b(new posts|neue posts(?:\s+sehen)?|neue posts sind verfügbar|neue Beiträge|nouveaux tweets|nuevos tweets|新しい投稿|Новые посты|novos posts|منشورات جديدة|nuovi post|새 게시물|new tweets|post anzeigen|posts anzeigen|show \d+ post|show \d+ posts)\b/i;
+    const excludePattern = /\b(teilen|share|posten|veröffentlichen|grok)\b/i;
+
+    const matchesNewPostsText = (text) => {
+        const normalized = (text || '').toLowerCase().trim();
+        return postIndicatorPattern.test(normalized) && !excludePattern.test(normalized);
+    };
+
+    // Live-Crawl 06/2026: Pill-Button mit data-testid="pillLabel" + „Neue Posts sehen“
+    const pillLabel = document.querySelector('[data-testid="pillLabel"]');
+    if (pillLabel) {
+        const btn = pillLabel.closest('button, [role="button"]');
+        if (btn && btn.dataset.processed !== 'true') {
+            const combined = ((pillLabel.textContent || '') + ' ' + (btn.getAttribute('aria-label') || '')).trim();
+            if (matchesNewPostsText(combined)) {
+                const numMatch = combined.match(/(\d+)/);
+                pendingNewPosts = numMatch ? parseInt(numMatch[1], 10) : 1;
+                return btn;
+            }
+        }
+    }
+
     const selectors = [
         'button[data-testid*="new-tweets"], button[data-testid*="new-posts"]',
+        'button[aria-label*="Neue Posts"], button[aria-label*="neue Posts"], button[aria-label*="new posts"], button[aria-label*="neue Beiträge"]',
         'div[data-testid="cellInnerDiv"] button[role="button"][class*="css-175oi2r r-1777fci"]',
         'button[role="button"][class*="css-175oi2r"]',
-        'button[aria-label*="new posts"], button[aria-label*="neue Beiträge"], button[aria-label*="nouveaux tweets"], button[aria-label*="nuevos tweets"], button[aria-label*="new tweets"]',
+        'button[aria-label*="nouveaux tweets"], button[aria-label*="nuevos tweets"], button[aria-label*="new tweets"]',
         'button span[class*="css-"][dir="ltr"]',
         'div[role="button"] span[data-testid*="new-tweet"], div[role="button"] span[aria-label*="posts"]'
     ];
@@ -2839,13 +2871,10 @@
     for (const selector of selectors) {
         const btn = document.querySelector(selector);
         if (btn && btn.dataset.processed !== 'true') {
-            const span = getSelectorFallback(btn, ['span']);
+            const span = getSelectorFallback(btn, ['span', '[data-testid="pillLabel"]']);
             const textContent = (span ? span.textContent : btn.getAttribute('aria-label') || '').toLowerCase().trim();
 
-            const postIndicatorPattern = /\b(new posts|neue Beiträge|nouveaux tweets|nuevos tweets|新しい投稿|Новые посты|novos posts|منشورات جديدة|nuovi post|새 게시물|new tweets|post anzeigen|posts anzeigen|show \d+ post|show \d+ posts)\b/i;
-            const excludePattern = /\b(teilen|share|posten|veröffentlichen)\b/i;
-
-            if (postIndicatorPattern.test(textContent) && !excludePattern.test(textContent)) {
+            if (matchesNewPostsText(textContent)) {
                 const numMatch = textContent.match(/(\d+)/);
                 pendingNewPosts = numMatch ? parseInt(numMatch[1], 10) : 1;
                 return btn;
@@ -2854,13 +2883,10 @@
     }
 
     // Robust text-based fallback (X.com ändert häufig die DOM-Struktur)
-    const postIndicatorPattern = /\b(new posts|neue Beiträge|nouveaux tweets|nuevos tweets|新しい投稿|Новые посты|novos posts|منشورات جديدة|nuovi post|새 게시물|new tweets|post anzeigen|posts anzeigen|show \d+ post|show \d+ posts)\b/i;
-    const excludePattern = /\b(teilen|share|posten|veröffentlichen)\b/i;
-
     const candidates = document.querySelectorAll('button, [role="button"]');
     for (const el of candidates) {
         const txt = (el.textContent || el.getAttribute('aria-label') || '').toLowerCase().trim();
-        if (postIndicatorPattern.test(txt) && !excludePattern.test(txt)) {
+        if (matchesNewPostsText(txt)) {
             const rect = el.getBoundingClientRect();
             // Nur Elemente nah am oberen Rand des Viewports berücksichtigen
             if (rect.top > -100 && rect.top < 350 && rect.width > 50) {
