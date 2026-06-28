@@ -1,5 +1,6 @@
 // ==UserScript==
-// @name Twitter/X Timeline Sync
+// @name X Reading Position & Media Download
+// @name:de X Leseposition & Medien-Download
 // @description Tracks and syncs your last reading position on Twitter/X, with manual and automatic options. Ideal for keeping track of new posts without losing your place. Uses Tweet ID for precise positioning and supports reposts.
 // @description:de Verfolgt und synchronisiert Ihre letzte Leseposition auf Twitter/X, mit manuellen und automatischen Optionen. Perfekt, um neue Beiträge im Blick zu behalten, ohne die aktuelle Position zu verlieren. Verwendet Tweet-ID für präzise Positionierung und Unterstützung für Reposts.
 // @description:es Rastrea y sincroniza tu última posición de lectura en Twitter/X, con opciones manuales y automáticas. Ideal para mantener el seguimiento de las publicaciones nuevas sin perder tu posición. Usa ID de Tweet para posicionamiento preciso y soporte para reposts.
@@ -14,7 +15,7 @@
 // @description:ko Twitter/X에서 마지막 읽기 위치를 추적하고 동기화합니다. 수동 및 자동 옵션 포함. 새로운 게시물을 확인하면서 현재 위치를 잃지 않도록 이상적입니다. 트윗 ID를 사용하여 정확한 위치 지정을 하고, 리포스트를 지원합니다。
 // @icon https://x.com/favicon.ico
 // @namespace https://github.com/Copiis/x-timeline-sync
-// @version 2026.6.28f
+// @version 2026.6.28i
 // @author Copiis
 // @license MIT
 // @match https://x.com/*
@@ -1794,10 +1795,17 @@
         debugLog('Restore', `Grace ${CONFIG.RESTORE_GRACE_MS}ms aktiviert für ${tweetId}`);
     }
 
+    function isLesestelleMutationBlocked() {
+        return searchControl.newPostsRestoreActive ||
+            searchControl.isSearching ||
+            searchControl.isFallbackSearching ||
+            searchControl.manualSearchActive;
+    }
+
     async function markTopVisiblePost(save = true, allowOlderRegression = false, mapDirection = null) {
     try {
 
-    if (!window.location.href.includes('/home') || searchControl.isSearching || searchControl.isFallbackSearching || searchControl.manualSearchActive) {
+    if (!window.location.href.includes('/home') || isLesestelleMutationBlocked()) {
         return;
     }
 
@@ -2185,6 +2193,7 @@
      * Umgeht Map/Reconcile-Verzögerung nach New-Posts-Restore (stale lastScrollY, Option-2-Skip).
      */
     async function tryPromoteNewerVisiblePostOnScrollUp(mapDirection) {
+        if (isLesestelleMutationBlocked()) return false;
         if (mapDirection !== 'up' && !scrollState.hasScrolledUp) return false;
         if (!lastReadPost?.tweetId) return false;
 
@@ -2447,6 +2456,7 @@
      * Verhindert, dass beim Hochscrollen alte Reposts die neueren Fortschritte überschreiben.
      */
     function reconcileLesestelleWithHistory() {
+        if (isLesestelleMutationBlocked()) return;
         if (!lastReadPost || !lastReadPost.tweetId || postHistoryCache.length === 0) {
             return;
         }
@@ -4190,7 +4200,10 @@
             });
             applyHighlightToPost(fresh, { confidence, strategy });
         } else if (scroll) {
-            await new Promise(resolve => scrollToPostWithHighlight(post.element, resolve));
+            const scrollOpts = verifySource === 'new-posts-restore'
+                ? { ignoreAnchorStale: true }
+                : {};
+            await new Promise(resolve => scrollToPostWithHighlight(post.element, resolve, scrollOpts));
             applyHighlightToPost(fresh, { confidence, strategy });
         } else {
             applyHighlightToPost(fresh, { confidence, strategy });
@@ -4202,6 +4215,8 @@
                 lastReadPost.resolveStrategy = strategy;
                 lastReadPost.resolveConfidence = confidence;
             }
+        } else if (verifySource === 'new-posts-restore' && expectedBookmark?.tweetId) {
+            scheduleHighlightRetries(expectedBookmark.tweetId, expectedBookmark.authorHandler, [0, 300, 900, 2000, 3500]);
         }
 
         log('Resolve', `Landing (${strategy}, ${confidence}%): @${post.authorHandler} ${post.tweetId}`);
@@ -4816,8 +4831,9 @@
         }
     }
 
-    function finishPostHighlightAtOffset(element, anchorTweetId, anchorAuthor, onComplete, reason) {
-        if (isScrollAnchorStale(anchorTweetId, anchorAuthor)) {
+    function finishPostHighlightAtOffset(element, anchorTweetId, anchorAuthor, onComplete, reason, options = {}) {
+        const { ignoreAnchorStale = false } = options;
+        if (!ignoreAnchorStale && isScrollAnchorStale(anchorTweetId, anchorAuthor)) {
             debugLog('Position', 'Scroll-Highlight abgebrochen — Lesestelle wurde zwischendurch aktualisiert');
             searchControl.isAutoScrolling = false;
             scrollState.programmaticScrollEndedAt = Date.now();
@@ -4837,7 +4853,34 @@
         if (onComplete) onComplete();
     }
 
-    function scrollToPostWithHighlight(post, onComplete = null) {
+    async function reinstateFrozenReadingBookmark(bookmark, options = {}) {
+        const { save = true, highlight = true } = options;
+        const frozen = snapshotReadingBookmark(bookmark);
+        if (!frozen?.tweetId || !frozen.authorHandler) return false;
+
+        const account = frozen.account || await getCurrentUserHandle();
+        lastReadPost = { ...frozen, account };
+        currentPost = lastReadPost;
+        invalidateHighlightRetries();
+
+        if (highlight) {
+            const el = findPostElementInDOM(frozen.tweetId, frozen.authorHandler);
+            if (el) {
+                applyHighlightToPost(el);
+                scheduleHighlightRetries(frozen.tweetId, frozen.authorHandler, [0, 300, 900, 2000, 3500]);
+            } else {
+                updateHighlightedPost();
+            }
+        }
+
+        if (save) {
+            await saveLastReadPost(lastReadPost, { force: true });
+        }
+        return true;
+    }
+
+    function scrollToPostWithHighlight(post, onComplete = null, options = {}) {
+    const { ignoreAnchorStale = false } = options;
     if (!post) {
         log('Search', 'Kein Beitrag zum Scrollen.');
         endManualSearchSession();
@@ -4847,7 +4890,7 @@
     }
     const anchorTweetId = getPostTweetId(post);
     const anchorAuthor = getPostAuthorHandler(post);
-    if (isScrollAnchorStale(anchorTweetId, anchorAuthor)) {
+    if (!ignoreAnchorStale && isScrollAnchorStale(anchorTweetId, anchorAuthor)) {
         debugLog('Position', 'Scroll übersprungen — Lesestelle wurde vor Positionierung aktualisiert');
         searchControl.isAutoScrolling = false;
         syncHighlightIfDrifted();
@@ -4862,7 +4905,8 @@
             anchorTweetId,
             anchorAuthor,
             onComplete,
-            `Bereits am Ziel (rect.top≈${CONFIG.RESTORE_SCROLL_OFFSET}px, Δ=${Math.round(getPostOffsetDeviation(activePostInitial))}px) — kein Scroll`
+            `Bereits am Ziel (rect.top≈${CONFIG.RESTORE_SCROLL_OFFSET}px, Δ=${Math.round(getPostOffsetDeviation(activePostInitial))}px) — kein Scroll`,
+            options
         );
         return;
     }
@@ -4904,7 +4948,7 @@
     };
 
     const finishPositioning = (reason) => {
-        finishPostHighlightAtOffset(post, anchorTweetId, anchorAuthor, onComplete, reason);
+        finishPostHighlightAtOffset(post, anchorTweetId, anchorAuthor, onComplete, reason, options);
     };
 
     const doPrecisePositioning = () => {
@@ -4917,13 +4961,14 @@
 
         debugLog('Position', `rect.top:${rect.top} scrollY:${scrollY} targetY:${targetY} Δ:${Math.round(deviation)} Versuch:${positionAttempts+1}`);
 
-        if (isScrollAnchorStale(anchorTweetId, anchorAuthor)) {
+        if (!ignoreAnchorStale && isScrollAnchorStale(anchorTweetId, anchorAuthor)) {
             finishPostHighlightAtOffset(
                 activePost,
                 anchorTweetId,
                 anchorAuthor,
                 onComplete,
-                'Positionierung abgebrochen — Lesestelle hat sich geändert'
+                'Positionierung abgebrochen — Lesestelle hat sich geändert',
+                options
             );
             return;
         }
@@ -5328,6 +5373,9 @@
                 }
 
                 if (landingOk) {
+                    if (!adopt) {
+                        await reinstateFrozenReadingBookmark(restoreBookmark);
+                    }
                     newPostsState.lastRestoreCompletedAt = Date.now();
                     updateTimelineMap('new-posts-restore', 'up');
                     if (resolved.strategy === 'exact' && isReadingPositionAtTargetOffset(restoreBookmark)) {
@@ -5354,8 +5402,9 @@
                 flushDeferredTimelineMapUpdate('new-posts-restore');
                 lastScrollY = window.scrollY;
                 scrollState.lastMapScrollY = window.scrollY;
+                scrollState.hasScrolledUp = false;
                 setTimeout(() => {
-                    updateHighlightedPost();
+                    void reinstateFrozenReadingBookmark(restoreBookmark, { save: false });
                 }, 500);
             }
         }, 400);
