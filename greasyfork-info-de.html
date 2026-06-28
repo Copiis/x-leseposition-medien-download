@@ -1,0 +1,115 @@
+<!-- GreasyFork „Zusätzliche Informationen“ — Stand 2026.6.28f -->
+<!-- Einfügen: https://greasyfork.org/de/scripts/517767-twitter-x-timeline-sync → Bearbeiten → Zusätzliche Informationen -->
+
+<h1>Timeline Sync für X.com</h1>
+
+<p><strong>Verliere nie wieder deine Leseposition.</strong></p>
+
+<p>Ein Tampermonkey-Skript, das deine aktuelle Position in der X/Twitter-Timeline präzise speichert —
+automatisch oder manuell. Auch nach Neuladen, „Neue Beiträge“, gelöschten Tweets oder stark verändertem Feed
+findest du zuverlässig zurück zur richtigen Stelle.</p>
+
+<p>
+  <strong>Automatisches Tracking</strong> ·
+  <strong>Tweet-ID + Kontext</strong> ·
+  <strong>Resolve-Engine</strong> ·
+  <strong>12+ Sprachen</strong> ·
+  <strong>JSON-Backup</strong> ·
+  <strong>Medien-Download</strong>
+</p>
+
+<h2>Funktionen</h2>
+
+<h3>Automatisches Speichern</h3>
+<p>Beim Scrollen wird die Lesestelle laufend gespeichert — inkl. Tweet-ID, Autor, Zeitstempel, Repost-Status
+und Nachbar-Kontext für robuste Wiederherstellung.</p>
+
+<h3>Resolve-Engine (intelligente Wiederherstellung)</h3>
+<p>Wenn der exakte Tweet fehlt, landet das Skript trotzdem an der bestmöglichen Stelle:</p>
+<ul>
+  <li><strong>Exakt</strong> — Tweet-ID + Autor + Repost-Typ im DOM</li>
+  <li><strong>Kontext</strong> — Nachbar-Posts passen noch zur gespeicherten Umgebung</li>
+  <li><strong>Trail</strong> — neuester bekannter History-Eintrag im Feed</li>
+  <li><strong>Temporal</strong> — zeitlich nächster Post (mit Overshoot-Schutz)</li>
+  <li><strong>Notfall</strong> — nächster sichtbarer Post am Lesestellen-Offset</li>
+</ul>
+
+<h3>Neue Beiträge</h3>
+<p>Erkennt den „Neue Beiträge“-Button, lädt neue Posts oben nach und stellt die Lesestelle danach wieder her —
+ohne ungewollte Sprünge mitten in der Timeline.</p>
+
+<h3>Timeline-Landkarte</h3>
+<p>Merkt sich die Feed-Reihenfolge im Browser, damit Suche und Wiederherstellung auch bei vielen geladenen
+Posts schneller und stabiler funktionieren.</p>
+
+<h3>Repost-sicher</h3>
+<p>Erkennt Reposts zuverlässig und trennt sie von normalen Posts — inkl. eigenem <code>readAt</code>-Zeitstempel
+und Repost-Log.</p>
+
+<h3>Visuelle Markierung</h3>
+<p>Die aktuelle Lesestelle wird mit einem <strong>orangenen 1px-Rahmen</strong> markiert (dezent, stört nicht beim Lesen).</p>
+
+<h3>JSON-Export &amp; Import</h3>
+<p>Leseposition, History und Repost-Log als <code>.json</code> exportieren — z.&nbsp;B. für Gerätewechsel
+oder Backup. Import über den Ordner-Button.</p>
+
+<h3>Medien-Download (Bilder &amp; Videos)</h3>
+<p>Download-Button oben links auf Tweet-Bildern und -Videos (beim Hover sichtbar):</p>
+<ul>
+  <li><strong>Bilder</strong> — Originalauflösung (<code>orig</code>), mit Fallback auf kleinere Varianten</li>
+  <li><strong>Videos</strong> — höchste verfügbare MP4-Qualität</li>
+  <li>Funktioniert auf <strong>allen x.com-Seiten</strong> mit Medien (Timeline, Profil, Einzel-Tweet)</li>
+</ul>
+
+<h3>Mehrsprachig</h3>
+<p>Automatische Spracherkennung: Deutsch, Englisch, Spanisch, Französisch, Chinesisch, Russisch, Japanisch,
+Portugiesisch, Hindi, Arabisch, Italienisch, Koreanisch u.&nbsp;a.</p>
+
+<h2>Schwebende Aktionsbuttons (links unten)</h2>
+
+<table>
+  <tr><td>🔍</td><td><strong>Manuelle Suche</strong> — springt zur letzten Leseposition (Lupe)</td></tr>
+  <tr><td>💾</td><td><strong>Position speichern</strong> — aktuellen Post manuell merken</td></tr>
+  <tr><td>📂</td><td><strong>Aus Datei laden</strong> — JSON-Import</td></tr>
+  <tr><td>🔄</td><td><strong>Auto-Speichern</strong> — Ein/Aus</td></tr>
+</table>
+
+<h2>Wie es funktioniert</h2>
+<ol>
+  <li>Beim Scrollen speichert das Skript die Lesestelle (Tweet-ID, Autor, Zeitstempel, Kontext).</li>
+  <li>Beim nächsten Besuch: Lupe-Klick → Suche/Scroll zur gespeicherten Position.</li>
+  <li>Fehlt der exakte Tweet, übernimmt die Resolve-Engine mit abgestufter Konfidenz.</li>
+  <li>Oben in der Timeline: „Neue Beiträge“ werden erkannt und die Lesestelle danach synchronisiert.</li>
+</ol>
+
+<h2>Datenschutz</h2>
+<ul>
+  <li>Alle Daten <strong>nur lokal</strong> im Browser (Tampermonkey Storage).</li>
+  <li><strong>Keine</strong> Übertragung an Server oder Dritte.</li>
+  <li>Leseposition-Sync nur auf <strong>x.com/home</strong>; Medien-Download auf <strong>x.com</strong>.</li>
+  <li>Export/Löschung jederzeit über JSON-Datei möglich.</li>
+</ul>
+
+<p><strong>Mehrere Accounts:</strong> Leseposition pro Account getrennt gespeichert.</p>
+
+<h2>Installation</h2>
+<ol>
+  <li>Tampermonkey, Violentmonkey oder Greasemonkey installieren</li>
+  <li>Über <strong>„Skript installieren“</strong> oben installieren</li>
+  <li><a href="https://x.com/home">x.com/home</a> öffnen — Buttons erscheinen links unten</li>
+</ol>
+
+<h2>Quelle &amp; Updates</h2>
+<p>
+  Entwicklung: <a href="https://github.com/Copiis/x-timeline-sync">GitHub (Copiis/x-timeline-sync)</a><br>
+  Aktuelle Version: <strong>2026.6.28f</strong>
+</p>
+
+<h2>Unterstütze den Entwickler</h2>
+<p>Wenn dir das Skript gefällt:</p>
+<p>
+  <a href="https://github.com/sponsors/Copiis">GitHub Sponsors</a>
+</p>
+<p>BTC: <code>bc1quc5mkudlwwkktzhvzw5u2nruxyepef957p68r7</code></p>
+
+<p><em>MIT License · Entwickelt für alle, die auf X wirklich lesen wollen.</em></p>

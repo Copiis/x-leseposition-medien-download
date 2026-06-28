@@ -6,6 +6,8 @@ Userscript für Tampermonkey — Leseposition auf X/Twitter synchronisieren.
 
 **GitHub (einzige Spiegelung):** https://github.com/Copiis/x-timeline-sync
 
+**GreasyFork:** https://greasyfork.org/de/scripts/517767-twitter-x-timeline-sync
+
 Raw-URL (GreasyFork Code-Synchronisation + direkte Installation):
 
 ```
@@ -21,6 +23,10 @@ https://raw.githubusercontent.com/Copiis/x-timeline-sync/master/Twitter-X-Timeli
 
 ## GreasyFork
 
-Skript: https://greasyfork.org/scripts/517767
+**Code-Synchronisation** (einmalig / nach URL-Wechsel):
 
-Im GreasyFork-Editor unter **Code-Synchronisation** die Raw-URL oben eintragen.
+```
+https://raw.githubusercontent.com/Copiis/x-timeline-sync/master/Twitter-X-Timeline-Sync.js
+```
+
+**Beschreibung aktualisieren:** Als Autor einloggen → Skript bearbeiten → „Zusätzliche Informationen“ → Inhalt aus `greasyfork-info-de.html` einfügen (auch in Zwischenablage nach `./update-greasyfork-info.sh`).
