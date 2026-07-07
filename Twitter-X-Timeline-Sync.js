@@ -15,7 +15,7 @@
 // @description:ko Twitter/X에서 마지막 읽기 위치를 추적하고 동기화합니다. 수동 및 자동 옵션 포함. 새로운 게시물을 확인하면서 현재 위치를 잃지 않도록 이상적입니다. 트윗 ID를 사용하여 정확한 위치 지정을 하고, 리포스트를 지원합니다。
 // @icon https://x.com/favicon.ico
 // @namespace https://github.com/Copiis/x-leseposition-medien-download
-// @version 2026.6.29k
+// @version 2026.7.7a
 // @author Copiis
 // @license MIT
 // @match https://x.com/*
@@ -1240,6 +1240,24 @@
                         debugLog('Repost', `Repost-Log aus Datei importiert: ${importedRepostLog.length} Einträge`);
                     }
 
+                    // Timeline-Landkarte aus der Lesestelle-Datei wiederherstellen (integriert wegen TM-Sync-Problem)
+                    if (data.timelineMap && Array.isArray(data.timelineMap.orderedKeys) && data.timelineMap.entries) {
+                        try {
+                            const mapKey = TIMELINE_MAP_KEY(account);
+                            GM_setValue(mapKey, JSON.stringify({
+                                orderedKeys: data.timelineMap.orderedKeys,
+                                entries: data.timelineMap.entries,
+                                savedAt: data.timelineMap.savedAt || new Date().toISOString()
+                            }));
+                            debugLog('Map', `Timeline-Landkarte aus Datei importiert: ${data.timelineMap.orderedKeys.length} Einträge`);
+
+                            // Live-Strukturen sofort befüllen, damit Resolve/Map-Logik sie nutzen kann
+                            loadTimelineMapForAccount(account, true);
+                        } catch (e) {
+                            log('Map', 'Fehler beim Import der Landkarte aus Datei:', e);
+                        }
+                    }
+
                     showPopup('fileLoadSuccess', 4000);
 
                     updateHighlightedPost();
@@ -1373,13 +1391,37 @@
         const fileName = `${account}_${postAuthor}_${dateStr}_${timeStr}.json`;
         // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
+        // Timeline-Landkarte mit in die Lesestelle-Datei einbetten.
+        // Grund: Tampermonkey-interner Sync der großen `timelineMap_*`-Werte ist unzuverlässig.
+        // Die kombinierte Datei wird bei Tab-Leseverlust (blur / beforeunload + Auto-Download)
+        // heruntergeladen. Anschließend Ordner-Sync (z.B. Syncthing) → andere Maschine lädt
+        // per "Load last read position" die Lesestelle + Landkarte zusammen.
+        let exportedTimelineMap = null;
+        if (timelineMapAccount === account && timelineMapOrderedKeys.length > 0) {
+            const entries = {};
+            for (const key of timelineMapOrderedKeys) {
+                const entry = timelineMapByKey.get(key);
+                if (entry) {
+                    // inDom ist transient, nicht persistieren
+                    const { inDom, ...cleanEntry } = entry;
+                    entries[key] = cleanEntry;
+                }
+            }
+            exportedTimelineMap = {
+                orderedKeys: [...timelineMapOrderedKeys],
+                entries,
+                savedAt: new Date().toISOString()
+            };
+        }
+
         const exportData = {
             account: account,
             current: { ...lastReadPost },
             history: exportHistory,
             repostLog: exportRepostLog,
+            timelineMap: exportedTimelineMap,
             exportedAt: now.toISOString(),
-            version: "1.1"   // erhöht wegen neuem repostLog-Feld (30.05.2026)
+            version: "1.2"   // 1.2: timelineMap in Lesestelle-Download integriert (wegen fehlendem TM-Map-Sync)
         };
 
         const fileContent = JSON.stringify(exportData, null, 2);
