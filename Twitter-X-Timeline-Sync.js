@@ -15,7 +15,7 @@
 // @description:ko Twitter/X에서 마지막 읽기 위치를 추적하고 동기화합니다. 수동 및 자동 옵션 포함. 새로운 게시물을 확인하면서 현재 위치를 잃지 않도록 이상적입니다. 트윗 ID를 사용하여 정확한 위치 지정을 하고, 리포스트를 지원합니다。
 // @icon https://x.com/favicon.ico
 // @namespace https://github.com/Copiis/x-leseposition-medien-download
-// @version 2026.7.7a
+// @version 2026.7.10a
 // @author Copiis
 // @license MIT
 // @match https://x.com/*
@@ -86,8 +86,8 @@
         // === Such-Verhalten (Balance zwischen Geschwindigkeit bei weit entfernten Zielen und Overshoot-Schutz) ===
         MAX_SEARCH_DISTANCE_FACTOR: 3.2,     // Etwas höher als früher, damit weit entfernte Lesestellen schneller erreicht werden
         MAX_SEARCH_STEP_VH: 3.8,             // Deutlich größere Sprünge erlaubt für weit entfernte Lesestellen (vorher zu konservativ)
-        SLOW_SEARCH_FINE_STEP_PX: 120,       // Kleine Schritte wenn Ziel-idx bereits im Viewport (Ping-Pong-Schutz)
-        SLOW_SEARCH_FINE_MAX_ATTEMPTS: 10,   // Danach Top-Retry + sicheres Resolve
+        SLOW_SEARCH_FINE_STEP_PX: 280,       // Kleine Schritte wenn Ziel-idx bereits im Viewport (Ping-Pong-Schutz). Etwas größer, damit auch bei importierter Landkarte (anderer Rechner) noch Feed nachgeladen wird.
+        SLOW_SEARCH_FINE_MAX_ATTEMPTS: 15,   // Danach Top-Retry + sicheres Resolve. Mehr Versuche bei importierten Lesestellen (cross-rechner).
         SEARCH_FINE_ZONE_HYSTERESIS: 2,      // Abstand 0–2: keine großen Sprünge mehr (Ping-Pong-Schutz)
         SEARCH_TOP_RETRY_MAX_IDX: 25,        // Nahe Top: einmal scrollY=0 vor Fallback
 
@@ -1228,6 +1228,9 @@
                     }
 
                     GM_setValue(historyKey, importedHistory);
+                    postHistoryCache = importedHistory;
+                    rebuildKnownMarkedKeys();
+                    debugLog('Load', `Post-Historie aus Datei geladen: ${importedHistory.length} Einträge.`);
                     GM_setValue(STORAGE_KEY(account), JSON.stringify(lastReadPost));
 
                     // Repost-Log importieren, falls in der Datei vorhanden (User-Wunsch)
@@ -1256,6 +1259,12 @@
                         } catch (e) {
                             log('Map', 'Fehler beim Import der Landkarte aus Datei:', e);
                         }
+                    }
+
+                    // Sicherstellen, dass die importierte Lesestelle als konkreter Eintrag in der (importierten) Landkarte steht.
+                    // Wichtig für cross-rechner: mit frisch geladener History können History-Anker für korrekte Platzierung genutzt werden.
+                    if (lastReadPost && lastReadPost.tweetId) {
+                        ensureBookmarkInMap(lastReadPost);
                     }
 
                     showPopup('fileLoadSuccess', 4000);
@@ -3476,7 +3485,28 @@
     }
 
     function isSearchFineZoneDistance(mapDistance) {
-        return mapDistance !== null && mapDistance <= CONFIG.SEARCH_FINE_ZONE_HYSTERESIS;
+        if (mapDistance === null || mapDistance > CONFIG.SEARCH_FINE_ZONE_HYSTERESIS) return false;
+
+        // Wichtig für "Load from file" auf anderem Rechner (und allgemein):
+        // Nur in den Fein-Modus (winzige Schritte) wechseln, wenn wir bereits Posts im Ziel-Bereich
+        // der Landkarte geladen haben. Sonst sind winzige 120px-Schritte wirkungslos (laden keine neuen
+        // Artikel) und die Suche bricht zu früh ab.
+        const frozenIdx = getFrozenSearchBookmarkIdx();
+        if (frozenIdx < 0) return true;
+
+        const useSnapshot = searchControl.isSearching && scrollState.mapSnapshotOrderedKeys?.length;
+        const loaded = useSnapshot
+            ? getDomIndexRangeInSnapshotOrder(scrollState.mapSnapshotOrderedKeys)
+            : getLoadedDomMapIndexRange();
+
+        if (loaded && loaded.oldest >= 0) {
+            // Wir müssen mindestens bis kurz vor das Ziel vorgedrungen sein (oder es überholt haben).
+            // Sonst weiter mit normalen/größeren Schritten scrollen, um mehr Feed zu laden.
+            if (loaded.oldest < frozenIdx - 1) {
+                return false;
+            }
+        }
+        return true;
     }
 
     function isSearchFineZoneActive(mapDistance) {
@@ -3518,13 +3548,13 @@
         }
 
         const resolved = resolveReadingPosition(searchBookmark);
-        if (resolved?.strategy === 'exact' && resolved?.post?.element) {
+        if (resolved?.post?.element) {
             await applyResolvedReadingPosition(resolved, {
-                adopt: false,
+                adopt: true,
                 expectedBookmark: searchBookmark,
                 verifySource: 'search-fine-exhausted',
             });
-            diagEndFlow('ok', 'SEARCH_FINE_RESOLVE_EXACT', 'Resolve exakt nach Feinbereich', {
+            diagEndFlow('ok', 'SEARCH_FINE_RESOLVE', `Resolve ${resolved.strategy} nach Feinbereich`, {
                 target: diagBookmark(searchBookmark),
             });
             clearMapSnapshotForSearch();

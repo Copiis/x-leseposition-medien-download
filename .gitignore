@@ -1,9 +1,5 @@
 *.bak*
 .gh-token
-.gist-config
-.gist-id
-.gist-config.example
-.gist-id.example
 html.txt
 log.txt
 status.md
