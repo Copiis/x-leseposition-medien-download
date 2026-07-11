@@ -15,7 +15,7 @@
 // @description:ko Twitter/X에서 마지막 읽기 위치를 추적하고 동기화합니다. 수동 및 자동 옵션 포함. 새로운 게시물을 확인하면서 현재 위치를 잃지 않도록 이상적입니다. 트윗 ID를 사용하여 정확한 위치 지정을 하고, 리포스트를 지원합니다。
 // @icon https://x.com/favicon.ico
 // @namespace https://github.com/Copiis/x-leseposition-medien-download
-// @version 2026.7.10a
+// @version 2026.7.11b
 // @author Copiis
 // @license MIT
 // @match https://x.com/*
@@ -1597,6 +1597,8 @@
 
         const checkNewPostsInterval = setInterval(() => {
             tryAutoClickNewPosts();
+            // Auch "versteckte Beiträge anzeigen" regelmäßig prüfen (X blendet sonst Teile der Timeline aus)
+            tryClickShowHiddenPostsButton('interval');
         }, 3000);
 
         window.addEventListener('unload', () => clearInterval(checkNewPostsInterval));
@@ -4549,6 +4551,11 @@
         window.scrollBy({ top: scrollStep, behavior: 'smooth' });
 
         await new Promise(resolve => setTimeout(resolve, 300));
+
+        // Nach dem Scrollen kann X einen "versteckte Beiträge"-Button eingefügt haben.
+        // Klicken, damit bei der Lesestelle-Suche keine Posts versteckt bleiben.
+        await tryClickShowHiddenPostsButton('scroll-search');
+
         if (continueFn) {
             requestAnimationFrame(() => setTimeout(continueFn, 300));
         }
@@ -4644,6 +4651,9 @@
     debugLog('Search', 'Starte optimierte Suche für letzte Leseposition...');
     beginManualSearchSession();
     diagBeginFlow('manual-search', { fromFile });
+
+    // Sofort prüfen, ob X schon einen "versteckte Beiträge"-Button zeigt (kann Suche blockieren)
+    await tryClickShowHiddenPostsButton('search-start');
 
     // Wichtig: Such-/Scroll-State zurücksetzen (Punkt 4)
     scrollState.scrollCyclePhase = 0;
@@ -4838,6 +4848,16 @@
         scrollState.totalLoadedPosts = Array.from(document.querySelectorAll('article')).length;
         debugLog('Search', `Prüfe ${posts.length} sichtbare Posts (Gesamt: ${scrollState.totalLoadedPosts}). Scroll-Versuch: ${scrollState.stagnantScrollCount + 1}, Zyklusphase: ${scrollState.scrollCyclePhase}`);
 
+        // Während Lesestelle-Suche: falls X einen "Versteckte Beiträge anzeigen" Button eingefügt hat,
+        // diesen sofort anklicken, damit die versteckten Posts geladen werden und die Suche das Ziel finden kann.
+        const gapClicked = await tryClickShowHiddenPostsButton('search');
+        if (gapClicked) {
+            // Nach dem Expand die sichtbaren Posts neu holen
+            posts = getVisiblePosts().map(p => p.element);
+            scrollState.totalLoadedPosts = Array.from(document.querySelectorAll('article')).length;
+            debugLog('Search', 'Nach Klick auf versteckte Beiträge: Posts neu geprüft.');
+        }
+
         if (shouldAbortSearch('loaded-posts', scrollCount, () => {
             window.removeEventListener('keydown', handleSpaceKey);
             if (io) io.disconnect();
@@ -4845,6 +4865,7 @@
 
         if (posts.length === 0) {
             debugLog('Search', 'Keine sichtbaren Posts im DOM, warte auf Laden...');
+            await tryClickShowHiddenPostsButton('search-empty');
             await performScrollAndContinue(search, () => {
                 window.removeEventListener('keydown', handleSpaceKey);
                 if (io) io.disconnect();
@@ -5316,6 +5337,16 @@
                 window.newPostsObserver.disconnect();
             }
         }
+
+        // Gap / "versteckte Beiträge anzeigen" Buttons behandeln (auch während Suche und Scroll)
+        // Diese Buttons blenden Teile der Timeline aus — wir klicken sie automatisch weg.
+        const gapBtn = getShowHiddenPostsButton();
+        if (gapBtn) {
+            setTimeout(() => {
+                tryClickShowHiddenPostsButton('observer');
+            }, 180);
+            // NICHT disconnecten — Gap-Buttons können mehrfach und an beliebiger Stelle auftauchen
+        }
     });
 
     window.newPostsObserver.observe(timelineContainer, {
@@ -5395,6 +5426,76 @@
 
     return null;
 }
+
+    /**
+     * Erkennt "Versteckte Beiträge anzeigen" / "Show more posts" / Gap-Buttons,
+     * die X in der Timeline einblendet, um Teile der Timeline auszublenden.
+     * Wird besonders während der Lesestelle-Suche benötigt, damit das Ziel nicht
+     * hinter versteckten Posts "versteckt" bleibt.
+     */
+    function getShowHiddenPostsButton() {
+        const hiddenPattern = /\b(versteckte\s+beiträge\s+anzeigen|versteckte\s+posts?\s+anzeigen|show\s+more\s+posts?|show\s+\d+\s+posts?|mehr\s+beiträge\s+anzeigen|mehr\s+posts?\s+anzeigen|\d+\s+beiträge\s+anzeigen|beiträge\s+anzeigen|posts?\s+anzeigen|show\s+more|hidden\s+posts?\s+anzeigen)\b/i;
+        const newPostsExclude = /\b(new\s*posts?|neue\s*posts?|neue\s*beiträge)\b/i;
+
+        // Bevorzugt: Buttons in cellInnerDiv, die NICHT in einem Tweet-Article liegen (das sind die Gap-Buttons)
+        const cellButtons = document.querySelectorAll('div[data-testid="cellInnerDiv"] button, div[data-testid="cellInnerDiv"] [role="button"]');
+        for (const btn of cellButtons) {
+            if (btn.dataset.processed === 'true') continue;
+            if (btn.closest('article')) continue; // keine Buttons innerhalb von Tweets (Replies etc.)
+            const txt = (btn.textContent || btn.getAttribute('aria-label') || btn.innerText || '').trim();
+            if (!txt) continue;
+            const lower = txt.toLowerCase();
+            if (hiddenPattern.test(lower) && !newPostsExclude.test(lower)) {
+                debugLog('Gap', `Gap-Button via cell gefunden: "${txt.substring(0, 80)}"`);
+                return btn;
+            }
+        }
+
+        // Robustes Fallback über alle Buttons (X ändert Struktur oft)
+        const candidates = document.querySelectorAll('button, [role="button"]');
+        for (const el of candidates) {
+            if (el.dataset.processed === 'true') continue;
+            if (el.closest('article')) continue;
+            const txt = (el.textContent || el.getAttribute('aria-label') || '').toLowerCase().trim();
+            if (hiddenPattern.test(txt) && !newPostsExclude.test(txt)) {
+                const rect = el.getBoundingClientRect();
+                if (rect.width > 60 && rect.height > 18 && rect.top > -200 && rect.top < (window.innerHeight + 800)) {
+                    debugLog('Gap', `Gap-Button via Fallback: "${txt.substring(0, 80)}"`);
+                    return el;
+                }
+            }
+        }
+        return null;
+    }
+
+    async function tryClickShowHiddenPostsButton(context = 'general') {
+        if (!isScriptActivated) return false;
+        const btn = getShowHiddenPostsButton();
+        if (!btn) return false;
+
+        // Defensive: nicht mit New-Posts-Pill verwechseln
+        const txt = ((btn.textContent || '') + ' ' + (btn.getAttribute('aria-label') || '')).toLowerCase();
+        if (/\b(new|neue)\b.*(post|beitr)/.test(txt)) {
+            return false;
+        }
+
+        btn.dataset.processed = 'true';
+        debugLog('Gap', `Klicke "versteckte Beiträge anzeigen"-Button (context=${context})`);
+        try {
+            btn.click();
+        } catch (e) {
+            debugLog('Gap', 'Click fehlgeschlagen: ' + e);
+            return false;
+        }
+
+        // Warten, bis X die versteckten Posts nachlädt. Besonders kritisch bei Lesestelle-Suche!
+        await new Promise(resolve => setTimeout(resolve, 520));
+
+        if (typeof scheduleTimelineMapUpdate === 'function') {
+            scheduleTimelineMapUpdate('hidden-gap-click', 'down');
+        }
+        return true;
+    }
 
     /** Viewport → Lesestelle vor New-Posts-Freeze (nur ohne Hochscroll-Phase). */
     async function syncViewportLesestelleAtTimelineTopForNewPosts() {
