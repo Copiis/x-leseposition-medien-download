@@ -15,7 +15,7 @@
 // @description:ko Twitter/X에서 마지막 읽기 위치를 추적하고 동기화합니다. 수동 및 자동 옵션 포함. 새로운 게시물을 확인하면서 현재 위치를 잃지 않도록 이상적입니다. 트윗 ID를 사용하여 정확한 위치 지정을 하고, 리포스트를 지원합니다。
 // @icon https://x.com/favicon.ico
 // @namespace https://github.com/Copiis/x-leseposition-medien-download
-// @version 2026.7.11b
+// @version 2026.7.19a
 // @author Copiis
 // @license MIT
 // @match https://x.com/*
@@ -1944,13 +1944,21 @@
     const postAuthorHandler = getPostAuthorHandler(anchorPost);
     const repostFlag = isRepost(anchorPost);
 
-    // === Starker History-Gedächtnis-Check (User-Wunsch) ===
-    // Ein Post/RePost darf **nur** dann als neue Lesestelle gesetzt werden,
-    // wenn er noch NICHT in der History bekannt ist.
-    // Das ist die primäre Regel für echtes Gedächtnis beim normalen Scrollen (rauf/runter).
+    // === History-Gedächtnis ===
+    // Bekannte Posts: standardmäßig nicht erneut setzen — AUSNAHME: Post steht in der
+    // Landkarte ÜBER der aktuellen Lesestelle → darf wieder Lesestelle werden (User-Wunsch).
     const positionKey = `${postTweetId}-${repostFlag}`;
+    const anchorAsCandidate = {
+        tweetId: postTweetId,
+        authorHandler: postAuthorHandler,
+        timestamp: postTimestamp,
+        isRepost: repostFlag
+    };
+    const knownButAboveOnMap = !!(lastReadPost?.tweetId && knownMarkedKeys.has(positionKey) &&
+        isAboveLesestelleOnMap(anchorAsCandidate, lastReadPost) &&
+        isCandidateNewer(anchorAsCandidate, lastReadPost));
 
-    if (knownMarkedKeys.has(positionKey) && !allowOlderRegression) {
+    if (knownMarkedKeys.has(positionKey) && !allowOlderRegression && !knownButAboveOnMap) {
         if (lastReadPost?.tweetId && postTweetId && postAuthorHandler && postTimestamp) {
             try {
                 const higherId = BigInt(postTweetId) > BigInt(lastReadPost.tweetId);
@@ -2350,19 +2358,26 @@
         if (postRefKey(candidate) === postRefKey(bookmark)) return false;
 
         const candidateKey = postRefKey(candidate);
+        const aboveOnMap = isAboveLesestelleOnMap(candidate, bookmark);
 
-        // Landkarte/History-Gedächtnis: bekannte normale Posts beim Hochscrollen nicht
-        // erneut als Lesestelle promoten (tryPromote umging bisher markTopVisiblePost).
-        if (!candidate.isRepost && candidateKey && knownMarkedKeys.has(candidateKey)) {
+        // History/Landkarte: bekannte normale Posts nur überspringen, wenn sie
+        // NICHT über der Lesestelle in der Landkarte stehen. Stehen sie darüber
+        // (kleinerer Map-Index), dürfen sie wieder Lesestelle werden.
+        if (!candidate.isRepost && candidateKey && knownMarkedKeys.has(candidateKey) && !aboveOnMap) {
             debugLog('Save',
                 `Hochscroll-Promotion übersprungen: @${candidate.authorHandler} ${candidate.tweetId}` +
-                ' bereits in History/Landkarte');
+                ' bereits in History/Landkarte (nicht über Lesestelle auf Map)');
             return false;
+        }
+        if (!candidate.isRepost && candidateKey && knownMarkedKeys.has(candidateKey) && aboveOnMap) {
+            debugLog('Save',
+                `Hochscroll-Promotion erlaubt (Map über Lesestelle): @${candidate.authorHandler} ${candidate.tweetId}`);
         }
 
         // Session-Max: keine normalen Posts über dem Hochscroll-Höchststand (auch
         // außerhalb isNearTimelineTop — marcfriedrich wurde dort noch promoted).
-        if (isScrollUpSessionActive() && !candidate.isRepost) {
+        // Ausnahme: klar über der Lesestelle in der Landkarte → trotzdem promoten.
+        if (isScrollUpSessionActive() && !candidate.isRepost && !aboveOnMap) {
             try {
                 const maxRef = scrollState.scrollUpMaxTweetId;
                 if (maxRef && BigInt(candidate.tweetId) > BigInt(maxRef)) {
@@ -2376,6 +2391,8 @@
                 return false;
             }
         }
+
+        if (aboveOnMap) return true;
 
         try {
             if (BigInt(candidate.tweetId) > BigInt(bookmark.tweetId)) return true;
@@ -3856,6 +3873,31 @@
     function postRefKey(ref) {
         if (!ref?.tweetId) return null;
         return `${ref.tweetId}-${!!ref.isRepost}`;
+    }
+
+    /**
+     * true, wenn Kandidat in der Landkarte ÜBER der Lesestelle steht
+     * (kleinerer Map-Index = weiter oben im Feed).
+     * Ohne Map-Einträge: Fallback auf höhere Tweet-ID.
+     * User-Wunsch: solche Posts dürfen (wieder) Lesestelle werden,
+     * auch wenn sie schon in History/Landkarte bekannt sind.
+     */
+    function isAboveLesestelleOnMap(candidate, bookmark) {
+        if (!candidate?.tweetId || !bookmark?.tweetId) return false;
+        if (postRefKey(candidate) === postRefKey(bookmark)) return false;
+
+        const candIdx = findBookmarkIndexInMap(candidate);
+        const bookIdx = findBookmarkIndexInMap(bookmark);
+
+        if (candIdx >= 0 && bookIdx >= 0) {
+            return candIdx < bookIdx;
+        }
+
+        try {
+            return BigInt(candidate.tweetId) > BigInt(bookmark.tweetId);
+        } catch (e) {
+            return false;
+        }
     }
 
     function captureReadingContext(anchorElement) {
@@ -5511,10 +5553,12 @@
         if (!isCandidateNewer(parsed, lastReadPost)) return false;
 
         const parsedKey = postRefKey(parsed);
-        if (!parsed.isRepost && parsedKey && knownMarkedKeys.has(parsedKey)) {
+        // Bekannte Posts: trotzdem promoten, wenn sie in der Landkarte über der Lesestelle stehen
+        if (!parsed.isRepost && parsedKey && knownMarkedKeys.has(parsedKey) &&
+            !isAboveLesestelleOnMap(parsed, lastReadPost)) {
             debugLog('NewPosts',
                 `Freeze-Sync übersprungen: @${parsed.authorHandler} ${parsed.tweetId}` +
-                ' bereits in History/Landkarte');
+                ' bereits in History/Landkarte (nicht über Lesestelle auf Map)');
             return false;
         }
         if (lastReadPost?.isRepost && !parsed.isRepost) {
@@ -5593,11 +5637,18 @@
         };
 
         if (isNearTimelineTop()) {
-            // Am Timeline-Ende: Hochscroll-Fortschritt nicht auf Map-/ID-Anker zurücksetzen.
+            // User-Wunsch: steht der Top-Post in der Landkarte ÜBER der Lesestelle,
+            // Lesestelle dorthin ziehen (auch wenn schon in History bekannt).
+            // Sonst am Timeline-Top nicht zurückspringen/überschreiben.
+            if (!(lastReadPost && isAboveLesestelleOnMap(viewportCandidate, lastReadPost) &&
+                    isCandidateNewer(viewportCandidate, lastReadPost))) {
+                debugLog('NewPosts',
+                    `Am Timeline-Top: kein Lesestellen-Sync (@${authorHandler} ${tweetId}` +
+                    `${repostFlag ? ', Repost' : ''} ≠ @${lastReadPost?.authorHandler} ${lastReadPost?.tweetId})`);
+                return true;
+            }
             debugLog('NewPosts',
-                `Am Timeline-Top: kein Lesestellen-Sync (@${authorHandler} ${tweetId}` +
-                `${repostFlag ? ', Repost' : ''} ≠ @${lastReadPost?.authorHandler} ${lastReadPost?.tweetId})`);
-            return true;
+                `Am Timeline-Top: Sync erlaubt — Map über Lesestelle (@${authorHandler} ${tweetId})`);
         }
 
         if (lastReadPost?.tweetId && BigInt(tweetId) < BigInt(lastReadPost.tweetId)) {
