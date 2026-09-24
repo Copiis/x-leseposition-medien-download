@@ -15,7 +15,7 @@
 // @description:ko Twitter/X에서 마지막 읽기 위치를 추적하고 동기화합니다. 수동 및 자동 옵션 포함. 새로운 게시물을 확인하면서 현재 위치를 잃지 않도록 이상적입니다. 트윗 ID를 사용하여 정확한 위치 지정을 하고, 리포스트를 지원합니다。
 // @icon https://x.com/favicon.ico
 // @namespace https://github.com/Copiis/x-leseposition-medien-download
-// @version 2026.7.19a
+// @version 2026.9.22a
 // @author Copiis
 // @license MIT
 // @match https://x.com/*
@@ -1363,7 +1363,8 @@
     }
 }
 
-    async function downloadLastReadPost() {
+    async function downloadLastReadPost(options = {}) {
+    const { force = false } = options;
     if (!window.location.href.includes('/home')) {
         debugLog('Load', 'Download übersprungen: Nicht auf Home-Seite.');
         return;
@@ -1376,7 +1377,7 @@
         }
 
         const postKey = `${lastReadPost.tweetId}-${lastReadPost.authorHandler}`;
-        if (downloadedPosts.has(postKey)) {
+        if (!force && downloadedPosts.has(postKey)) {
             showPopup('alreadyDownloaded', 5000);
             return;
         }
@@ -1866,24 +1867,26 @@
     }
 
     async function markTopVisiblePost(save = true, allowOlderRegression = false, mapDirection = null) {
+    let savedNow = false;
     try {
 
     if (!window.location.href.includes('/home') || isLesestelleMutationBlocked()) {
-        return;
+        return false;
     }
 
-    if (searchControl.lastManualSearchEndedAt > 0 &&
+    if (!allowOlderRegression &&
+        searchControl.lastManualSearchEndedAt > 0 &&
         Date.now() - searchControl.lastManualSearchEndedAt < CONFIG.POST_LUPE_NEWER_BLOCK_MS) {
         debugLog('Save', 'Auto-Save unterdrückt (nach Lupe-Suche / Scrollbalken-Nachlauf)');
-        return;
+        return false;
     }
 
     const dir = mapDirection || scrollState.lastMapScrollDirection || 'neutral';
     refreshMapForLesestelle('mark', dir);
 
-    if (dir === 'up' || scrollState.hasScrolledUp) {
+    if (!allowOlderRegression && (dir === 'up' || scrollState.hasScrolledUp)) {
         const promoted = await tryPromoteNewerVisiblePostOnScrollUp(dir);
-        if (promoted) return;
+        if (promoted) return false;
     }
 
     // Gedächtnis-Abgleich — beim Hochscrollen pausieren (konkurriert mit tryPromote)
@@ -1895,7 +1898,7 @@
     }
 
     // Punkt 3 vereinfacht: kurzer Grace + sofortige Aufhebung sobald User zu neuerem Post scrollt
-    if (save && suppressionState.until > 0) {
+    if (save && !allowOlderRegression && suppressionState.until > 0) {
         const now = Date.now();
         let suppress = false;
 
@@ -1930,7 +1933,7 @@
         debugLog('Restore', 'Grace abgelaufen — normale Auto-Speicherung wieder aktiv');
     }
 
-    if (save && scrollState.programmaticScrollEndedAt > 0 &&
+    if (save && !allowOlderRegression && scrollState.programmaticScrollEndedAt > 0 &&
         Date.now() - scrollState.programmaticScrollEndedAt < 2500) {
         save = false;
         debugLog('Restore', 'Auto-Save unterdrückt (nach programmatischem Scroll)');
@@ -2074,7 +2077,9 @@
 
         let shouldUpdate = true;
 
-        if (lastReadPost && lastReadPost.tweetId) {
+        if (allowOlderRegression) {
+            shouldUpdate = true;
+        } else if (lastReadPost && lastReadPost.tweetId) {
             try {
                 const newPostData = {
                     tweetId: postTweetId,
@@ -2107,11 +2112,12 @@
         if (shouldUpdate) {
             lastReadPost = newPost;
             currentPost = newPost;
-            await saveLastReadPost(lastReadPost);
+            await saveLastReadPost(lastReadPost, { force: allowOlderRegression });
             log('Save', 'Neue Leseposition gespeichert: @' + postAuthorHandler, postTweetId, repostFlag ? '(Repost)' : '');
 
             // Nach jedem erfolgreichen Speichern das Hochscroll-Flag zurücksetzen.
             scrollState.hasScrolledUp = false;
+            savedNow = true;
         }
     }
 
@@ -2126,6 +2132,7 @@
             applyHighlightToPost(savedElement);
         }
     }
+    return savedNow;
     } catch (err) {
         log('Highlight', 'Unerwarteter Fehler in markTopVisiblePost:', err);
         // Wichtig: isSearching wird hier NICHT angefasst – das übernimmt der Caller oder startRefinedSearch...
@@ -5895,9 +5902,19 @@
                     {
                         icon: 'save',
                         title: 'Save current position',
-                        onClick: () => {
-                            // Expliziter manueller Save darf auch ältere Reposts als Lesestelle setzen
-                            markTopVisiblePost(true, true);
+                        onClick: async () => {
+                            if (!isScriptActivated) {
+                                isScriptActivated = true;
+                                log('UI', 'Skript durch Speichern-Klick aktiviert.');
+                                observeForNewPosts();
+                            }
+                            const saved = await markTopVisiblePost(true, true);
+                            if (!saved) {
+                                showPopup('noValidPosition', 5000);
+                                log('Save', 'Manuelles Speichern ohne Lesestelle abgebrochen');
+                                return;
+                            }
+                            await downloadLastReadPost({ force: true });
                             log('Save', 'Manuell gespeichert');
                         },
                     },

@@ -69,3 +69,10 @@ Automatisch (Chrome CDP Port 9222): `node greasyfork-cdp-fill.mjs de --publish`
 ## Lizenz
 
 MIT · [Copiis](https://github.com/Copiis)
+
+## Superuser / sudo (AI)
+
+Wenn die AI **Superuser-Rechte** (`sudo` o. Ä.) braucht, um ein Ziel zu erreichen, **darf und soll sie ein Bestätigungsfenster öffnen**, in dem du das Passwort eingeben kannst (z. B. grafischer `pkexec`/`sudo`-Dialog oder Terminal-Prompt).
+
+- Die AI speichert, loggt und commitet **kein** Passwort.
+- Ohne deine Eingabe im Fenster geht es bei privilegierten Schritten nicht weiter — das ist beabsichtigt.
