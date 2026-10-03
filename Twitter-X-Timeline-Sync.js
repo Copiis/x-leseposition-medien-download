@@ -15,7 +15,7 @@
 // @description:ko Twitter/X에서 마지막 읽기 위치를 추적하고 동기화합니다. 수동 및 자동 옵션 포함. 새로운 게시물을 확인하면서 현재 위치를 잃지 않도록 이상적입니다. 트윗 ID를 사용하여 정확한 위치 지정을 하고, 리포스트를 지원합니다。
 // @icon https://x.com/favicon.ico
 // @namespace https://github.com/Copiis/x-leseposition-medien-download
-// @version 2026.9.22a
+// @version 2026.10.3a
 // @author Copiis
 // @license MIT
 // @match https://x.com/*
@@ -68,6 +68,8 @@
         RESTORE_GRACE_MS: 1200,              // Kurzer harter Mindestschutz nach manuellem Restore (früher 3.5s+)
         POST_LUPE_NEWER_BLOCK_MS: 5000,      // Nach Lupe: keine automatische Lesestellen-Vorwärts-Sprünge
         NEW_POSTS_GRACE_MS: 1800,            // Nach "Neue Beiträge" (etwas länger wegen Feed-Sprung)
+        BACKGROUND_SLEEP_MS: 45000,          // Ab dieser Hintergrundzeit gilt der Tab als eingeschlafen
+        WAKE_RESTORE_GRACE_MS: 12000,        // Nach dem Aufwachen auf nachgeladene Posts warten, dann Lesestelle suchen
         NEW_POSTS_SCROLL_SEARCH_MAX_ATTEMPTS: 60,
         NEW_POSTS_SCROLL_STEP_PX: 520,
         NEW_POSTS_SCROLL_SETTLE_MS: 280,
@@ -929,7 +931,20 @@
         lastLesestelleLogKey: null,
         lastRestoreCompletedAt: 0,
         restoreGraceUntil: 0,
+        hiddenAt: 0,
+        lastSleepMs: 0,
+        lastWakeAt: 0,
+        wakeGeneration: 0,
+        wakeSearchStarted: false,
+        wakeClickArmedAt: 0,
+        hiddenBaselineKeys: null,
+        hiddenBookmark: null,
+        hiddenNearTop: false,
+        restoreStartedAt: 0,
     };
+
+    /** Laufendes Warten auf neue Posts. Hintergrund-Tabs verwerfen dessen Timer. */
+    let activeNewPostsWait = null;
 
     function snapshotReadingBookmark(bookmark = lastReadPost) {
         if (!bookmark?.tweetId || !bookmark?.authorHandler || !bookmark?.timestamp) {
@@ -1527,6 +1542,7 @@
         window.addEventListener('beforeunload', () => persistTimelineMap(true));
 
         window.addEventListener('focus', () => {
+            if (document.visibilityState === 'visible') notePageVisible('focus');
             if (!isScriptActivated || searchControl.isSearching || searchControl.isFallbackSearching || searchControl.isAutoScrolling) {
                 return;
             }
@@ -1562,6 +1578,11 @@
 
         // Zusätzlicher visibilitychange Listener für zuverlässiges Erkennen nach Background-Tab
         document.addEventListener('visibilitychange', () => {
+            if (document.visibilityState === 'hidden') {
+                notePageHidden();
+                return;
+            }
+            notePageVisible('visibility');
             if (document.visibilityState === 'visible' &&
                 isScriptActivated &&
                 !searchControl.isSearching &&
@@ -1596,7 +1617,15 @@
             }
         });
 
+        window.addEventListener('blur', () => notePageHidden());
+        document.addEventListener('freeze', () => notePageHidden());
+        document.addEventListener('resume', () => notePageVisible('resume'));
+        window.addEventListener('pageshow', () => {
+            if (document.visibilityState === 'visible') notePageVisible('pageshow');
+        });
+
         const checkNewPostsInterval = setInterval(() => {
+            nudgeStalledNewPostsRestore();
             tryAutoClickNewPosts();
             // Auch "versteckte Beiträge anzeigen" regelmäßig prüfen (X blendet sonst Teile der Timeline aus)
             tryClickShowHiddenPostsButton('interval');
@@ -1691,7 +1720,7 @@
         return;
     }
 
-    log('Init', 'Initialisiere Skript auf /home... (Version 2026.6.29k)');
+    log('Init', 'Initialisiere Skript auf /home... (Version 2026.10.3a)');
     log('Init', 'Diag-Logging aktiv — bei Problemen Konsole filtern: Diag:ERROR | Diag:WARN | Diag:SESSION');
 
     const observer = new MutationObserver((mutations, obs) => {
@@ -2152,9 +2181,19 @@
     let loadAttempts = 0;
     const maxLoadAttempts = aggressiveScroll ? 80 : 12;
     let callbackTriggered = false;
+    let wasHiddenDuringWait = pageIsBackgrounded();
     let observer = null;
     let timeoutCheck = null;
     let fallbackTimer = null;
+    let onVisibilityEvent = null;
+
+    const cleanupWait = () => {
+        if (observer) observer.disconnect();
+        if (timeoutCheck) clearInterval(timeoutCheck);
+        if (fallbackTimer) clearTimeout(fallbackTimer);
+        if (onVisibilityEvent) document.removeEventListener('visibilitychange', onVisibilityEvent);
+        if (activeNewPostsWait === waitApi) activeNewPostsWait = null;
+    };
 
     const hasNewDomContent = () => {
         const currentPostCount = document.querySelectorAll('article').length;
@@ -2167,17 +2206,66 @@
 
     const triggerCallback = (reason) => {
         if (callbackTriggered || searchControl.isSearchCancelled) return;
+        if (pageIsBackgrounded()) {
+            wasHiddenDuringWait = true;
+            debugLog('NewPosts', `Restore-Trigger „${reason}“ im Hintergrund zurückgestellt.`);
+            armFallback(CONFIG.WAKE_RESTORE_GRACE_MS, 'hidden-hold');
+            return;
+        }
         callbackTriggered = true;
-        if (observer) observer.disconnect();
-        if (timeoutCheck) clearInterval(timeoutCheck);
-        if (fallbackTimer) clearTimeout(fallbackTimer);
+        cleanupWait();
         debugLog('NewPosts', `Restore-Trigger: ${reason}`);
         setTimeout(() => {
             callback();
         }, settleMs);
     };
 
+    const armFallback = (ms, reason) => {
+        if (fallbackTimer) clearTimeout(fallbackTimer);
+        fallbackTimer = setTimeout(() => {
+            if (callbackTriggered || searchControl.isSearchCancelled) return;
+            if (pageIsBackgrounded()) {
+                wasHiddenDuringWait = true;
+                armFallback(CONFIG.WAKE_RESTORE_GRACE_MS, 'hidden-retry');
+                return;
+            }
+            log('NewPosts', `Fallback-Restore (${reason}).`);
+            triggerCallback(reason);
+        }, ms);
+    };
+
+    const onVisibility = (forceAwake) => {
+        if (!forceAwake && pageIsBackgrounded()) {
+            wasHiddenDuringWait = true;
+            return;
+        }
+        if (!wasHiddenDuringWait || callbackTriggered) return;
+        loadAttempts = 0;
+        log('NewPosts', 'Tab wieder sichtbar — warte auf die nachgeladenen Posts, dann Lesestelle.');
+        armFallback(CONFIG.WAKE_RESTORE_GRACE_MS, 'wake');
+        setTimeout(() => {
+            if (callbackTriggered || pageIsBackgrounded()) return;
+            if (hasNewDomContent()) triggerCallback('wake-dom');
+        }, 700);
+    };
+
+    const waitApi = {
+        isDone: () => callbackTriggered,
+        force: (reason) => triggerCallback(reason || 'wake-force'),
+        extendForWake: () => {
+            if (callbackTriggered) return;
+            wasHiddenDuringWait = true;
+            newPostsState.restoreStartedAt = Date.now();
+            onVisibility(true);
+        },
+    };
+    activeNewPostsWait = waitApi;
+
     observer = new MutationObserver(() => {
+        if (pageIsBackgrounded()) {
+            wasHiddenDuringWait = true;
+            return;
+        }
         if (!hasNewDomContent()) return;
         log('NewPosts', 'Neue Beiträge oder Zellen im DOM erkannt, starte Suche.');
         triggerCallback('mutation');
@@ -2189,11 +2277,15 @@
     });
 
     timeoutCheck = setInterval(() => {
-        loadAttempts++;
         if (callbackTriggered || searchControl.isSearchCancelled) {
             clearInterval(timeoutCheck);
             return;
         }
+        if (pageIsBackgrounded()) {
+            wasHiddenDuringWait = true;
+            return;
+        }
+        loadAttempts++;
         if (hasNewDomContent()) {
             log('NewPosts', 'Neue Beiträge über Polling erkannt, starte Suche.');
             triggerCallback('poll');
@@ -2206,16 +2298,12 @@
         }
     }, 1000);
 
-    fallbackTimer = setTimeout(() => {
-        if (callbackTriggered || searchControl.isSearchCancelled) return;
-        log('NewPosts', 'Fallback-Restore (DOM bereits beim Klick aktualisiert).');
-        triggerCallback('fallback');
-    }, fallbackMs);
+    armFallback(fallbackMs, 'fallback');
+    onVisibilityEvent = () => onVisibility(false);
+    document.addEventListener('visibilitychange', onVisibilityEvent);
 
     window.addEventListener('unload', () => {
-        if (observer) observer.disconnect();
-        if (timeoutCheck) clearInterval(timeoutCheck);
-        if (fallbackTimer) clearTimeout(fallbackTimer);
+        cleanupWait();
         searchControl.isSearching = false;
         searchControl.isFallbackSearching = false;
     }, { once: true });
@@ -5130,6 +5218,7 @@
         }
         const indicator = getNewPostsIndicator();
         if (indicator && indicator.dataset.processed !== 'true') {
+            newPostsState.wakeClickArmedAt = Date.now();
             clickNewPostsIndicator();
         }
     }
@@ -5696,6 +5785,185 @@
         return true;
     }
 
+    let newPostsRestoreGeneration = 0;
+
+    function pageIsBackgrounded() {
+        return document.hidden || !document.hasFocus();
+    }
+
+    function notePageHidden() {
+        if (newPostsState.hiddenAt) return;
+        newPostsState.hiddenAt = Date.now();
+        newPostsState.hiddenNearTop = isNearTimelineTop();
+        try {
+            newPostsState.hiddenBaselineKeys = snapshotLoadedPostKeys();
+            newPostsState.hiddenBookmark = snapshotReadingBookmark();
+        } catch (e) {
+            debugLog('Restore', 'Hintergrund-Stand konnte nicht gemerkt werden: ' + e);
+        }
+    }
+
+    function notePageVisible(source) {
+        const hiddenAt = newPostsState.hiddenAt;
+        if (!hiddenAt) return;
+        const sleptMs = Date.now() - hiddenAt;
+        newPostsState.hiddenAt = 0;
+        newPostsState.lastSleepMs = sleptMs;
+        newPostsState.lastWakeAt = Date.now();
+        if (sleptMs < CONFIG.BACKGROUND_SLEEP_MS) return;
+        if (!window.location.pathname.startsWith('/home')) return;
+        if (!searchControl.manualSearchActive) {
+            searchControl.isSearchCancelled = false;
+        }
+        log('Restore', `Nach ${Math.round(sleptMs / 1000)}s im Hintergrund (${source}): Lesestelle wird nach neuen Posts gesucht.`);
+        if (activeNewPostsWait && !activeNewPostsWait.isDone()) {
+            activeNewPostsWait.extendForWake();
+            return;
+        }
+        if (!searchControl.manualSearchActive &&
+            (searchControl.isSearching || searchControl.newPostsRestoreActive || searchControl.isAutoScrolling)) {
+            debugLog('Restore', 'Hängende Suche nach Hintergrund zurückgesetzt.');
+            searchControl.isSearching = false;
+            searchControl.newPostsRestoreActive = false;
+            searchControl.isAutoScrolling = false;
+            searchControl.isFallbackSearching = false;
+        }
+        scheduleWakeReadingSearch();
+    }
+
+    function nudgeStalledNewPostsRestore() {
+        if (pageIsBackgrounded() || searchControl.manualSearchActive) return;
+        if (!activeNewPostsWait || activeNewPostsWait.isDone()) return;
+        const started = newPostsState.restoreStartedAt || 0;
+        if (!started) return;
+        if (Date.now() - started < CONFIG.WAKE_RESTORE_GRACE_MS + 4000) return;
+        log('Restore', 'Suche nach der Lesestelle hing nach dem Aufwachen — starte sie jetzt.');
+        activeNewPostsWait.force('watchdog');
+    }
+
+    function scheduleWakeReadingSearch() {
+        const generation = ++newPostsState.wakeGeneration;
+        newPostsState.wakeSearchStarted = false;
+        newPostsState.wakeClickArmedAt = 0;
+        const bookmark = newPostsState.hiddenBookmark || snapshotReadingBookmark();
+        const baseline = newPostsState.hiddenBaselineKeys || snapshotLoadedPostKeys();
+        if (!bookmark?.tweetId) return;
+        const delays = [800, 2500, 6000, 12000];
+        delays.forEach((delay) => {
+            setTimeout(() => {
+                if (generation !== newPostsState.wakeGeneration) return;
+                if (pageIsBackgrounded() || !isScriptActivated || searchControl.manualSearchActive) return;
+                if (!newPostsState.hiddenNearTop && !isNearTimelineTop()) return;
+                if (searchControl.isSearching || searchControl.newPostsRestoreActive) return;
+                if (isReadingPositionAtTargetOffset(bookmark)) return;
+                if (newPostsState.wakeClickArmedAt &&
+                    Date.now() - newPostsState.wakeClickArmedAt < 8000) {
+                    return;
+                }
+                const pill = typeof getNewPostsIndicator === 'function' ? getNewPostsIndicator() : null;
+                if (pill && pill.dataset.processed !== 'true' && isNearTimelineTop() && !isNewPostsAutoLoadPaused()) {
+                    newPostsState.wakeClickArmedAt = Date.now();
+                    tryAutoClickNewPosts();
+                    return;
+                }
+                if (newPostsState.wakeSearchStarted) return;
+                newPostsState.wakeSearchStarted = true;
+                void runWakeReadingSearch(bookmark, baseline);
+            }, delay);
+        });
+    }
+
+    async function runWakeReadingSearch(bookmark, baseline) {
+        if (searchControl.manualSearchActive || searchControl.isSearching || searchControl.newPostsRestoreActive) {
+            return;
+        }
+        if (isReadingPositionAtTargetOffset(bookmark)) return;
+        searchControl.newPostsRestoreActive = true;
+        searchControl.isSearching = true;
+        newPostsState.restoreStartedAt = Date.now();
+        newPostsState.restoreGraceUntil = Date.now() + CONFIG.NEW_POSTS_GRACE_MS + 2500;
+        suppressionState.until = Date.now() + CONFIG.NEW_POSTS_GRACE_MS;
+        log('Restore', 'Nach dem Aufwachen: suche die Lesestelle.');
+        diagBeginFlow('wake-reading-search', { frozenBookmark: diagBookmark(bookmark) });
+        await finishNewPostsRestore(bookmark, baseline instanceof Set ? baseline : snapshotLoadedPostKeys());
+    }
+
+    async function finishNewPostsRestore(restoreBookmark, postsBeforeNewPosts) {
+        const generation = ++newPostsRestoreGeneration;
+        try {
+            const resolved = await restoreReadingPositionAfterNewPosts(restoreBookmark, postsBeforeNewPosts);
+            if (generation !== newPostsRestoreGeneration) return;
+            if (!resolved) {
+                diagPush('NEWPOSTS_EMPTY_FEED', 'error', 'Kein Treffer nach New-Posts Scroll-Restore', {
+                    frozen: diagBookmark(restoreBookmark),
+                    snapshot: diagSnapshot(),
+                });
+                showPopup('tweetIdNotFound', 6000, {
+                    authorHandler: restoreBookmark.authorHandler,
+                    tweetId: restoreBookmark.tweetId
+                });
+                diagEndFlow('fail', 'NEWPOSTS_NO_RESOLVE', 'Weder Lesestelle noch neue Posts');
+                return;
+            }
+
+            const adopt = resolved.adopt === true || resolved.strategy === 'new-posts-oldest';
+            log('Restore', `New-Posts Restore (${resolved.strategy}, adopt=${adopt}) → @${resolved.post.authorHandler} ${resolved.post.tweetId}`);
+            const landingOk = await applyResolvedReadingPosition(resolved, {
+                adopt,
+                expectedBookmark: restoreBookmark,
+                verifySource: 'new-posts-restore',
+            });
+            if (generation !== newPostsRestoreGeneration) return;
+
+            const popupKey = getResolvePopupKey(resolved);
+            if (popupKey) {
+                const lang = getUserLanguage();
+                showPopup(popupKey, 5000, {
+                    strategy: getResolveStrategyLabel(resolved.strategy, lang)
+                });
+            }
+
+            if (landingOk) {
+                if (!adopt) {
+                    await reinstateFrozenReadingBookmark(restoreBookmark);
+                }
+                newPostsState.lastRestoreCompletedAt = Date.now();
+                updateTimelineMap('new-posts-restore', 'up');
+                if (resolved.strategy === 'exact' && isReadingPositionAtTargetOffset(restoreBookmark)) {
+                    newPostsState.autoLoadPaused = true;
+                }
+                diagEndFlow('ok', 'NEWPOSTS_RESTORE_OK', 'Restore abgeschlossen', {
+                    strategy: resolved.strategy,
+                    frozen: diagBookmark(restoreBookmark),
+                });
+            } else {
+                diagEndFlow('fail', 'NEWPOSTS_RESTORE_FAIL', 'Restore ohne gültiges Landing');
+            }
+        } catch (err) {
+            if (generation !== newPostsRestoreGeneration) return;
+            log('Restore', 'Fehler beim New-Posts Restore:', err);
+            diagPush('NEWPOSTS_RESTORE_ERROR', 'error', String(err?.message || err), {
+                frozen: diagBookmark(restoreBookmark),
+                snapshot: diagSnapshot(),
+            });
+            await landReadingPositionFromResolve('new-posts-error', restoreBookmark);
+            diagEndFlow('fail', 'NEWPOSTS_RESTORE_EXCEPTION', 'Restore mit Exception beendet');
+        } finally {
+            if (generation !== newPostsRestoreGeneration) return;
+            searchControl.isSearching = false;
+            searchControl.newPostsRestoreActive = false;
+            flushDeferredTimelineMapUpdate('new-posts-restore');
+            lastScrollY = window.scrollY;
+            scrollState.lastMapScrollY = window.scrollY;
+            scrollState.hasScrolledUp = false;
+            setTimeout(() => {
+                if (generation !== newPostsRestoreGeneration) return;
+                void reinstateFrozenReadingBookmark(restoreBookmark, { save: false });
+                newPostsState.restoreGraceUntil = Date.now() + 1500;
+            }, 500);
+        }
+    }
+
     async function clickNewPostsIndicator() {
 
     if (searchControl.manualSearchActive) {
@@ -5765,6 +6033,7 @@
 
     searchControl.newPostsRestoreActive = true;
     searchControl.isSearching = true;
+    newPostsState.restoreStartedAt = Date.now();
     diagBeginFlow('new-posts-restore', { frozenBookmark: diagBookmark(restoreBookmark) });
     diagPush('BOOKMARK_FROZEN', 'info', 'Restore-Bookmark eingefroren', {
         frozen: diagBookmark(restoreBookmark),
@@ -5792,74 +6061,8 @@
     log('Restore', 'Nach neuen Beiträgen: Warte auf DOM-Stabilisierung und versuche letzte Lesestelle wiederherzustellen...');
 
     waitForNewPosts(() => {
-        setTimeout(async () => {
-            try {
-                const resolved = await restoreReadingPositionAfterNewPosts(restoreBookmark, postsBeforeNewPosts);
-                if (!resolved) {
-                    diagPush('NEWPOSTS_EMPTY_FEED', 'error', 'Kein Treffer nach New-Posts Scroll-Restore', {
-                        frozen: diagBookmark(restoreBookmark),
-                        snapshot: diagSnapshot(),
-                    });
-                    showPopup('tweetIdNotFound', 6000, {
-                        authorHandler: restoreBookmark.authorHandler,
-                        tweetId: restoreBookmark.tweetId
-                    });
-                    diagEndFlow('fail', 'NEWPOSTS_NO_RESOLVE', 'Weder Lesestelle noch neue Posts');
-                    return;
-                }
-
-                const adopt = resolved.adopt === true || resolved.strategy === 'new-posts-oldest';
-                log('Restore', `New-Posts Restore (${resolved.strategy}, adopt=${adopt}) → @${resolved.post.authorHandler} ${resolved.post.tweetId}`);
-                const landingOk = await applyResolvedReadingPosition(resolved, {
-                    adopt,
-                    expectedBookmark: restoreBookmark,
-                    verifySource: 'new-posts-restore',
-                });
-
-                const popupKey = getResolvePopupKey(resolved);
-                if (popupKey) {
-                    const lang = getUserLanguage();
-                    showPopup(popupKey, 5000, {
-                        strategy: getResolveStrategyLabel(resolved.strategy, lang)
-                    });
-                }
-
-                if (landingOk) {
-                    if (!adopt) {
-                        await reinstateFrozenReadingBookmark(restoreBookmark);
-                    }
-                    newPostsState.lastRestoreCompletedAt = Date.now();
-                    updateTimelineMap('new-posts-restore', 'up');
-                    if (resolved.strategy === 'exact' && isReadingPositionAtTargetOffset(restoreBookmark)) {
-                        newPostsState.autoLoadPaused = true;
-                    }
-                    diagEndFlow('ok', 'NEWPOSTS_RESTORE_OK', 'Restore abgeschlossen', {
-                        strategy: resolved.strategy,
-                        frozen: diagBookmark(restoreBookmark),
-                    });
-                } else {
-                    diagEndFlow('fail', 'NEWPOSTS_RESTORE_FAIL', 'Restore ohne gültiges Landing');
-                }
-            } catch (err) {
-                log('Restore', 'Fehler beim New-Posts Restore:', err);
-                diagPush('NEWPOSTS_RESTORE_ERROR', 'error', String(err?.message || err), {
-                    frozen: diagBookmark(restoreBookmark),
-                    snapshot: diagSnapshot(),
-                });
-                await landReadingPositionFromResolve('new-posts-error', restoreBookmark);
-                diagEndFlow('fail', 'NEWPOSTS_RESTORE_EXCEPTION', 'Restore mit Exception beendet');
-            } finally {
-                searchControl.isSearching = false;
-                searchControl.newPostsRestoreActive = false;
-                flushDeferredTimelineMapUpdate('new-posts-restore');
-                lastScrollY = window.scrollY;
-                scrollState.lastMapScrollY = window.scrollY;
-                scrollState.hasScrolledUp = false;
-                setTimeout(() => {
-                    void reinstateFrozenReadingBookmark(restoreBookmark, { save: false });
-                    newPostsState.restoreGraceUntil = Date.now() + 1500;
-                }, 500);
-            }
+        setTimeout(() => {
+            void finishNewPostsRestore(restoreBookmark, postsBeforeNewPosts);
         }, 400);
     }, {
         ...domBaseline,
