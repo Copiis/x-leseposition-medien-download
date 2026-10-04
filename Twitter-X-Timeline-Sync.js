@@ -15,7 +15,7 @@
 // @description:ko Twitter/X에서 마지막 읽기 위치를 추적하고 동기화합니다. 수동 및 자동 옵션 포함. 새로운 게시물을 확인하면서 현재 위치를 잃지 않도록 이상적입니다. 트윗 ID를 사용하여 정확한 위치 지정을 하고, 리포스트를 지원합니다。
 // @icon https://x.com/favicon.ico
 // @namespace https://github.com/Copiis/x-leseposition-medien-download
-// @version 2026.10.3a
+// @version 2026.10.4a
 // @author Copiis
 // @license MIT
 // @match https://x.com/*
@@ -1530,12 +1530,20 @@
             lastScrollY = window.scrollY;
             scrollState.lastMapScrollY = window.scrollY;
 
+            // Erst die sichtbare Lesestelle übernehmen, danach „Neue Beiträge“.
+            // Sonst friert der Klick die alte Stelle ein und scrollt nach dem
+            // Markieren des neuesten Beitrags wieder dorthin zurück.
+            const markPromise = markTopVisiblePost(true, false, mapScrollDir);
             if (!isNearTimelineTop()) {
                 newPostsState.autoLoadPaused = false;
             } else {
-                tryAutoClickNewPosts();
+                void Promise.resolve(markPromise).then(() => {
+                    if (isNearTimelineTop()) tryAutoClickNewPosts();
+                }).catch((err) => {
+                    debugLog('Save', 'Lesestellen-Update vor Neue-Beiträge fehlgeschlagen:', err);
+                    if (isNearTimelineTop()) tryAutoClickNewPosts();
+                });
             }
-            markTopVisiblePost(true, false, mapScrollDir);
         }, 150), { passive: true });
 
         setupTimelineMapObserver();
@@ -1720,7 +1728,7 @@
         return;
     }
 
-    log('Init', 'Initialisiere Skript auf /home... (Version 2026.10.3a)');
+    log('Init', 'Initialisiere Skript auf /home... (Version 2026.10.4a)');
     log('Init', 'Diag-Logging aktiv — bei Problemen Konsole filtern: Diag:ERROR | Diag:WARN | Diag:SESSION');
 
     const observer = new MutationObserver((mutations, obs) => {
@@ -2031,6 +2039,7 @@
                         readAt: new Date().toISOString(),
                         context: captureReadingContext(anchorPost)
                     };
+                    noteUserAdvancedReadingPosition(lastReadPost);
                     await saveLastReadPost(lastReadPost, { force: true });
                     updateHighlightedPost();
                     debugLog('Save', `GM-Sync: bekannter Post ${positionKey} aktualisiert` +
@@ -2141,6 +2150,7 @@
         if (shouldUpdate) {
             lastReadPost = newPost;
             currentPost = newPost;
+            noteUserAdvancedReadingPosition(newPost);
             await saveLastReadPost(lastReadPost, { force: allowOlderRegression });
             log('Save', 'Neue Leseposition gespeichert: @' + postAuthorHandler, postTweetId, repostFlag ? '(Repost)' : '');
 
@@ -2563,6 +2573,7 @@
         invalidateHighlightRetries();
         lastReadPost = newPost;
         currentPost = newPost;
+        noteUserAdvancedReadingPosition(newPost);
         updateScrollUpMaxTweetId(newPost.tweetId);
         await saveLastReadPost(lastReadPost, { force: true });
         updateHighlightedPost(newer.element);
@@ -2839,6 +2850,7 @@
                     );
                     if (newestVisible && isCandidateNewer(newestHist, lastReadPost)) {
                         lastReadPost = { ...newestHist };
+                        noteUserAdvancedReadingPosition(lastReadPost);
                         updateHighlightedPost();
                         void saveLastReadPost(lastReadPost, { force: true });
                         debugLog('Save', 'Gedächtnis-Abgleich: Neuester History-Eintrag oben im Feed (GM-Sync)');
@@ -2875,6 +2887,7 @@
                 // dann setzen wir ihn als autoritative Lesestelle (starkes Gedächtnis).
                 if (isCandidateNewer(bestFromHistoryAndVisible, lastReadPost)) {
                     lastReadPost = { ...bestFromHistoryAndVisible };
+                    noteUserAdvancedReadingPosition(lastReadPost);
                     updateHighlightedPost();
                     debugLog('Save', 'Gedächtnis-Abgleich: Lesestelle aus History + sichtbarer Timeline korrigiert');
                 }
@@ -4378,6 +4391,11 @@
 
         await new Promise(r => setTimeout(r, 450));
 
+        if (isLiveReadingAheadOf(bookmark)) {
+            debugLog('Restore', 'New-Posts-Scroll nicht gestartet — Lesestelle ist inzwischen neuer');
+            return null;
+        }
+
         let newPostCandidates = collectNewPostsSinceBaseline(bookmark, baselineKeys);
         let lastArticleCount = document.querySelectorAll('article').length;
         let lastScrollHeight = document.body.scrollHeight || document.documentElement.scrollHeight;
@@ -4424,6 +4442,11 @@
                 }
 
                 if (step >= maxSteps) break;
+
+                if (isLiveReadingAheadOf(bookmark)) {
+                    debugLog('Restore', 'New-Posts-Scroll gestoppt — Lesestelle ist inzwischen neuer');
+                    return null;
+                }
 
                 window.scrollBy({ top: CONFIG.NEW_POSTS_SCROLL_STEP_PX, behavior: 'auto' });
                 await new Promise(r => setTimeout(r, CONFIG.NEW_POSTS_SCROLL_SETTLE_MS));
@@ -4552,6 +4575,12 @@
             return false;
         }
 
+        if (expectedBookmark && isLiveReadingAheadOf(expectedBookmark)) {
+            debugLog('Position', 'Landing übersprungen — Lesestelle ist neuer als das Restore-Ziel');
+            syncHighlightIfDrifted();
+            return false;
+        }
+
         const { post, confidence, strategy } = resolved;
 
         const fresh = resolveFreshPostElement(post.element, post.tweetId, post.authorHandler) || post.element;
@@ -4576,6 +4605,10 @@
                 ? { ignoreAnchorStale: true }
                 : {};
             await new Promise(resolve => scrollToPostWithHighlight(post.element, resolve, scrollOpts));
+            if (expectedBookmark && isLiveReadingAheadOf(expectedBookmark)) {
+                syncHighlightIfDrifted();
+                return false;
+            }
             applyHighlightToPost(fresh, { confidence, strategy });
         } else {
             applyHighlightToPost(fresh, { confidence, strategy });
@@ -5245,10 +5278,59 @@
         if (onComplete) onComplete();
     }
 
+    /** Lebende Lesestelle ist ein anderer, neuerer Post als das eingefrorene Ziel. */
+    function isLiveReadingAheadOf(frozen) {
+        if (!frozen?.tweetId || !lastReadPost?.tweetId) return false;
+        if (postRefKey(lastReadPost) === postRefKey(frozen)) return false;
+        return isCandidateNewer(lastReadPost, frozen);
+    }
+
+    /**
+     * Hochscrollen hat die Lesestelle nach vorn gesetzt.
+     * Eine vorher gemerkte Aufwach-Suche darf danach nicht mehr zur alten Stelle springen.
+     */
+    function noteUserAdvancedReadingPosition(newPost) {
+        if (!newPost?.tweetId) return;
+        const hidden = newPostsState.hiddenBookmark;
+        if (!hidden?.tweetId) return;
+        if (postRefKey(newPost) === postRefKey(hidden)) return;
+        if (!isCandidateNewer(newPost, hidden)) return;
+        newPostsState.wakeGeneration++;
+        newPostsState.hiddenBookmark = null;
+        debugLog('Restore',
+            'Aufwach-Suche verworfen — neuere Lesestelle @' +
+            (newPost.authorHandler || '?') + ' ' + newPost.tweetId);
+    }
+
+    function liveReadingIsAheadOfPost(post) {
+        if (!post || !lastReadPost?.tweetId) return false;
+        const tweetId = getPostTweetId(post);
+        if (!tweetId) return false;
+        const authorHandler = getPostAuthorHandler(post);
+        if (tweetId === lastReadPost.tweetId &&
+            authorHandler === lastReadPost.authorHandler &&
+            !!isRepost(post) === !!lastReadPost.isRepost) {
+            return false;
+        }
+        return isCandidateNewer(lastReadPost, {
+            tweetId,
+            authorHandler,
+            timestamp: getPostTimestamp(post),
+            isRepost: isRepost(post)
+        });
+    }
+
     async function reinstateFrozenReadingBookmark(bookmark, options = {}) {
         const { save = true, highlight = true } = options;
         const frozen = snapshotReadingBookmark(bookmark);
         if (!frozen?.tweetId || !frozen.authorHandler) return false;
+        if (isLiveReadingAheadOf(frozen)) {
+            debugLog('Restore',
+                'Ältere Lesestelle nicht zurückgeschrieben — @' +
+                lastReadPost.authorHandler + ' ' + lastReadPost.tweetId + ' bleibt');
+            syncHighlightIfDrifted();
+            return false;
+        }
 
         const account = frozen.account || await getCurrentUserHandle();
         lastReadPost = { ...frozen, account };
@@ -5282,6 +5364,14 @@
     }
     const anchorTweetId = getPostTweetId(post);
     const anchorAuthor = getPostAuthorHandler(post);
+    if (liveReadingIsAheadOfPost(post)) {
+        debugLog('Position', 'Scroll abgebrochen — Lesestelle ist neuer als das Scroll-Ziel');
+        searchControl.isAutoScrolling = false;
+        scrollState.programmaticScrollEndedAt = Date.now();
+        syncHighlightIfDrifted();
+        if (onComplete) onComplete();
+        return;
+    }
     if (!ignoreAnchorStale && isScrollAnchorStale(anchorTweetId, anchorAuthor)) {
         debugLog('Position', 'Scroll übersprungen — Lesestelle wurde vor Positionierung aktualisiert');
         searchControl.isAutoScrolling = false;
@@ -5353,6 +5443,14 @@
 
         debugLog('Position', `rect.top:${rect.top} scrollY:${scrollY} targetY:${targetY} Δ:${Math.round(deviation)} Versuch:${positionAttempts+1}`);
 
+        if (liveReadingIsAheadOfPost(activePost) || liveReadingIsAheadOfPost(post)) {
+            debugLog('Position', 'Positionierung abgebrochen — Lesestelle ist neuer als das Scroll-Ziel');
+            searchControl.isAutoScrolling = false;
+            scrollState.programmaticScrollEndedAt = Date.now();
+            syncHighlightIfDrifted();
+            if (onComplete) onComplete();
+            return;
+        }
         if (!ignoreAnchorStale && isScrollAnchorStale(anchorTweetId, anchorAuthor)) {
             finishPostHighlightAtOffset(
                 activePost,
@@ -5675,6 +5773,7 @@
             readAt: new Date().toISOString(),
             context: captureReadingContext(topEl)
         };
+        noteUserAdvancedReadingPosition(lastReadPost);
         await saveLastReadPost(lastReadPost);
         updateHighlightedPost(topEl);
         debugLog('NewPosts',
@@ -5774,6 +5873,7 @@
                 account,
                 readAt: new Date().toISOString()
             };
+            noteUserAdvancedReadingPosition(lastReadPost);
             await saveLastReadPost(lastReadPost);
             updateHighlightedPost();
             log('Save', 'Lesestelle vor New-Posts synchronisiert: @' + authorHandler, tweetId);
@@ -5856,6 +5956,10 @@
                 if (!newPostsState.hiddenNearTop && !isNearTimelineTop()) return;
                 if (searchControl.isSearching || searchControl.newPostsRestoreActive) return;
                 if (isReadingPositionAtTargetOffset(bookmark)) return;
+                if (isLiveReadingAheadOf(bookmark)) {
+                    debugLog('Restore', 'Aufwach-Suche übersprungen — Lesestelle ist inzwischen neuer');
+                    return;
+                }
                 if (newPostsState.wakeClickArmedAt &&
                     Date.now() - newPostsState.wakeClickArmedAt < 8000) {
                     return;
@@ -5877,6 +5981,10 @@
         if (searchControl.manualSearchActive || searchControl.isSearching || searchControl.newPostsRestoreActive) {
             return;
         }
+        if (isLiveReadingAheadOf(bookmark)) {
+            debugLog('Restore', 'Aufwach-Suche abgebrochen — Lesestelle ist inzwischen neuer');
+            return;
+        }
         if (isReadingPositionAtTargetOffset(bookmark)) return;
         searchControl.newPostsRestoreActive = true;
         searchControl.isSearching = true;
@@ -5891,8 +5999,19 @@
     async function finishNewPostsRestore(restoreBookmark, postsBeforeNewPosts) {
         const generation = ++newPostsRestoreGeneration;
         try {
+            if (isLiveReadingAheadOf(restoreBookmark)) {
+                debugLog('Restore',
+                    'Kein Rücksprung — Lesestelle @' + lastReadPost.authorHandler + ' ' +
+                    lastReadPost.tweetId + ' ist neuer als @' +
+                    restoreBookmark.authorHandler + ' ' + restoreBookmark.tweetId);
+                return;
+            }
             const resolved = await restoreReadingPositionAfterNewPosts(restoreBookmark, postsBeforeNewPosts);
             if (generation !== newPostsRestoreGeneration) return;
+            if (isLiveReadingAheadOf(restoreBookmark)) {
+                debugLog('Restore', 'Restore verworfen — Lesestelle wurde während der Suche neuer');
+                return;
+            }
             if (!resolved) {
                 diagPush('NEWPOSTS_EMPTY_FEED', 'error', 'Kein Treffer nach New-Posts Scroll-Restore', {
                     frozen: diagBookmark(restoreBookmark),
@@ -5914,6 +6033,11 @@
                 verifySource: 'new-posts-restore',
             });
             if (generation !== newPostsRestoreGeneration) return;
+            if (isLiveReadingAheadOf(restoreBookmark)) {
+                debugLog('Restore', 'Landing verworfen — Lesestelle ist neuer als das Restore-Ziel');
+                syncHighlightIfDrifted();
+                return;
+            }
 
             const popupKey = getResolvePopupKey(resolved);
             if (popupKey) {
@@ -5946,7 +6070,9 @@
                 frozen: diagBookmark(restoreBookmark),
                 snapshot: diagSnapshot(),
             });
-            await landReadingPositionFromResolve('new-posts-error', restoreBookmark);
+            if (!isLiveReadingAheadOf(restoreBookmark)) {
+                await landReadingPositionFromResolve('new-posts-error', restoreBookmark);
+            }
             diagEndFlow('fail', 'NEWPOSTS_RESTORE_EXCEPTION', 'Restore mit Exception beendet');
         } finally {
             if (generation !== newPostsRestoreGeneration) return;
@@ -5958,6 +6084,10 @@
             scrollState.hasScrolledUp = false;
             setTimeout(() => {
                 if (generation !== newPostsRestoreGeneration) return;
+                if (isLiveReadingAheadOf(restoreBookmark)) {
+                    debugLog('Restore', 'Nachlauf-Markierung der alten Lesestelle übersprungen');
+                    return;
+                }
                 void reinstateFrozenReadingBookmark(restoreBookmark, { save: false });
                 newPostsState.restoreGraceUntil = Date.now() + 1500;
             }, 500);
