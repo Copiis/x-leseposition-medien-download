@@ -15,7 +15,7 @@
 // @description:ko Twitter/X에서 마지막 읽기 위치를 추적하고 동기화합니다. 수동 및 자동 옵션 포함. 새로운 게시물을 확인하면서 현재 위치를 잃지 않도록 이상적입니다. 트윗 ID를 사용하여 정확한 위치 지정을 하고, 리포스트를 지원합니다。
 // @icon https://x.com/favicon.ico
 // @namespace https://github.com/Copiis/x-leseposition-medien-download
-// @version 2026.10.4a
+// @version 2026.10.5a
 // @author Copiis
 // @license MIT
 // @match https://x.com/*
@@ -1530,10 +1530,13 @@
             lastScrollY = window.scrollY;
             scrollState.lastMapScrollY = window.scrollY;
 
-            // Erst die sichtbare Lesestelle übernehmen, danach „Neue Beiträge“.
-            // Sonst friert der Klick die alte Stelle ein und scrollt nach dem
-            // Markieren des neuesten Beitrags wieder dorthin zurück.
-            const markPromise = markTopVisiblePost(true, false, mapScrollDir);
+            // Am Timeline-Top ohne Hochscrollen die Lesestelle nicht auf den
+            // neuesten Post ziehen. „Neue Beiträge“ sucht die gespeicherte Stelle.
+            // Hochscrollen setzt sie vorher, damit der Klick nicht zurückspringt.
+            const scrollingUp = mapScrollDir === 'up' || scrollState.hasScrolledUp;
+            const markPromise = (isNearTimelineTop() && !scrollingUp)
+                ? Promise.resolve(false)
+                : markTopVisiblePost(true, false, mapScrollDir);
             if (!isNearTimelineTop()) {
                 newPostsState.autoLoadPaused = false;
             } else {
@@ -5733,55 +5736,6 @@
         return true;
     }
 
-    /** Viewport → Lesestelle vor New-Posts-Freeze (nur ohne Hochscroll-Phase). */
-    async function syncViewportLesestelleAtTimelineTopForNewPosts() {
-        if (!window.location.href.includes('/home')) return false;
-        if (!isNearTimelineTop() || isScrollUpSessionActive() || isScrollUpActive()) return false;
-
-        const topEl = getTopVisiblePost();
-        if (!topEl) return false;
-
-        const parsed = parseLoadedPost(topEl);
-        if (!parsed?.tweetId || !parsed.authorHandler || !parsed.timestamp) return false;
-        if (lastReadPost && postRefKey(parsed) === postRefKey(lastReadPost)) return false;
-        if (!isCandidateNewer(parsed, lastReadPost)) return false;
-
-        const parsedKey = postRefKey(parsed);
-        // Bekannte Posts: trotzdem promoten, wenn sie in der Landkarte über der Lesestelle stehen
-        if (!parsed.isRepost && parsedKey && knownMarkedKeys.has(parsedKey) &&
-            !isAboveLesestelleOnMap(parsed, lastReadPost)) {
-            debugLog('NewPosts',
-                `Freeze-Sync übersprungen: @${parsed.authorHandler} ${parsed.tweetId}` +
-                ' bereits in History/Landkarte (nicht über Lesestelle auf Map)');
-            return false;
-        }
-        if (lastReadPost?.isRepost && !parsed.isRepost) {
-            debugLog('NewPosts',
-                'Freeze-Sync übersprungen — Repost-Lesestelle bleibt (@' +
-                lastReadPost.authorHandler + ' ' + lastReadPost.tweetId + ')');
-            return false;
-        }
-
-        const account = await getCurrentUserHandle();
-        invalidateHighlightRetries();
-        lastReadPost = {
-            tweetId: parsed.tweetId,
-            timestamp: parsed.timestamp,
-            authorHandler: parsed.authorHandler,
-            isRepost: parsed.isRepost,
-            account,
-            readAt: new Date().toISOString(),
-            context: captureReadingContext(topEl)
-        };
-        noteUserAdvancedReadingPosition(lastReadPost);
-        await saveLastReadPost(lastReadPost);
-        updateHighlightedPost(topEl);
-        debugLog('NewPosts',
-            `Lesestelle vor Freeze aus Viewport: @${parsed.authorHandler} ${parsed.tweetId}` +
-            (parsed.isRepost ? ' (Repost)' : ''));
-        return true;
-    }
-
     async function ensureViewportLesestelleBeforeNewPosts() {
         if (searchControl.manualSearchActive) {
             debugLog('NewPosts', 'Lesestellen-Sync übersprungen — manuelle Suche aktiv.');
@@ -5832,18 +5786,13 @@
         };
 
         if (isNearTimelineTop()) {
-            // User-Wunsch: steht der Top-Post in der Landkarte ÜBER der Lesestelle,
-            // Lesestelle dorthin ziehen (auch wenn schon in History bekannt).
-            // Sonst am Timeline-Top nicht zurückspringen/überschreiben.
-            if (!(lastReadPost && isAboveLesestelleOnMap(viewportCandidate, lastReadPost) &&
-                    isCandidateNewer(viewportCandidate, lastReadPost))) {
-                debugLog('NewPosts',
-                    `Am Timeline-Top: kein Lesestellen-Sync (@${authorHandler} ${tweetId}` +
-                    `${repostFlag ? ', Repost' : ''} ≠ @${lastReadPost?.authorHandler} ${lastReadPost?.tweetId})`);
-                return true;
-            }
+            // Der oberste Post ist hier fast immer der neueste Beitrag.
+            // Den nicht zur Lesestelle machen — nach dem Laden wird die
+            // gespeicherte Stelle gesucht. Hochscrollen promotet separat.
             debugLog('NewPosts',
-                `Am Timeline-Top: Sync erlaubt — Map über Lesestelle (@${authorHandler} ${tweetId})`);
+                `Am Timeline-Top: kein Lesestellen-Sync (@${authorHandler} ${tweetId}` +
+                `${repostFlag ? ', Repost' : ''} ≠ @${lastReadPost?.authorHandler} ${lastReadPost?.tweetId})`);
+            return true;
         }
 
         if (lastReadPost?.tweetId && BigInt(tweetId) < BigInt(lastReadPost.tweetId)) {
@@ -6121,15 +6070,13 @@
         return;
     }
 
+    // Hochscrollen darf die Lesestelle nach vorn setzen. Der Snapshot kommt
+    // danach, damit eine ältere Stelle nicht zurückspringt. Ohne Hochscrollen
+    // bleibt die gespeicherte Lesestelle — der neueste Post wird nicht markiert.
     if (isNearTimelineTop() && (isScrollUpSessionActive() || isScrollUpActive())) {
         await tryPromoteNewerVisiblePostOnScrollUp('up');
-    } else if (isNearTimelineTop()) {
-        await syncViewportLesestelleAtTimelineTopForNewPosts();
     }
 
-    // Snapshot NACH Viewport-Sync: ensureViewport kann lastReadPost auf den
-    // aktuell sichtbar-neuesten Post heben — ein früherer Snapshot würde sonst
-    // nach New-Posts auf einen älteren Post zurückspringen (frozen ≠ live).
     const restoreBookmark = snapshotReadingBookmark();
     if (!restoreBookmark) {
         debugLog('NewPosts', 'Kein Bookmark — Neue Beiträge übersprungen.');
