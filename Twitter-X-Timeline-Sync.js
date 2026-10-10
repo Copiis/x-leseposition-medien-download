@@ -15,7 +15,7 @@
 // @description:ko Twitter/X에서 마지막 읽기 위치를 추적하고 동기화합니다. 수동 및 자동 옵션 포함. 새로운 게시물을 확인하면서 현재 위치를 잃지 않도록 이상적입니다. 트윗 ID를 사용하여 정확한 위치 지정을 하고, 리포스트를 지원합니다。
 // @icon https://x.com/favicon.ico
 // @namespace https://github.com/Copiis/x-leseposition-medien-download
-// @version 2026.10.10d
+// @version 2026.10.10e
 // @author Copiis
 // @license MIT
 // @match https://x.com/*
@@ -83,10 +83,10 @@
         SMALL_SVG_MAX_SIZE: 22,              // Max. Breite/Höhe für Repost-Icon-Erkennung
 
         // === Such-Verhalten ===
-        // Grobe Suche springt um Landkarten-Abstand × mittlere Post-Höhe (sofort, ohne smooth).
-        // Feinsuche nur, wenn der Ziel-Index schon im geladenen Fenster liegt.
-        SLOW_SEARCH_FINE_STEP_PX: 280,       // Kleine Schritte wenn Ziel-idx bereits im Viewport (Ping-Pong-Schutz).
-        SEARCH_JUMP_MAX_VH: 8,               // Obergrenze für einen Sprung, damit virtuelle Listen nachziehen können.
+        // Grobe Suche rückt um höchstens einen Bildschirm vor. X lädt nur das
+        // Sichtbare; ein größerer Sprung lässt die Lesestelle aus und rollt bis unten.
+        SLOW_SEARCH_FINE_STEP_PX: 280,       // Kleine Schritte wenn das Ziel schon nah ist.
+        SEARCH_JUMP_MAX_VH: 0.85,            // Ein Schritt, mit Überlappung zum vorigen Bild.
         SEARCH_SETTLE_MS: 240,               // Kurz warten, bis neue Tweet-IDs da sind oder scrollY stillsteht.
         SLOW_SEARCH_FINE_MAX_ATTEMPTS: 15,   // Danach Top-Retry + sicheres Resolve. Mehr Versuche bei importierten Lesestellen (cross-rechner).
         SEARCH_FINE_ZONE_HYSTERESIS: 2,      // Abstand 0–2: keine großen Sprünge mehr (Ping-Pong-Schutz)
@@ -1754,7 +1754,7 @@
         return;
     }
 
-    log('Init', 'Initialisiere Skript auf /home... (Version 2026.10.10d)');
+    log('Init', 'Initialisiere Skript auf /home... (Version 2026.10.10e)');
 
     const observer = new MutationObserver((mutations, obs) => {
         if (document.body) {
@@ -4416,6 +4416,11 @@
                 // damit der nächste Sprung den Abstand in der Landkarte kennt.
                 ingestArticles(visibleArticleElements(), 'new-posts-restore-scroll');
 
+                if (scrolledPastBookmark(bookmark)) {
+                    debugLog('Restore', 'Lesestelle liegt schon über dem Fenster — nicht weiter nach unten');
+                    break;
+                }
+
                 if (step > 0) {
                     const articleCount = document.querySelectorAll('article').length;
                     const scrollHeight = document.body.scrollHeight || document.documentElement.scrollHeight;
@@ -4671,19 +4676,6 @@
         return !!resolved;
     }
 
-    function medianArticleHeight() {
-        const heights = [];
-        for (const article of visibleArticleElements()) {
-            const h = article.getBoundingClientRect().height;
-            if (h >= 40) heights.push(h);
-        }
-        if (!heights.length) return 320;
-        heights.sort((a, b) => a - b);
-        const mid = Math.floor(heights.length / 2);
-        if (heights.length % 2) return heights[mid];
-        return (heights[mid - 1] + heights[mid]) / 2;
-    }
-
     function visibleTweetSignature() {
         const ids = [];
         for (const article of visibleArticleElements()) {
@@ -4693,18 +4685,26 @@
         return ids.join('|');
     }
 
-    /** Positiver Sprung in Pixeln. Richtung setzt der Aufrufer. */
+    /**
+     * Positiver Sprung in Pixeln. Richtung setzt der Aufrufer.
+     * Nie weiter als ein Bildschirm: die Beiträge dazwischen gibt es noch nicht.
+     */
     function searchJumpMagnitude(bookmark) {
         const distance = getMapDistanceToTarget(bookmark);
-        const fine = isSearchFineZoneDistance(distance);
-        if (fine || distance === 0) return CONFIG.SLOW_SEARCH_FINE_STEP_PX;
-        if (distance != null && distance > 0) {
-            const jump = distance * medianArticleHeight();
-            const cap = Math.round(window.innerHeight * CONFIG.SEARCH_JUMP_MAX_VH);
-            const floor = Math.round(window.innerHeight * 0.85);
-            return Math.max(floor, Math.min(Math.round(jump), cap));
-        }
-        return Math.round(window.innerHeight * 1.5);
+        const near = isSearchFineZoneDistance(distance)
+            || distance === 0
+            || (distance != null && distance <= 8);
+        if (near) return CONFIG.SLOW_SEARCH_FINE_STEP_PX;
+        const vh = window.innerHeight || 800;
+        return Math.round(vh * CONFIG.SEARCH_JUMP_MAX_VH);
+    }
+
+    /** Sichtbare Beiträge sind schon älter als die Lesestelle. Weiter nach unten würde sie auslassen. */
+    function scrolledPastBookmark(bookmark) {
+        const idx = findBookmarkIndexInMap(bookmark);
+        if (idx < 0) return false;
+        const { min } = getVisibleMapIndexRange();
+        return min >= 0 && idx < min;
     }
 
     /**
@@ -4749,7 +4749,7 @@
     }
 
     /**
-     * Ein Sprung (Landkarten-Abstand × Posthöhe), dann weiter, sobald der Feed nachzieht.
+     * Ein Bildschirm weiter, dann prüfen, sobald der Feed nachzieht.
      * Die eingefrorene Such-Landkarte wird hier nicht neu eingelesen.
      */
     async function performScrollAndContinue(continueFn, onStagnationCleanup = null) {
