@@ -15,7 +15,7 @@
 // @description:ko Twitter/X에서 마지막 읽기 위치를 추적하고 동기화합니다. 수동 및 자동 옵션 포함. 새로운 게시물을 확인하면서 현재 위치를 잃지 않도록 이상적입니다. 트윗 ID를 사용하여 정확한 위치 지정을 하고, 리포스트를 지원합니다。
 // @icon https://x.com/favicon.ico
 // @namespace https://github.com/Copiis/x-leseposition-medien-download
-// @version 2026.10.10b
+// @version 2026.10.10c
 // @author Copiis
 // @license MIT
 // @match https://x.com/*
@@ -72,24 +72,22 @@
         BACKGROUND_SLEEP_MS: 45000,          // Ab dieser Hintergrundzeit gilt der Tab als eingeschlafen
         WAKE_RESTORE_GRACE_MS: 12000,        // Nach dem Aufwachen auf nachgeladene Posts warten, dann Lesestelle suchen
         NEW_POSTS_SCROLL_SEARCH_MAX_ATTEMPTS: 60,
-        NEW_POSTS_SCROLL_STEP_PX: 520,
-        NEW_POSTS_SCROLL_SETTLE_MS: 280,
-        NEW_POSTS_SCROLL_STAGNANT_LOADS: 3,    // Keine neuen articles mehr im DOM
+        NEW_POSTS_SCROLL_STAGNANT_LOADS: 3,    // Keine neuen articles und keine neuen Tweet-IDs mehr
         NEW_POSTS_SCROLL_STAGNANT_HEIGHT: 2,   // scrollHeight unverändert
 
         // === Positionierung ===
         READING_POSITION_TOP_OFFSET: 5,      // Oberster sichtbarer Post ab 5px unter Viewport-Oberkante (Lesestelle)
         RESTORE_SCROLL_OFFSET: 175,          // Ziel: obere Kante des Posts 175px unter Viewport-Oberkante (Lupe/Restore/New-Posts)
         POSITION_CORRECTION_TOLERANCE: 35,   // Toleranz in scrollToPostWithHighlight
-        FALLBACK_POSITION_TOLERANCE: 40,     // Toleranz in findAndSetClosestPost Feinjustierung
-
         // === DOM-Heuristiken ===
         SMALL_SVG_MAX_SIZE: 22,              // Max. Breite/Höhe für Repost-Icon-Erkennung
 
-        // === Such-Verhalten (Balance zwischen Geschwindigkeit bei weit entfernten Zielen und Overshoot-Schutz) ===
-        MAX_SEARCH_DISTANCE_FACTOR: 3.2,     // Etwas höher als früher, damit weit entfernte Lesestellen schneller erreicht werden
-        MAX_SEARCH_STEP_VH: 3.8,             // Deutlich größere Sprünge erlaubt für weit entfernte Lesestellen (vorher zu konservativ)
-        SLOW_SEARCH_FINE_STEP_PX: 280,       // Kleine Schritte wenn Ziel-idx bereits im Viewport (Ping-Pong-Schutz). Etwas größer, damit auch bei importierter Landkarte (anderer Rechner) noch Feed nachgeladen wird.
+        // === Such-Verhalten ===
+        // Grobe Suche springt um Landkarten-Abstand × mittlere Post-Höhe (sofort, ohne smooth).
+        // Feinsuche nur, wenn der Ziel-Index schon im geladenen Fenster liegt.
+        SLOW_SEARCH_FINE_STEP_PX: 280,       // Kleine Schritte wenn Ziel-idx bereits im Viewport (Ping-Pong-Schutz).
+        SEARCH_JUMP_MAX_VH: 8,               // Obergrenze für einen Sprung, damit virtuelle Listen nachziehen können.
+        SEARCH_SETTLE_MS: 240,               // Kurz warten, bis neue Tweet-IDs da sind oder scrollY stillsteht.
         SLOW_SEARCH_FINE_MAX_ATTEMPTS: 15,   // Danach Top-Retry + sicheres Resolve. Mehr Versuche bei importierten Lesestellen (cross-rechner).
         SEARCH_FINE_ZONE_HYSTERESIS: 2,      // Abstand 0–2: keine großen Sprünge mehr (Ping-Pong-Schutz)
         SEARCH_TOP_RETRY_MAX_IDX: 25,        // Nahe Top: einmal scrollY=0 vor Fallback
@@ -116,81 +114,28 @@
     };
 
     const repostCache = new WeakMap();
-    const repostNegativeAt = new WeakMap();
 
     function detectRepost(postElement) {
-        // Flexibleres Pattern: Matcht charakteristische Teile des Repost-Icon-Pfads
-        // (X ändert die exakte minifizierte Form gelegentlich)
+        // socialContext zuerst: ein Knoten, kein Lauf über alle path-Attribute.
+        // Den Icon-Pfad nur anfassen, wenn die Textzeile noch fehlt.
         const repostPathPattern = /M4\.75 3\.79l4\.603.*zm11\.5 2\.71H11V4h5\.25|repost-arrow|repost-icon/i;
+        const repostTextPattern = /\b(repost(?:ed|et)?|hat repostet|retweeté|retwittato|リポストしました|перепостил|republicou|إعادة نشر|repostado|리트윗|reposted by|repostet by|retweeted by)\b/i;
 
-        // === Stufe 1: Repost-Icon-Pfad (flexibler) ===
-        const allPaths = postElement.querySelectorAll('path');
-        for (const p of allPaths) {
-            const d = p.getAttribute('d') || '';
-            if (repostPathPattern.test(d)) {
-                debugLog('Repost', '✅ Repost erkannt (Stage 1 - Icon-Pfad)');
-                return true;
-            }
-        }
-
-        // === Stufe 2: socialContext (Text + Icon) — sehr zuverlässig bei Reposts ===
         const socialContext = postElement.querySelector('span[data-testid="socialContext"]');
         if (socialContext) {
-            const txt = (socialContext.textContent || '').toLowerCase();
-
-            // Starke Text-Erkennung für deutsche und englische Varianten
-            if (/\b(repost|reposted|repostet|hat repostet)\b/.test(txt)) {
-                debugLog('Repost', 'erkannt (Stage 2 - socialContext Text)');
-                return true;
-            }
-
-            // Icon im socialContext
+            if (repostTextPattern.test(socialContext.textContent || '')) return true;
             const path = socialContext.querySelector('path');
-            if (path && repostPathPattern.test(path.getAttribute('d') || '')) {
-                debugLog('Repost', 'erkannt (Stage 2 - socialContext Icon)');
-                return true;
-            }
+            if (path && repostPathPattern.test(path.getAttribute('d') || '')) return true;
         }
 
-        // === Stufe 3: Kleine SVGs (Icon oben links) ===
         const svgs = postElement.querySelectorAll('svg');
-        for (let i = 0; i < Math.min(svgs.length, 6); i++) {
+        const limit = Math.min(svgs.length, 4);
+        for (let i = 0; i < limit; i++) {
             const svg = svgs[i];
             const rect = svg.getBoundingClientRect();
-            if (rect.height <= CONFIG.SMALL_SVG_MAX_SIZE && rect.width <= CONFIG.SMALL_SVG_MAX_SIZE) {
-                const path = svg.querySelector('path');
-                if (path && repostPathPattern.test(path.getAttribute('d') || '')) {
-                    debugLog('Repost', 'erkannt (Stage 3 - kleines Icon SVG)');
-                    return true;
-                }
-            }
-        }
-
-        // === Fallback: Icon-Pfad + Größen-Check ===
-        const allPaths2 = postElement.querySelectorAll('path');
-        for (const path of allPaths2) {
-            if (repostPathPattern.test(path.getAttribute('d') || '')) {
-                const parentSvg = path.closest('svg');
-                if (parentSvg) {
-                    const r = parentSvg.getBoundingClientRect();
-                    if (r.height <= 22 && r.width <= 22) {
-                        debugLog('Repost', 'erkannt (Fallback Icon + Größe)');
-                        return true;
-                    }
-                }
-            }
-        }
-
-        // === Letzter Fallback: Breite Text-Suche ===
-        const repostTextPattern = /\b(reposted|hat repostet|retweeté|retwittato|リポストしました|перепостил|republicou|إعادة نشر|repostado|리트윗|reposted by|repostet by|retweeted by)\b/i;
-
-        const textElement = postElement.querySelector('span[data-testid="socialContext"], span[class*="css-"][dir="ltr"]');
-        if (textElement) {
-            const text = (textElement.textContent || '').toLowerCase().trim();
-            if (repostTextPattern.test(text)) {
-                debugLog('Repost', 'erkannt (Text-Fallback)');
-                return true;
-            }
+            if (rect.height > CONFIG.SMALL_SVG_MAX_SIZE || rect.width > CONFIG.SMALL_SVG_MAX_SIZE) continue;
+            const path = svg.querySelector('path');
+            if (path && repostPathPattern.test(path.getAttribute('d') || '')) return true;
         }
 
         return false;
@@ -198,29 +143,25 @@
 
     function isRepost(postElement) {
         if (!postElement) return false;
+        // Cache hängt an der Tweet-ID. X recycelt article-Knoten; eine andere ID verwirft den Eintrag.
+        const tweetId = getPostTweetId(postElement) || '';
         const cached = repostCache.get(postElement);
-        if (cached === true) return true;
-        // Die Zeile „hat repostet“ kommt oft erst nach dem Artikel-Rahmen.
-        // Ein frühes „nein“ nur kurz glauben, sonst bleibt der Post ein
-        // normaler alter Tweet und wird erst nach erneutem Vorbeiscrollen erkannt.
-        if (cached === false) {
-            const seenAt = repostNegativeAt.get(postElement) || 0;
+        if (cached && cached.tweetId === tweetId) {
+            if (cached.isRepost) return true;
             const lateLabel = !!postElement.querySelector('span[data-testid="socialContext"]');
-            const stillFresh = Date.now() - seenAt < CONFIG.SCROLL_UP_REPOST_RECHECK_MS;
+            const stillFresh = Date.now() - cached.negativeAt < CONFIG.SCROLL_UP_REPOST_RECHECK_MS;
             if (!lateLabel && !stillFresh) return false;
-            repostCache.delete(postElement);
         }
         const result = detectRepost(postElement);
         if (result) {
-            repostCache.set(postElement, true);
-            repostNegativeAt.delete(postElement);
+            repostCache.set(postElement, { tweetId, isRepost: true, negativeAt: 0 });
             return true;
         }
         if (postElement.querySelector('time[datetime]')) {
-            repostCache.set(postElement, false);
-            if (!repostNegativeAt.has(postElement)) {
-                repostNegativeAt.set(postElement, Date.now());
-            }
+            const negativeAt = cached && cached.tweetId === tweetId && cached.negativeAt
+                ? cached.negativeAt
+                : Date.now();
+            repostCache.set(postElement, { tweetId, isRepost: false, negativeAt });
         }
         return false;
     }
@@ -739,7 +680,7 @@
         });
     }
 
-    const DEBUG = true;
+    const DEBUG = false;
 
     // Hinweis (2026-05-30 nach Punkt 2): Alle direkten console.log / if(DEBUG) console.log wurden
     // auf das zentrale log('Kategorie', ...) + debugLog('Kategorie', ...) System umgestellt.
@@ -772,7 +713,7 @@
     // ============================================================
 
     const DIAG = {
-        enabled: true,
+        enabled: false,
         flowCounter: 0,
         activeFlow: null,
         sessionAnomalies: [],
@@ -915,11 +856,7 @@
     // === Scroll & Search State ===
     const scrollState = {
         isSlowScrollMode: false,
-        largeScrollCount: 0,
-        maxLargeScrolls: 12,   // Mehr große Sprünge erlauben, bevor wir in den präzisen (langsamen) Modus wechseln. Wichtig für weit entfernte Lesestellen.
         searchDirection: 'down',
-        scrollCyclePhase: 0,
-        hasCompletedCycle: false,
         stagnantScrollCount: 0,
         lastScrollHeight: 0,
         totalLoadedPosts: 0,
@@ -1114,7 +1051,6 @@
         return showActionPopup(messageKey, params);
     }
     let pendingNewPosts = 0;
-    let currentPost = null;   // wird aktuell kaum genutzt
 
     // === Data & Cache ===
     let downloadedPosts = new Set(GM_getValue('downloadedPosts', []));
@@ -1126,10 +1062,14 @@
     // Timeline-Landkarte: Feed-Reihenfolge (oben→unten), fortlaufend aktualisiert
     let timelineMapOrderedKeys = [];
     const timelineMapByKey = new Map();
+    const timelineMapIndexByKey = new Map();
     let timelineMapAccount = null;
     let timelineMapLastPersist = 0;
     let timelineMapUpdateTimer = null;
     let timelineMapPendingSource = 'unknown';
+    let mapMutationTimer = null;
+    const mapMutationArticles = new Set();
+    const mapMutationRemoved = [];
 
     // Schnelles Gedächtnis: Alle bereits markierten Positionen (tweetId + Repost-Flag)
     // Wird aus der History befüllt. Ein Post/RePost wird nur dann als neue Lesestelle übernommen,
@@ -1213,7 +1153,7 @@
         postHistoryCache = history; // Cache aktualisieren für schnellen Timeline-Abgleich
         rebuildKnownMarkedKeys();
         timelineMapAccount = postData.account;
-        scheduleTimelineMapUpdate('save', 'neutral');
+        scheduleTimelineMapUpdate('save');
 
         debugLog('Save', `Position + Historie gespeichert (${history.length}/${MAX_POST_HISTORY} Einträge)`);
 
@@ -1655,7 +1595,7 @@
                     sinceUp < CONFIG.SCROLL_UP_SETTLE_MS &&
                     dropped < CONFIG.SCROLL_UP_SETTLE_PX;
                 if (mapScrollDir === 'down') {
-                    refreshMapForLesestelle('scroll-down', 'down');
+                    refreshMapForLesestelle('scroll-down');
                 } else if (settlingAfterUp) {
                     void tryPromoteNewerVisiblePostOnScrollUp('up');
                 }
@@ -1713,30 +1653,10 @@
 
             // Stelle sicher, dass der New-Posts-Observer aktiv ist, wenn wir oben in der Timeline sind
             if (isNearTimelineTop()) {
-                // Starte / aktualisiere den Observer sofort
                 if (!window.newPostsObserver) {
                     observeForNewPosts();
                 }
-
-                if (isNewPostsAutoLoadPaused()) {
-                    return;
-                }
-
-                tryAutoClickNewPosts();
-
-                // Mehrere schnelle Checks, weil der "New Posts"-Button oft erst beim Fokussieren gerendert wird
-                const checkNewPostsOnFocus = (attempt = 0) => {
-                    if (attempt > 8 || isNewPostsAutoLoadPaused()) return;
-
-                    setTimeout(() => {
-                        tryAutoClickNewPosts();
-                        if (!isNewPostsAutoLoadPaused()) {
-                            checkNewPostsOnFocus(attempt + 1);
-                        }
-                    }, 300 + (attempt * 130));
-                };
-
-                checkNewPostsOnFocus(0);
+                burstCheckNewPosts();
             }
         });
 
@@ -1754,30 +1674,10 @@
                 !searchControl.isAutoScrolling &&
                 isNearTimelineTop()) {
 
-                // Sofort Observer neu starten (falls disconnected)
                 if (!window.newPostsObserver) {
                     observeForNewPosts();
                 }
-
-                if (isNewPostsAutoLoadPaused()) {
-                    return;
-                }
-
-                tryAutoClickNewPosts();
-
-                // Mehrere schnelle Versuche, weil der New-Posts-Button oft erst beim Sichtbar-Werden gerendert wird
-                const checkOnVisibility = (attempt = 0) => {
-                    if (attempt > 8 || isNewPostsAutoLoadPaused()) return;
-
-                    setTimeout(() => {
-                        tryAutoClickNewPosts();
-                        if (!isNewPostsAutoLoadPaused()) {
-                            checkOnVisibility(attempt + 1);
-                        }
-                    }, 280 + (attempt * 110));
-                };
-
-                checkOnVisibility(0);
+                burstCheckNewPosts();
             }
         });
 
@@ -1793,7 +1693,7 @@
             tryAutoClickNewPosts();
             // Auch "versteckte Beiträge anzeigen" regelmäßig prüfen (X blendet sonst Teile der Timeline aus)
             tryClickShowHiddenPostsButton('interval');
-        }, 3000);
+        }, CONFIG.NEW_POSTS_CHECK_INTERVAL_MS);
 
         window.addEventListener('unload', () => clearInterval(checkNewPostsInterval));
 
@@ -1830,53 +1730,23 @@
     }
 }
 
-    function setupHoldReadPosition() {
-    log('Init', 'Verbessertes Lesestelle-Festhalten aktiviert');
+    let newPostsBurstTimer = null;
 
-    let feedElement = null;
-    let lastHeight = 0;
-
-    const observer = new MutationObserver(() => {
-        if (!feedElement) return;
-
-        setTimeout(() => {
-            const currentHeight = feedElement.scrollHeight || 0;
-
-            if (lastHeight > 0 && currentHeight > lastHeight + 40) {
-                const addedHeight = currentHeight - lastHeight;
-                window.scrollBy(0, addedHeight);
-                log('Save', `Lesestelle gehalten (+${Math.round(addedHeight)}px neue Beiträge oberhalb)`);
-            }
-
-            lastHeight = currentHeight;
-        }, 80);
-    });
-
-    const initObserver = () => {
-
-        const possibleFeeds = [
-            "div[role='feed']",
-            "div[aria-label='Timeline: Your Home timeline']",
-            "div[data-testid='primaryColumn'] section[role='region']",
-            "main[role='main'] div[role='feed']"
-        ];
-
-        for (const selector of possibleFeeds) {
-            feedElement = document.querySelector(selector);
-            if (feedElement) break;
-        }
-
-        if (feedElement) {
-            lastHeight = feedElement.scrollHeight || 0;
-            observer.observe(feedElement, { childList: true, subtree: true });
-            debugLog('Init', 'Lesestellen-Observer läuft auf Feed:', feedElement.tagName);
-        } else {
-            setTimeout(initObserver, 500);
-        }
-    };
-
-    initObserver();
-}
+    function burstCheckNewPosts() {
+        if (newPostsBurstTimer) return;
+        if (!isNearTimelineTop() || isNewPostsAutoLoadPaused()) return;
+        let attempt = 0;
+        const step = () => {
+            newPostsBurstTimer = null;
+            if (!isScriptActivated || searchControl.isSearching || searchControl.isFallbackSearching || searchControl.isAutoScrolling) return;
+            if (!isNearTimelineTop() || isNewPostsAutoLoadPaused()) return;
+            tryAutoClickNewPosts();
+            attempt++;
+            if (attempt > 8) return;
+            newPostsBurstTimer = setTimeout(step, 280 + attempt * 110);
+        };
+        step();
+    }
 
     function initializeWhenDOMReady() {
     if (!window.location.pathname.startsWith('/home')) {
@@ -1884,8 +1754,7 @@
         return;
     }
 
-    log('Init', 'Initialisiere Skript auf /home... (Version 2026.10.10b)');
-    log('Init', 'Diag-Logging aktiv — bei Problemen Konsole filtern: Diag:ERROR | Diag:WARN | Diag:SESSION');
+    log('Init', 'Initialisiere Skript auf /home... (Version 2026.10.10c)');
 
     const observer = new MutationObserver((mutations, obs) => {
         if (document.body) {
@@ -2086,7 +1955,7 @@
     }
 
     const dir = mapDirection || scrollState.lastMapScrollDirection || 'neutral';
-    refreshMapForLesestelle('mark', dir);
+    refreshMapForLesestelle('mark');
 
     if (!allowOlderRegression && dir === 'down') {
         syncHighlightIfDrifted();
@@ -2330,7 +2199,6 @@
                 return savedNow;
             }
             lastReadPost = newPost;
-            currentPost = newPost;
             noteUserAdvancedReadingPosition(newPost);
             invalidateHighlightRetries();
             applyHighlightToPost(anchorPost);
@@ -2369,10 +2237,9 @@
         (document.body.scrollHeight || document.documentElement.scrollHeight);
     const settleMs = options.settleMs ?? 1600;
     const fallbackMs = options.fallbackMs ?? 3200;
-    const aggressiveScroll = options.aggressiveScroll ?? false;
 
     let loadAttempts = 0;
-    const maxLoadAttempts = aggressiveScroll ? 80 : 12;
+    const maxLoadAttempts = 12;
     let callbackTriggered = false;
     let wasHiddenDuringWait = pageIsBackgrounded();
     let observer = null;
@@ -2485,9 +2352,6 @@
         } else if (loadAttempts >= maxLoadAttempts) {
             log('NewPosts', 'Keine DOM-Änderung erkannt – Restore mit aktuellem Feed.');
             triggerCallback('timeout');
-        } else if (aggressiveScroll) {
-            const scrollStep = window.innerHeight * 0.6;
-            window.scrollBy({ top: scrollStep, behavior: 'smooth' });
         }
     }, 1000);
 
@@ -2501,13 +2365,6 @@
         searchControl.isFallbackSearching = false;
     }, { once: true });
 }
-
-    function startNewPostsCheckInterval() {
-        const interval = setInterval(() => {
-            tryAutoClickNewPosts();
-        }, 3000);
-        window.addEventListener('unload', () => clearInterval(interval));
-    }
 
     function getTopVisiblePost() {
   const posts = document.querySelectorAll("article[data-testid='tweet']");
@@ -2755,7 +2612,6 @@
 
         invalidateHighlightRetries();
         lastReadPost = newPost;
-        currentPost = newPost;
         noteUserAdvancedReadingPosition(newPost);
         updateScrollUpMaxTweetId(newPost.tweetId);
         applyHighlightToPost(newer.element);
@@ -3086,12 +2942,17 @@
 
     const TIMELINE_MAP_KEY = (account) => `timelineMap_${account}`;
 
-    function getPostDomY(parsed) {
-        return parsed.element.getBoundingClientRect().top + window.scrollY;
+    function rebuildTimelineMapIndex() {
+        timelineMapIndexByKey.clear();
+        for (let i = 0; i < timelineMapOrderedKeys.length; i++) {
+            timelineMapIndexByKey.set(timelineMapOrderedKeys[i], i);
+        }
     }
 
-    function sortPostsByDomY(posts) {
-        return [...posts].sort((a, b) => getPostDomY(a) - getPostDomY(b));
+    function mapIndexOf(key) {
+        if (!key) return -1;
+        const idx = timelineMapIndexByKey.get(key);
+        return idx === undefined ? -1 : idx;
     }
 
     function loadTimelineMapForAccount(account, force = false) {
@@ -3103,6 +2964,7 @@
         timelineMapAccount = account;
         timelineMapOrderedKeys = [];
         timelineMapByKey.clear();
+        timelineMapIndexByKey.clear();
         timelineMapLastPersist = 0;
 
         const stored = GM_getValue(TIMELINE_MAP_KEY(account), null);
@@ -3129,6 +2991,7 @@
             for (const key of [...timelineMapByKey.keys()]) {
                 if (!orderSet.has(key)) timelineMapByKey.delete(key);
             }
+            rebuildTimelineMapIndex();
 
             debugLog('Map', `Landkarte geladen: ${timelineMapOrderedKeys.length} Einträge`);
         } catch (e) {
@@ -3176,131 +3039,185 @@
         }
 
         timelineMapOrderedKeys = kept;
+        rebuildTimelineMapIndex();
     }
 
-    function mergeNewDomChunk(oldOrder, domKeys) {
-        const domSet = new Set(domKeys);
-        const ghosts = oldOrder.filter(k => !domSet.has(k));
+    let timelineMapDirtyWhileDeferred = false;
 
-        if (!domKeys.length) return ghosts;
-        if (!ghosts.length) return [...domKeys];
-
-        const firstDom = timelineMapByKey.get(domKeys[0]);
-        const firstGhost = timelineMapByKey.get(ghosts[0]);
-
-        if (firstDom && firstGhost) {
-            try {
-                if (BigInt(firstDom.tweetId) > BigInt(firstGhost.tweetId)) {
-                    return [...domKeys, ...ghosts];
-                }
-            } catch (e) {
-                debugLog('Map', 'mergeNewDomChunk ID-Vergleich fehlgeschlagen:', e);
+    function tweetArticlesFrom(nodes) {
+        const list = [];
+        const seen = new Set();
+        const consider = (el) => {
+            if (!el || el.nodeType !== 1 || seen.has(el)) return;
+            if (!el.matches("article[data-testid='tweet']")) return;
+            seen.add(el);
+            list.push(el);
+        };
+        for (const node of nodes) {
+            if (!node || node.nodeType !== 1) continue;
+            consider(node);
+            if (node.querySelectorAll) {
+                node.querySelectorAll("article[data-testid='tweet']").forEach(consider);
             }
         }
-
-        return [...ghosts, ...domKeys];
+        list.sort((a, b) => {
+            if (a === b) return 0;
+            const pos = a.compareDocumentPosition(b);
+            if (pos & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
+            if (pos & Node.DOCUMENT_POSITION_PRECEDING) return 1;
+            return 0;
+        });
+        return list;
     }
 
-    function mergeDomOrderIntoMap(oldOrder, domKeys) {
-        const domSet = new Set(domKeys);
-        if (!oldOrder.length) return [...domKeys];
-        if (!domKeys.length) return oldOrder.filter(k => timelineMapByKey.has(k));
-
-        const firstDomIdx = oldOrder.findIndex(k => domSet.has(k));
-        if (firstDomIdx < 0) return mergeNewDomChunk(oldOrder, domKeys);
-
-        const before = oldOrder.slice(0, firstDomIdx).filter(k => !domSet.has(k));
-        const after = oldOrder.slice(firstDomIdx).filter(k => !domSet.has(k));
-
-        return [...before, ...domKeys, ...after];
+    function parsedArticleKey(article) {
+        const parsed = parseLoadedPost(article);
+        if (!parsed?.tweetId) return null;
+        const key = postRefKey(parsed);
+        if (!key) return null;
+        return { key, parsed };
     }
 
-    function normalizeMapDirection(direction, source) {
-        if (direction === 'up' || direction === 'down') return direction;
-        if (source === 'mutation' || source === 'save' || source === 'search-init' || source === 'mark') {
-            return 'neutral';
+    function noteArticleKey(article, key, parsed) {
+        const prev = article.getAttribute('data-xts-map-key');
+        if (prev && prev !== key) {
+            const old = timelineMapByKey.get(prev);
+            if (old) old.inDom = false;
         }
-        if (source.startsWith('search')) {
-            if (scrollState.searchDirection === 'up') return 'up';
-            if (scrollState.searchDirection === 'down') return 'down';
+        if (article.isConnected) article.setAttribute('data-xts-map-key', key);
+        const nowIso = new Date().toISOString();
+        const existing = timelineMapByKey.get(key);
+        if (existing) {
+            existing.lastSeenAt = nowIso;
+            existing.inDom = !!article.isConnected;
+            existing.isRepost = !!parsed.isRepost;
+            if (parsed.authorHandler) existing.authorHandler = parsed.authorHandler;
+            if (parsed.timestamp) existing.timestamp = parsed.timestamp;
+            return;
         }
-        if (scrollState.lastMapScrollDirection === 'up' || scrollState.lastMapScrollDirection === 'down') {
-            return scrollState.lastMapScrollDirection;
+        timelineMapByKey.set(key, {
+            key,
+            tweetId: parsed.tweetId,
+            authorHandler: parsed.authorHandler,
+            isRepost: !!parsed.isRepost,
+            timestamp: parsed.timestamp,
+            lastSeenAt: nowIso,
+            inDom: !!article.isConnected
+        });
+    }
+
+    function nearestMappedKey(article, stepProp) {
+        let cell = article.closest?.("[data-testid='cellInnerDiv']") || article;
+        let node = cell[stepProp];
+        for (let guard = 0; node && guard < 80; guard++) {
+            const art = node.matches?.("article[data-testid='tweet']")
+                ? node
+                : node.querySelector?.("article[data-testid='tweet']");
+            if (art) {
+                const found = parsedArticleKey(art);
+                if (found && mapIndexOf(found.key) >= 0) return found.key;
+            }
+            node = node[stepProp];
         }
-        return 'neutral';
+        return null;
+    }
+
+    function chunkBelongsBeforeMap(items) {
+        const head = timelineMapByKey.get(timelineMapOrderedKeys[0]);
+        if (!head?.tweetId) return true;
+        let headId;
+        try {
+            headId = BigInt(head.tweetId);
+        } catch (e) {
+            return true;
+        }
+        for (const item of items) {
+            try {
+                if (BigInt(item.parsed.tweetId) > headId) return true;
+            } catch (e) { /* nächster */ }
+        }
+        return false;
+    }
+
+    function visibleArticleElements() {
+        const out = [];
+        const vh = window.innerHeight || 800;
+        const posts = document.querySelectorAll("article[data-testid='tweet']");
+        for (const post of posts) {
+            const rect = post.getBoundingClientRect();
+            if (rect.bottom > 0 && rect.top < vh) out.push(post);
+        }
+        return out;
     }
 
     /**
-     * Richtungsabhängiges Merge:
-     * up   → neuere Posts oben einfügen / Top-Segment aktualisieren
-     * down → ältere Posts unten anfügen
-     * neutral → vollständiger DOM-Abgleich (Suche-Init, Mutation)
+     * Neue Posts an den DOM-Nachbarn einhängen. Kein indexOf über die ganze Landkarte,
+     * keine Reihenfolge über die Tweet-ID (die dreht Reposts um).
      */
-    function mergeDirectional(oldOrder, domKeys, direction) {
-        const oldSet = new Set(oldOrder);
-        if (!oldOrder.length) return domKeys;
-        if (!domKeys.length) return oldOrder.filter(k => timelineMapByKey.has(k));
-        if (direction === 'neutral') return mergeDomOrderIntoMap(oldOrder, domKeys);
+    function ingestArticles(nodes, source) {
+        const ordered = tweetArticlesFrom(nodes);
+        if (!ordered.length) return 0;
 
-        if (direction === 'up') {
-            const anchorIdx = domKeys.findIndex(k => oldSet.has(k));
-            if (anchorIdx < 0) {
-                const prepend = domKeys.filter(k => !oldSet.has(k));
-                return [...prepend, ...oldOrder];
-            }
-            if (anchorIdx === 0) {
-                let topRun = 0;
-                while (topRun < domKeys.length && oldSet.has(domKeys[topRun])) topRun++;
-                if (topRun > 1) {
-                    const newTop = domKeys.slice(0, topRun);
-                    const rest = oldOrder.filter(k => !newTop.includes(k));
-                    return [...newTop, ...rest];
-                }
-            }
-            const prepend = domKeys.slice(0, anchorIdx);
-            const rest = oldOrder.filter(k => !prepend.includes(k));
-            return [...prepend, ...rest];
+        const fresh = [];
+        for (const article of ordered) {
+            const found = parsedArticleKey(article);
+            if (!found) continue;
+            noteArticleKey(article, found.key, found.parsed);
+            if (mapIndexOf(found.key) < 0) fresh.push({ article, ...found });
+        }
+        if (!fresh.length) {
+            persistTimelineMap();
+            return 0;
         }
 
-        if (direction === 'down') {
-            let anchorIdx = -1;
-            for (let i = domKeys.length - 1; i >= 0; i--) {
-                if (oldSet.has(domKeys[i])) {
-                    anchorIdx = i;
-                    break;
-                }
-            }
-            if (anchorIdx < 0) {
-                const append = domKeys.filter(k => !oldSet.has(k));
-                return [...oldOrder, ...append];
-            }
-            const append = domKeys.slice(anchorIdx + 1).filter(k => !oldSet.has(k));
-            return [...oldOrder, ...append];
-        }
+        const firstEl = fresh[0].article;
+        const lastEl = fresh[fresh.length - 1].article;
+        const prevIdx = mapIndexOf(nearestMappedKey(firstEl, 'previousElementSibling'));
+        const nextIdx = mapIndexOf(nearestMappedKey(lastEl, 'nextElementSibling'));
+        let insertAt = timelineMapOrderedKeys.length;
+        if (prevIdx >= 0) insertAt = prevIdx + 1;
+        else if (nextIdx >= 0) insertAt = nextIdx;
+        else if (!timelineMapOrderedKeys.length || chunkBelongsBeforeMap(fresh) || isNearTimelineTop()) insertAt = 0;
 
-        return mergeDomOrderIntoMap(oldOrder, domKeys);
+        let at = insertAt;
+        for (const item of fresh) {
+            timelineMapOrderedKeys.splice(at, 0, item.key);
+            at++;
+        }
+        trimTimelineMap();
+        persistTimelineMap();
+        debugLog('Map', `Ingest (${source}): +${fresh.length}, gesamt ${timelineMapOrderedKeys.length}`);
+        return fresh.length;
     }
 
-    function scheduleTimelineMapUpdate(source = 'unknown', direction = 'neutral') {
+    function markDetachedArticles(nodes) {
+        for (const article of tweetArticlesFrom(nodes)) {
+            if (article.isConnected) continue;
+            const stored = article.getAttribute('data-xts-map-key');
+            const found = stored ? null : parsedArticleKey(article);
+            const key = stored || found?.key;
+            const entry = key ? timelineMapByKey.get(key) : null;
+            if (entry) entry.inDom = false;
+        }
+    }
+
+    function scheduleTimelineMapUpdate(source = 'unknown') {
         if (shouldDeferTimelineMapUpdate()) {
             timelineMapDirtyWhileDeferred = true;
             timelineMapPendingSource = source;
-            timelineMapPendingDirection = direction;
             return;
         }
-
         timelineMapPendingSource = source;
-        timelineMapPendingDirection = direction;
         if (timelineMapUpdateTimer) return;
-
         timelineMapUpdateTimer = setTimeout(() => {
             timelineMapUpdateTimer = null;
-            updateTimelineMap(timelineMapPendingSource, timelineMapPendingDirection);
+            if (shouldDeferTimelineMapUpdate()) {
+                timelineMapDirtyWhileDeferred = true;
+                return;
+            }
+            refreshMapForLesestelle(timelineMapPendingSource);
         }, CONFIG.TIMELINE_MAP_DEBOUNCE_MS);
     }
-
-    let timelineMapPendingDirection = 'neutral';
-    let timelineMapDirtyWhileDeferred = false;
 
     function shouldDeferTimelineMapUpdate() {
         if (searchControl.newPostsRestoreActive) return true;
@@ -3317,94 +3234,47 @@
             clearTimeout(timelineMapUpdateTimer);
             timelineMapUpdateTimer = null;
         }
-        const src = timelineMapPendingSource || source;
-        const dir = timelineMapPendingDirection || 'neutral';
-        updateTimelineMap(src, dir, true);
+        if (mapMutationTimer) {
+            clearTimeout(mapMutationTimer);
+            mapMutationTimer = null;
+        }
+        mapMutationArticles.clear();
+        mapMutationRemoved.splice(0, mapMutationRemoved.length);
+        updateTimelineMap(timelineMapPendingSource || source, true);
     }
 
-    function updateTimelineMap(source = 'unknown', explicitDirection = 'neutral', force = false) {
+    function updateTimelineMap(source = 'unknown', force = false) {
         if (!force && shouldDeferTimelineMapUpdate()) {
             timelineMapDirtyWhileDeferred = true;
             timelineMapPendingSource = source;
-            timelineMapPendingDirection = explicitDirection;
             return;
         }
-
         if (!window.location.href.includes('/home')) return;
 
-        const all = getAllLoadedPostsParsed();
-        if (!all.length) return;
+        for (const entry of timelineMapByKey.values()) entry.inDom = false;
+        const root = document.querySelector("div[data-testid='primaryColumn']") || document;
+        ingestArticles(root.querySelectorAll("article[data-testid='tweet']"), source);
+    }
 
-        const direction = normalizeMapDirection(explicitDirection, source);
-        const domSorted = sortPostsByDomY(all);
-        const domKeys = [];
-        const domKeySet = new Set();
-        const now = Date.now();
-        const nowIso = new Date(now).toISOString();
-        const previousDomOrder = timelineMapOrderedKeys.filter(k => timelineMapByKey.get(k)?.inDom);
-        let reorderCount = 0;
-
-        for (const parsed of domSorted) {
-            const ref = compactPostRef(parsed);
-            const key = postRefKey(ref);
-            if (!key || domKeySet.has(key)) continue;
-
-            domKeySet.add(key);
-            domKeys.push(key);
-
-            const domY = getPostDomY(parsed);
-            const existing = timelineMapByKey.get(key);
-            const newDomIndex = domKeys.length - 1;
-            const oldDomIndex = previousDomOrder.indexOf(key);
-
-            if (oldDomIndex >= 0 && oldDomIndex !== newDomIndex) {
-                reorderCount++;
-            }
-
-            if (existing) {
-                existing.lastDomY = domY;
-                existing.lastSeenAt = nowIso;
-                existing.inDom = true;
-            } else {
-                timelineMapByKey.set(key, {
-                    key,
-                    tweetId: ref.tweetId,
-                    authorHandler: ref.authorHandler,
-                    isRepost: ref.isRepost,
-                    timestamp: ref.timestamp,
-                    lastDomY: domY,
-                    lastSeenAt: nowIso,
-                    inDom: true
-                });
-            }
+    function flushMapMutations() {
+        mapMutationTimer = null;
+        const articles = [...mapMutationArticles];
+        const removed = mapMutationRemoved.splice(0, mapMutationRemoved.length);
+        mapMutationArticles.clear();
+        if (shouldDeferTimelineMapUpdate()) {
+            timelineMapDirtyWhileDeferred = true;
+            timelineMapPendingSource = 'mutation';
+            return;
         }
+        markDetachedArticles(removed);
+        if (articles.length) ingestArticles(articles, 'mutation');
+    }
 
-        for (const key of timelineMapByKey.keys()) {
-            if (!domKeySet.has(key)) {
-                const entry = timelineMapByKey.get(key);
-                if (entry) entry.inDom = false;
-            }
-        }
-
-        const previousSize = timelineMapOrderedKeys.length;
-        timelineMapOrderedKeys = mergeDirectional(timelineMapOrderedKeys, domKeys, direction);
-        trimTimelineMap();
-
-        if (reorderCount > 0) {
-            diagPush('MAP_REORDER', 'info', `${reorderCount} Post(s) in Landkarte umsortiert`, {
-                source,
-                direction,
-                reorderCount,
-                mapSize: timelineMapOrderedKeys.length,
-            });
-        }
-
-        const added = timelineMapOrderedKeys.length - previousSize;
-        if (added > 0 || reorderCount > 0) {
-            debugLog('Map', `Update (${source}, ${direction}): ${timelineMapOrderedKeys.length} Einträge, +${Math.max(0, added)} neu, ${reorderCount} umsortiert`);
-        }
-
-        persistTimelineMap();
+    function queueMapMutation(articles, removed) {
+        for (const article of articles) mapMutationArticles.add(article);
+        if (removed.length) mapMutationRemoved.push(...removed);
+        if (mapMutationTimer) return;
+        mapMutationTimer = setTimeout(flushMapMutations, CONFIG.TIMELINE_MAP_DEBOUNCE_MS);
     }
 
     function setupTimelineMapObserver() {
@@ -3414,11 +3284,29 @@
             return;
         }
 
-        const observer = new MutationObserver(() => {
-            scheduleTimelineMapUpdate('mutation', 'neutral');
+        const observer = new MutationObserver((mutations) => {
+            const articles = [];
+            const removed = [];
+            for (const mutation of mutations) {
+                if (mutation.type !== 'childList') continue;
+                const host = mutation.target?.closest?.("article[data-testid='tweet']");
+                if (host) articles.push(host);
+                for (const node of mutation.addedNodes) {
+                    if (node.nodeType !== 1) continue;
+                    if (node.matches?.("article[data-testid='tweet']")) articles.push(node);
+                    else node.querySelectorAll?.("article[data-testid='tweet']").forEach(article => articles.push(article));
+                }
+                for (const node of mutation.removedNodes) {
+                    if (node.nodeType !== 1) continue;
+                    if (node.matches?.('article')) removed.push(node);
+                    else node.querySelectorAll?.('article').forEach(article => removed.push(article));
+                }
+            }
+            if (!articles.length && !removed.length) return;
+            queueMapMutation(articles, removed);
         });
         observer.observe(container, { childList: true, subtree: true });
-        debugLog('Map', 'Timeline-Landkarten-Observer aktiv');
+        ingestArticles(container.querySelectorAll("article[data-testid='tweet']"), 'init');
     }
 
     function isPostNewerThanBookmark(post, bookmark) {
@@ -3484,8 +3372,8 @@
         const bookmarkKey = postRefKey(bookmark);
         if (!bookmarkKey) return -1;
 
-        let idx = timelineMapOrderedKeys.indexOf(bookmarkKey);
-        if (idx >= 0) return idx;
+        const direct = mapIndexOf(bookmarkKey);
+        if (direct >= 0) return direct;
 
         try {
             const bookmarkId = BigInt(bookmark.tweetId);
@@ -3504,16 +3392,17 @@
             return -1;
         }
 
-        const computedIdx = computeBookmarkIdxInOrderedKeys(timelineMapOrderedKeys, bookmark);
-        if (computedIdx >= 0 && computedIdx < timelineMapOrderedKeys.length) {
-            return computedIdx;
-        }
-
         return -1;
     }
 
-    function refreshMapForLesestelle(source = 'mark', direction = 'neutral') {
-        updateTimelineMap(source, direction);
+    function refreshMapForLesestelle(source = 'mark') {
+        if (shouldDeferTimelineMapUpdate()) {
+            timelineMapDirtyWhileDeferred = true;
+            timelineMapPendingSource = source;
+            return;
+        }
+        const visible = visibleArticleElements();
+        if (visible.length) ingestArticles(visible, source);
     }
 
     /**
@@ -3609,46 +3498,6 @@
         return -1;
     }
 
-    function computeBookmarkIdxInOrderedKeys(orderedKeys, bookmark) {
-        if (!bookmark?.tweetId || !orderedKeys?.length) return -1;
-
-        const key = postRefKey(bookmark);
-        const listIdx = key ? orderedKeys.indexOf(key) : -1;
-
-        try {
-            const targetId = BigInt(bookmark.tweetId);
-            const targetRepost = !!bookmark.isRepost;
-            // Landkarte: Index 0 = neueste Posts, höhere Indizes = älter
-            let idIdx = orderedKeys.length;
-
-            for (let i = 0; i < orderedKeys.length; i++) {
-                const entry = timelineMapByKey.get(orderedKeys[i]);
-                if (!entry?.tweetId) continue;
-                const entryRepost = !!entry.isRepost;
-                const entryId = BigInt(entry.tweetId);
-
-                if (entryId === targetId && entryRepost === targetRepost) {
-                    idIdx = i;
-                    break;
-                }
-                // Eintrag älter als Bookmark → Bookmark gehört davor (niedrigerer Index)
-                if (entryId < targetId) {
-                    idIdx = i;
-                    break;
-                }
-            }
-
-            if (listIdx >= 0 && Math.abs(listIdx - idIdx) > 20) {
-                debugLog('Search', `Bookmark-Index korrigiert: ${listIdx} → ${idIdx} (Tweet-ID @${bookmark.authorHandler})`);
-            } else if (idIdx <= 2 && listIdx < 0 && orderedKeys.length > 80) {
-                debugLog('Search', `Bookmark-Index ${idIdx} (@${bookmark.authorHandler}) — prüfe Chronologie in Landkarte`);
-            }
-            return idIdx;
-        } catch (e) {
-            return listIdx;
-        }
-    }
-
     function ensureBookmarkInMap(bookmark) {
         if (!bookmark?.tweetId) return -1;
 
@@ -3662,15 +3511,6 @@
                 entry.authorHandler = bookmark.authorHandler || entry.authorHandler;
                 entry.timestamp = bookmark.timestamp || entry.timestamp;
             }
-            const correctIdx = computeBookmarkIdxInOrderedKeys(timelineMapOrderedKeys, bookmark);
-            if (correctIdx >= 0 && Math.abs(existingIdx - correctIdx) > 20) {
-                timelineMapOrderedKeys.splice(existingIdx, 1);
-                const insertAt = Math.min(Math.max(0, correctIdx > existingIdx ? correctIdx - 1 : correctIdx), timelineMapOrderedKeys.length);
-                timelineMapOrderedKeys.splice(insertAt, 0, key);
-                debugLog('Map', `Lesestelle per Tweet-ID verschoben: ${existingIdx} → ${insertAt}`);
-                persistTimelineMap(true);
-                return insertAt;
-            }
             return existingIdx;
         }
 
@@ -3681,7 +3521,6 @@
             authorHandler: bookmark.authorHandler,
             isRepost: !!bookmark.isRepost,
             timestamp: bookmark.timestamp,
-            lastDomY: null,
             lastSeenAt: nowIso,
             inDom: false
         });
@@ -3769,18 +3608,18 @@
             if (!entry?.tweetId) continue;
             scrollState.mapSnapshotTweetIdToIdx.set(`${entry.tweetId}-${!!entry.isRepost}`, i);
         }
-        scrollState.mapSnapshotBookmarkKey = bookmark ? postRefKey(bookmark) : null;
-        scrollState.mapSnapshotBookmarkIdx = bookmark
-            ? computeBookmarkIdxInOrderedKeys(scrollState.mapSnapshotOrderedKeys, bookmark)
+        const snapKey = bookmark ? postRefKey(bookmark) : null;
+        scrollState.mapSnapshotBookmarkKey = snapKey;
+        scrollState.mapSnapshotBookmarkIdx = snapKey
+            ? scrollState.mapSnapshotOrderedKeys.indexOf(snapKey)
             : -1;
         scrollState.searchCoarseDirection = null;
-        scrollState.largeScrollCount = 0;
         scrollState.isSlowScrollMode = false;
         scrollState.slowScrollLockedDirection = null;
         scrollState.slowScrollFineAttempts = 0;
         scrollState.searchTopRetryDone = false;
         scrollState.lastSearchScrollDirection = null;
-        debugLog('Search', `Landkarten-Snapshot: ${scrollState.mapSnapshotAtSearchStart.size} Einträge, Ziel-idx ${scrollState.mapSnapshotBookmarkIdx} (eingefroren, Tweet-ID)`);
+        debugLog('Search', `Landkarten-Snapshot: ${scrollState.mapSnapshotAtSearchStart.size} Einträge, Ziel-idx ${scrollState.mapSnapshotBookmarkIdx} (eingefroren)`);
     }
 
     function clearMapSnapshotForSearch() {
@@ -3819,16 +3658,6 @@
             }
         }
         return true;
-    }
-
-    function isSearchFineZoneActive(mapDistance) {
-        if (!isSearchFineZoneDistance(mapDistance)) return false;
-        const frozenIdx = getFrozenSearchBookmarkIdx();
-        const nearTopTarget = frozenIdx >= 0 && frozenIdx < CONFIG.SEARCH_TOP_RETRY_MAX_IDX;
-        return scrollState.isSlowScrollMode ||
-            scrollState.slowScrollLockedDirection !== null ||
-            scrollState.slowScrollFineAttempts > 0 ||
-            nearTopTarget;
     }
 
     async function landExactSearchHit(searchBookmark, postElement, diagCode, onCleanup) {
@@ -3943,38 +3772,19 @@
     }
 
     function resolveSearchDirection(bookmark, bookmarkIdx, viewportMin, viewportMax) {
-        let snapshotDirection = null;
-        let distance = 0;
-
+        // Richtung nur aus der Landkarte, sobald Ziel und Viewport einen Index haben.
+        // Tweet-IDs drehen Reposts um und dürfen die Richtung dann nicht mehr kippen.
         if (bookmarkIdx >= 0 && viewportMin >= 0) {
             if (bookmarkIdx < viewportMin) {
-                snapshotDirection = 'up';
-                distance = viewportMin - bookmarkIdx;
-            } else if (bookmarkIdx > viewportMax) {
-                snapshotDirection = 'down';
-                distance = bookmarkIdx - viewportMax;
-            } else {
-                distance = 0;
-                snapshotDirection = bookmarkIdx <= (viewportMin + viewportMax) / 2 ? 'up' : 'down';
+                return { direction: 'up', distance: viewportMin - bookmarkIdx };
             }
-        }
-
-        const tweetDirection = inferSearchDirectionFromTweetId(bookmark);
-
-        if (snapshotDirection && tweetDirection && snapshotDirection !== tweetDirection) {
-            if (bookmarkIdx < 30 && viewportMin > 80) {
-                debugLog('Search', `Richtung per Tweet-ID (Bookmark idx ${bookmarkIdx} verdächtig): ${tweetDirection}`);
-                return { direction: tweetDirection, distance: Math.max(distance, Math.abs(viewportMin - bookmarkIdx)) };
+            if (bookmarkIdx > viewportMax) {
+                return { direction: 'down', distance: bookmarkIdx - viewportMax };
             }
-            if (distance > 12) {
-                debugLog('Search', `Richtungs-Korrektur: Snapshot=${snapshotDirection} ≠ Tweet-ID=${tweetDirection} (Abstand ${distance}) → Tweet-ID`);
-                return { direction: tweetDirection, distance: distance || 99 };
-            }
+            const direction = bookmarkIdx <= (viewportMin + viewportMax) / 2 ? 'up' : 'down';
+            return { direction, distance: 0 };
         }
-        if (snapshotDirection) {
-            return { direction: snapshotDirection, distance };
-        }
-        return { direction: tweetDirection, distance: 99 };
+        return { direction: inferSearchDirectionFromTweetId(bookmark), distance: 99 };
     }
 
     function inferSearchDirectionFromTweetId(bookmark) {
@@ -4084,7 +3894,6 @@
             scrollState.searchCoarseDirection = newDirection;
             scrollState.searchDirection = newDirection;
             scrollState.isSlowScrollMode = false;
-            scrollState.largeScrollCount = 0;
             const label = useSnapshot ? 'Snapshot-Viewport' : 'Viewport';
             debugLog('Search', `${label}: Ziel idx ${bookmarkIdx} außerhalb (${min}–${max}, Abstand ${distance}) → grob ${newDirection}`);
         } else if (distance > 0) {
@@ -4105,7 +3914,7 @@
                 scrollState.slowScrollLockedDirection = null;
                 scrollState.slowScrollFineAttempts = 0;
                 scrollState.searchDirection = newDirection;
-                scrollState.isSlowScrollMode = scrollState.largeScrollCount >= scrollState.maxLargeScrolls;
+                scrollState.isSlowScrollMode = false;
                 scrollState.searchCoarseDirection = null;
                 debugLog('Search', `Annäherung: Ziel idx ${bookmarkIdx} nahe Viewport (${min}–${max}, Abstand ${distance}) → ${newDirection}`);
             }
@@ -4559,9 +4368,8 @@
     async function restoreReadingPositionAfterNewPosts(bookmark, baselineKeys) {
         if (!bookmark?.tweetId) return null;
 
-        let bookmarkId = null;
         try {
-            bookmarkId = BigInt(bookmark.tweetId);
+            BigInt(bookmark.tweetId);
         } catch (e) {
             return null;
         }
@@ -4579,6 +4387,7 @@
         let newPostCandidates = collectNewPostsSinceBaseline(bookmark, baselineKeys);
         let lastArticleCount = document.querySelectorAll('article').length;
         let lastScrollHeight = document.body.scrollHeight || document.documentElement.scrollHeight;
+        let lastSig = visibleTweetSignature();
         let stagnantLoads = 0;
         let stagnantScroll = 0;
 
@@ -4603,15 +4412,29 @@
                     collectNewPostsSinceBaseline(bookmark, baselineKeys)
                 );
 
+                // Observer ist während des Restores ausgesetzt. Sichtbare Artikel direkt einlesen,
+                // damit der nächste Sprung den Abstand in der Landkarte kennt.
+                ingestArticles(visibleArticleElements(), 'new-posts-restore-scroll');
+
                 if (step > 0) {
                     const articleCount = document.querySelectorAll('article').length;
                     const scrollHeight = document.body.scrollHeight || document.documentElement.scrollHeight;
+                    const sig = visibleTweetSignature();
                     const atBottom = window.scrollY + window.innerHeight >= scrollHeight - 80;
+                    const progressed = sig !== lastSig
+                        || articleCount !== lastArticleCount
+                        || scrollHeight !== lastScrollHeight;
 
-                    stagnantLoads = articleCount === lastArticleCount ? stagnantLoads + 1 : 0;
-                    stagnantScroll = scrollHeight === lastScrollHeight ? stagnantScroll + 1 : 0;
+                    if (progressed) {
+                        stagnantLoads = 0;
+                        stagnantScroll = 0;
+                    } else {
+                        stagnantLoads++;
+                        stagnantScroll++;
+                    }
                     lastArticleCount = articleCount;
                     lastScrollHeight = scrollHeight;
+                    lastSig = sig;
 
                     if (stagnantLoads >= CONFIG.NEW_POSTS_SCROLL_STAGNANT_LOADS &&
                         stagnantScroll >= CONFIG.NEW_POSTS_SCROLL_STAGNANT_HEIGHT &&
@@ -4623,9 +4446,9 @@
 
                 if (step >= maxSteps) break;
 
-                window.scrollBy({ top: CONFIG.NEW_POSTS_SCROLL_STEP_PX, behavior: 'auto' });
-                await new Promise(r => setTimeout(r, CONFIG.NEW_POSTS_SCROLL_SETTLE_MS));
-                updateTimelineMap('new-posts-restore-scroll', 'down');
+                const beforeSig = visibleTweetSignature();
+                window.scrollBy({ top: searchJumpMagnitude(bookmark), behavior: 'auto' });
+                await waitForFeedSettle(beforeSig, 480);
             }
         } finally {
             searchControl.isAutoScrolling = false;
@@ -4848,14 +4671,108 @@
         return !!resolved;
     }
 
+    function medianArticleHeight() {
+        const heights = [];
+        for (const article of visibleArticleElements()) {
+            const h = article.getBoundingClientRect().height;
+            if (h >= 40) heights.push(h);
+        }
+        if (!heights.length) return 320;
+        heights.sort((a, b) => a - b);
+        const mid = Math.floor(heights.length / 2);
+        if (heights.length % 2) return heights[mid];
+        return (heights[mid - 1] + heights[mid]) / 2;
+    }
+
+    function visibleTweetSignature() {
+        const ids = [];
+        for (const article of visibleArticleElements()) {
+            const id = getPostTweetId(article);
+            if (id) ids.push(id);
+        }
+        return ids.join('|');
+    }
+
+    /** Positiver Sprung in Pixeln. Richtung setzt der Aufrufer. */
+    function searchJumpMagnitude(bookmark) {
+        const distance = getMapDistanceToTarget(bookmark);
+        const fine = isSearchFineZoneDistance(distance);
+        if (fine || distance === 0) return CONFIG.SLOW_SEARCH_FINE_STEP_PX;
+        if (distance != null && distance > 0) {
+            const jump = distance * medianArticleHeight();
+            const cap = Math.round(window.innerHeight * CONFIG.SEARCH_JUMP_MAX_VH);
+            const floor = Math.round(window.innerHeight * 0.85);
+            return Math.max(floor, Math.min(Math.round(jump), cap));
+        }
+        return Math.round(window.innerHeight * 1.5);
+    }
+
     /**
-     * Zentralisierte Scroll-Logik inklusive Stagnationserkennung.
-     * Wird an mehreren Stellen innerhalb der Suche verwendet.
+     * Wartet per Frame, bis neue Tweet-IDs da sind und scrollY stillsteht,
+     * oder bis ohne neue IDs eine kurze Ruhezeit um ist.
+     */
+    function waitForFeedSettle(beforeSig, maxMs = 480) {
+        const settleMs = CONFIG.SEARCH_SETTLE_MS;
+        return new Promise(resolve => {
+            const start = performance.now();
+            let lastY = window.scrollY;
+            let stableFrames = 0;
+            let stableSince = start;
+            const tick = (now) => {
+                const y = window.scrollY;
+                if (Math.abs(y - lastY) > 1) {
+                    stableFrames = 0;
+                } else {
+                    stableFrames++;
+                    if (stableFrames === 1) stableSince = now;
+                }
+                lastY = y;
+                const sig = visibleTweetSignature();
+                const idsChanged = sig !== beforeSig;
+                const stillMs = now - stableSince;
+                if (idsChanged && stableFrames >= 2) {
+                    resolve(sig);
+                    return;
+                }
+                if (!idsChanged && stableFrames >= 2 && stillMs >= settleMs) {
+                    resolve(sig);
+                    return;
+                }
+                if (now - start >= maxMs) {
+                    resolve(sig);
+                    return;
+                }
+                requestAnimationFrame(tick);
+            };
+            requestAnimationFrame(tick);
+        });
+    }
+
+    /**
+     * Ein Sprung (Landkarten-Abstand × Posthöhe), dann weiter, sobald der Feed nachzieht.
+     * Die eingefrorene Such-Landkarte wird hier nicht neu eingelesen.
      */
     async function performScrollAndContinue(continueFn, onStagnationCleanup = null) {
-        const currentScrollHeight = document.body.scrollHeight || document.documentElement.scrollHeight;
+        const beforeHeight = document.body.scrollHeight || document.documentElement.scrollHeight;
+        const beforeSig = visibleTweetSignature();
+        const magnitude = searchJumpMagnitude(lastReadPost);
+        const step = scrollState.searchDirection === 'up' ? -magnitude : magnitude;
+        debugLog('Search', `Sprung ${step}px (Slow: ${scrollState.isSlowScrollMode}, Dir: ${scrollState.searchDirection})`);
+        window.scrollBy({ top: step, behavior: 'auto' });
 
-        if (currentScrollHeight === scrollState.lastScrollHeight) {
+        await waitForFeedSettle(beforeSig, 480);
+
+        // Nach dem Scrollen kann X einen "versteckte Beiträge"-Button eingefügt haben.
+        await tryClickShowHiddenPostsButton('scroll-search');
+
+        const afterHeight = document.body.scrollHeight || document.documentElement.scrollHeight;
+        const afterSig = visibleTweetSignature();
+        const progressed = afterHeight !== beforeHeight || afterSig !== beforeSig;
+        scrollState.lastScrollHeight = afterHeight;
+
+        if (progressed) {
+            scrollState.stagnantScrollCount = 0;
+        } else {
             scrollState.stagnantScrollCount++;
             const awaitingAnchors = isAwaitingHistoricalMapAnchors();
             const stagnantLimit = awaitingAnchors
@@ -4886,24 +4803,9 @@
             if (awaitingAnchors && scrollState.stagnantScrollCount > CONFIG.MAX_STAGNANT_SCROLLS) {
                 debugLog('Search', `Stagnation (${scrollState.stagnantScrollCount}), warte weiter auf historische Landkarten-Posts…`);
             }
-        } else {
-            scrollState.stagnantScrollCount = 0;
         }
 
-        scrollState.lastScrollHeight = currentScrollHeight;
-
-        const scrollStep = calculateScrollStep();
-        window.scrollBy({ top: scrollStep, behavior: 'smooth' });
-
-        await new Promise(resolve => setTimeout(resolve, 300));
-
-        // Nach dem Scrollen kann X einen "versteckte Beiträge"-Button eingefügt haben.
-        // Klicken, damit bei der Lesestelle-Suche keine Posts versteckt bleiben.
-        await tryClickShowHiddenPostsButton('scroll-search');
-
-        if (continueFn) {
-            requestAnimationFrame(() => setTimeout(continueFn, 300));
-        }
+        if (continueFn) requestAnimationFrame(continueFn);
     }
 
 
@@ -5000,11 +4902,7 @@
     // Sofort prüfen, ob X schon einen "versteckte Beiträge"-Button zeigt (kann Suche blockieren)
     await tryClickShowHiddenPostsButton('search-start');
 
-    // Wichtig: Such-/Scroll-State zurücksetzen (Punkt 4)
-    scrollState.scrollCyclePhase = 0;
-    scrollState.hasCompletedCycle = false;
     scrollState.stagnantScrollCount = 0;
-    scrollState.largeScrollCount = 0;
     scrollState.isSlowScrollMode = false;
     scrollState.searchDirection = 'down';
     scrollState.lastScrollHeight = 0;
@@ -5068,7 +4966,7 @@
     diagPush('BOOKMARK_TARGET', 'info', 'Such-Ziel gesetzt', { target: diagBookmark(searchBookmark) });
     debugLog('Search', `Suche für Account ${account}:`, lastReadPost);
     persistTimelineMap(true);
-    updateTimelineMap('search-init', 'neutral');
+    updateTimelineMap('search-init');
     ensureBookmarkInMap(searchBookmark);
     captureMapSnapshotForSearch(searchBookmark);
     const exactInDom = findBookmarkExactInDom(searchBookmark);
@@ -5191,7 +5089,7 @@
 
         let posts = getVisiblePosts().map(p => p.element);
         scrollState.totalLoadedPosts = Array.from(document.querySelectorAll('article')).length;
-        debugLog('Search', `Prüfe ${posts.length} sichtbare Posts (Gesamt: ${scrollState.totalLoadedPosts}). Scroll-Versuch: ${scrollState.stagnantScrollCount + 1}, Zyklusphase: ${scrollState.scrollCyclePhase}`);
+        debugLog('Search', `Prüfe ${posts.length} sichtbare Posts (Gesamt: ${scrollState.totalLoadedPosts}). Scroll-Versuch: ${scrollState.stagnantScrollCount + 1}`);
 
         // Während Lesestelle-Suche: falls X einen "Versteckte Beiträge anzeigen" Button eingefügt hat,
         // diesen sofort anklicken, damit die versteckten Posts geladen werden und die Suche das Ziel finden kann.
@@ -5301,7 +5199,7 @@
             if (io) io.disconnect();
         });
     };
-    await new Promise(resolve => setTimeout(resolve, 300));
+    await new Promise(resolve => requestAnimationFrame(resolve));
     search();
 
     } catch (err) {
@@ -5309,66 +5207,6 @@
         diagEndFlow('fail', 'SEARCH_EXCEPTION', String(err?.message || err), { snapshot: diagSnapshot() });
         endManualSearchSession();
     }
-}
-
-    function calculateScrollStep() {
-    const baseStep = window.innerHeight * 1.5;
-    let step;
-    if (scrollState.isSlowScrollMode) {
-        step = baseStep * 0.5;
-    } else {
-        step = baseStep * 3;
-    }
-
-    let hoursDiff;
-    const mapDistance = getMapDistanceToTarget(lastReadPost);
-    const fineZoneActive = isSearchFineZoneActive(mapDistance);
-    if (fineZoneActive) {
-        step = CONFIG.SLOW_SEARCH_FINE_STEP_PX;
-        scrollState.isSlowScrollMode = true;
-    }
-    if (mapDistance !== null && mapDistance > 12) {
-        scrollState.isSlowScrollMode = false;
-    }
-    if (mapDistance !== null && mapDistance > 0 && !fineZoneActive) {
-        let distanceFactor = Math.min(mapDistance / 5, 10);
-        distanceFactor = Math.min(distanceFactor, CONFIG.MAX_SEARCH_DISTANCE_FACTOR);
-        if (mapDistance > 12) {
-            distanceFactor = Math.max(distanceFactor, 2.5);
-        }
-        step *= distanceFactor;
-        hoursDiff = mapDistance / 4;
-        debugLog('Search', `Landkarten-Distanz-Faktor: ${distanceFactor.toFixed(2)} (idx-Abstand: ${mapDistance}, Snapshot: ${!!scrollState.mapSnapshotOrderedKeys})`);
-    }
-
-    // Absoluter Cap auf Schrittgröße.
-    // Bei weit entfernten Lesestellen (hoher hoursDiff) bewusst größere Sprünge erlauben.
-    // Overshoot-Schutz nach "Neue Beiträge" passiert primär durch Force-Slow + Bracketing.
-    let effectiveMaxVh = scrollState.isSlowScrollMode ? 1.4 : CONFIG.MAX_SEARCH_STEP_VH;
-    // (hoursDiff ist im aktuellen Scope verfügbar)
-    if (typeof hoursDiff !== 'undefined' && hoursDiff > 2 && scrollState.isSlowScrollMode) {
-        effectiveMaxVh = Math.max(effectiveMaxVh, 2.4);
-    }
-    const maxStep = window.innerHeight * effectiveMaxVh;
-    const sign = step < 0 ? -1 : 1;
-    step = sign * Math.min(Math.abs(step), maxStep);
-
-    // Landkarten-Index-Abstand steuert Scroll-Schrittgröße (größere Sprünge bei weit entfernten Zielen).
-
-    if (scrollState.searchDirection === 'up') {
-        step = -step;
-    }
-    if (!scrollState.isSlowScrollMode) {
-        scrollState.largeScrollCount++;
-
-        const inCoarsePhase = mapDistance !== null && mapDistance > 12;
-        if (!inCoarsePhase && scrollState.largeScrollCount >= scrollState.maxLargeScrolls) {
-            scrollState.isSlowScrollMode = true;
-            debugLog('Search', 'Max große Scrolls erreicht → Wechsel zu Slow-Scroll-Mode');
-        }
-    }
-    debugLog('Search', `Scroll-Schritt: ${step}px (Slow: ${scrollState.isSlowScrollMode}, Dir: ${scrollState.searchDirection})`);
-    return step;
 }
 
     function getPostOffsetDeviation(element) {
@@ -5537,7 +5375,6 @@
             return false;
         }
         lastReadPost = { ...frozen, account };
-        currentPost = lastReadPost;
         invalidateHighlightRetries();
 
         if (highlight) {
@@ -5622,10 +5459,7 @@
             const currentScroll = window.scrollY;
             const roughTarget = currentScroll + roughRect.top - (window.innerHeight * 0.55);
             window.scrollTo({ top: roughTarget, behavior: 'auto' });
-
-            setTimeout(() => {
-                doPrecisePositioning();
-            }, 900);
+            requestAnimationFrame(() => requestAnimationFrame(doPrecisePositioning));
             return;
         }
 
@@ -5673,9 +5507,9 @@
             return;
         }
 
-        window.scrollTo({ top: targetY, behavior: 'smooth' });
+        window.scrollTo({ top: targetY, behavior: 'auto' });
 
-        setTimeout(() => {
+        requestAnimationFrame(() => requestAnimationFrame(() => {
             const freshPost = resolveFreshPostElement(post, anchorTweetId, anchorAuthor) || post;
             const newRect = freshPost.getBoundingClientRect();
             const postDeviation = Math.abs(newRect.top - offset);
@@ -5692,29 +5526,19 @@
                 const correction = (newRect.top - offset) * 0.8;
                 window.scrollBy({ top: -correction, behavior: 'auto' });
                 debugLog('Position', `Eine Korrektur um ${Math.round(-correction)}px, dann fertig`);
-                setTimeout(() => {
-                    finishPositioning(`Beitrag nach einer Korrektur (rect.top=${newRect.top}).`);
-                }, 350);
+                requestAnimationFrame(() => requestAnimationFrame(() => {
+                    const corrected = resolveFreshPostElement(post, anchorTweetId, anchorAuthor) || post;
+                    finishPositioning(`Beitrag nach einer Korrektur (rect.top=${corrected.getBoundingClientRect().top}).`);
+                }));
             } else {
                 log('Position', 'Maximale Positionierungsversuche erreicht. rect.top:', newRect.top);
                 finishPositioning('Positionierung mit Toleranz abgeschlossen.');
             }
-        }, 850);
+        }));
     };
 
     tryPositionPost();
 }
-
-    async function findAndSetClosestPost() {
-        scrollState.scrollCyclePhase = 0;
-        scrollState.hasCompletedCycle = false;
-        scrollState.stagnantScrollCount = 0;
-        scrollState.largeScrollCount = 0;
-        scrollState.isSlowScrollMode = false;
-        scrollState.searchDirection = 'down';
-        scrollState.lastScrollHeight = 0;
-        await landReadingPositionFromResolve('legacy-fallback');
-    }
 
     function createSearchPopup(position) {
     const messageKey = searchControl.isFallbackSearching ? 'tweetIdNotFound' : 'searchPopup';
@@ -5869,23 +5693,6 @@
         }
     }
 
-    // Robust text-based fallback (X.com ändert häufig die DOM-Struktur)
-    const candidates = document.querySelectorAll('button, [role="button"]');
-    for (const el of candidates) {
-        const txt = (el.textContent || el.getAttribute('aria-label') || '').toLowerCase().trim();
-        if (matchesNewPostsText(txt)) {
-            const rect = el.getBoundingClientRect();
-            // Nur Elemente nah am oberen Rand des Viewports berücksichtigen
-            if (rect.top > -100 && rect.top < 350 && rect.width > 50) {
-                if (el.dataset.processed !== 'true') {
-                    const numMatch = txt.match(/(\d+)/);
-                    pendingNewPosts = numMatch ? parseInt(numMatch[1], 10) : 1;
-                    return el;
-                }
-            }
-        }
-    }
-
     return null;
 }
 
@@ -5954,7 +5761,7 @@
         await new Promise(resolve => setTimeout(resolve, 520));
 
         if (typeof scheduleTimelineMapUpdate === 'function') {
-            scheduleTimelineMapUpdate('hidden-gap-click', 'down');
+            scheduleTimelineMapUpdate('hidden-gap-click');
         }
         return true;
     }
@@ -6226,7 +6033,7 @@
                     debugLog('Restore', 'Gefundene Lesestelle nicht erneut gesetzt — schon manuell weitergescrollt');
                 }
                 newPostsState.lastRestoreCompletedAt = Date.now();
-                updateTimelineMap('new-posts-restore', 'up');
+                updateTimelineMap('new-posts-restore');
                 if (resolved.strategy === 'exact' && isReadingPositionAtTargetOffset(restoreBookmark)) {
                     newPostsState.autoLoadPaused = true;
                 }
@@ -6365,7 +6172,6 @@
         }, 400);
     }, {
         ...domBaseline,
-        aggressiveScroll: false,
         fallbackMs: 3000,
         settleMs: 1200,
     });
