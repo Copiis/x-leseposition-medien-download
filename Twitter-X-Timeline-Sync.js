@@ -15,7 +15,7 @@
 // @description:ko Twitter/X에서 마지막 읽기 위치를 추적하고 동기화합니다. 수동 및 자동 옵션 포함. 새로운 게시물을 확인하면서 현재 위치를 잃지 않도록 이상적입니다. 트윗 ID를 사용하여 정확한 위치 지정을 하고, 리포스트를 지원합니다。
 // @icon https://x.com/favicon.ico
 // @namespace https://github.com/Copiis/x-leseposition-medien-download
-// @version 2026.10.10c
+// @version 2026.10.10d
 // @author Copiis
 // @license MIT
 // @match https://x.com/*
@@ -1754,7 +1754,7 @@
         return;
     }
 
-    log('Init', 'Initialisiere Skript auf /home... (Version 2026.10.10c)');
+    log('Init', 'Initialisiere Skript auf /home... (Version 2026.10.10d)');
 
     const observer = new MutationObserver((mutations, obs) => {
         if (document.body) {
@@ -5251,8 +5251,13 @@
             newPostsState.autoLoadPaused = false;
             return false;
         }
-        // Lesestelle am Ziel-Offset: pausieren, auch wenn darüber neuere Posts sichtbar sind
-        // (erwartet nach erfolgreichem New-Posts-Restore — sonst Doppel-Klick-Schleife).
+        // Eine sichtbare Pille heißt: oben liegen noch ungeladene Beiträge.
+        // Die schon ausgerichtete Lesestelle darf den Klick nicht schlucken.
+        if (getNewPostsIndicator()) {
+            newPostsState.autoLoadPaused = false;
+            return false;
+        }
+        // Lesestelle am Ziel-Offset und keine Pille: nicht im Leerlauf klicken.
         if (isReadingPositionAtTargetOffset()) {
             if (!newPostsState.autoLoadPaused) {
                 newPostsState.autoLoadPaused = true;
@@ -5670,12 +5675,9 @@
     }
 
     const selectors = [
-        'button[data-testid*="new-tweets"], button[data-testid*="new-posts"]',
-        'button[aria-label*="Neue Posts"], button[aria-label*="neue Posts"], button[aria-label*="new posts"], button[aria-label*="neue Beiträge"]',
-        'div[data-testid="cellInnerDiv"] button[role="button"][class*="css-175oi2r r-1777fci"]',
-        'button[role="button"][class*="css-175oi2r"]',
-        'button[aria-label*="nouveaux tweets"], button[aria-label*="nuevos tweets"], button[aria-label*="new tweets"]',
-        'button span[class*="css-"][dir="ltr"]',
+        'button[data-testid*="new-tweets"], button[data-testid*="new-posts"], [role="button"][data-testid*="new-tweets"], [role="button"][data-testid*="new-posts"]',
+        'button[aria-label*="Neue Posts"], button[aria-label*="neue Posts"], button[aria-label*="new posts"], button[aria-label*="neue Beiträge"], [role="button"][aria-label*="Neue Posts"], [role="button"][aria-label*="neue Posts"], [role="button"][aria-label*="new posts"], [role="button"][aria-label*="neue Beiträge"]',
+        '[role="button"][aria-label*="nouveaux tweets"], [role="button"][aria-label*="nuevos tweets"], [role="button"][aria-label*="new tweets"]',
         'div[role="button"] span[data-testid*="new-tweet"], div[role="button"] span[aria-label*="posts"]'
     ];
 
@@ -5691,6 +5693,43 @@
                 return btn;
             }
         }
+    }
+
+    const column = document.querySelector("[data-testid='primaryColumn']")
+        || document.querySelector('main[role="main"]');
+    if (!column) return null;
+
+    const acceptPill = (host, txt) => {
+        if (!host || host.dataset?.processed === 'true') return null;
+        const rect = host.getBoundingClientRect();
+        if (rect.top < -100 || rect.top > 420 || rect.width < 40 || rect.height < 10) return null;
+        const numMatch = txt.match(/(\d+)/);
+        pendingNewPosts = numMatch ? parseInt(numMatch[1], 10) : 1;
+        return host;
+    };
+
+    // Live 10.10.2026: die Pille ist kein Button, sondern
+    // div[dir=ltr] (blau) > span, Text z. B. „3 neue Posts anzeigen“.
+    const blueSpans = document.querySelectorAll('div[dir="ltr"][style*="29, 155, 240"] > span');
+    for (const span of blueSpans) {
+        if (span.closest('article')) continue;
+        const txt = (span.textContent || '').replace(/\s+/g, ' ').trim();
+        if (!txt || txt.length > 80 || !matchesNewPostsText(txt)) continue;
+        const host = span.closest('button, [role="button"]') || span.parentElement || span;
+        const found = acceptPill(host, txt);
+        if (found) return found;
+    }
+
+    // Kurze Beschriftung in der Spalte, ohne die Aktionsbuttons der Tweets.
+    const candidates = column.querySelectorAll('button, [role="button"], div[dir="ltr"] > span');
+    for (const el of candidates) {
+        if (el.closest('article')) continue;
+        if (el.parentElement?.closest('button, [role="button"]')) continue;
+        const txt = ((el.textContent || el.getAttribute('aria-label') || '')).replace(/\s+/g, ' ').trim();
+        if (!txt || txt.length > 80 || !matchesNewPostsText(txt)) continue;
+        const host = el.closest('button, [role="button"]') || el.closest('div[dir="ltr"]') || el;
+        const found = acceptPill(host, txt);
+        if (found) return found;
     }
 
     return null;
@@ -6079,7 +6118,7 @@
         return;
     }
 
-    if (!fromUser && (isNewPostsAutoLoadPaused() || isReadingPositionAtTargetOffset())) {
+    if (!fromUser && isNewPostsAutoLoadPaused()) {
         if (!newPostsState.autoLoadPaused) {
             newPostsState.autoLoadPaused = true;
             logNewPostsAutoLoadPausedOnce();
