@@ -15,7 +15,7 @@
 // @description:ko Twitter/X에서 마지막 읽기 위치를 추적하고 동기화합니다. 수동 및 자동 옵션 포함. 새로운 게시물을 확인하면서 현재 위치를 잃지 않도록 이상적입니다. 트윗 ID를 사용하여 정확한 위치 지정을 하고, 리포스트를 지원합니다。
 // @icon https://x.com/favicon.ico
 // @namespace https://github.com/Copiis/x-leseposition-medien-download
-// @version 2026.10.11b
+// @version 2026.10.11c
 // @author Copiis
 // @license MIT
 // @match https://x.com/*
@@ -1755,7 +1755,7 @@
         return;
     }
 
-    log('Init', 'Initialisiere Skript auf /home... (Version 2026.10.11b)');
+    log('Init', 'Initialisiere Skript auf /home... (Version 2026.10.11c)');
 
     const observer = new MutationObserver((mutations, obs) => {
         if (document.body) {
@@ -3680,15 +3680,36 @@
     }
 
     async function finishSearchWhenFineExhausted(searchBookmark, onCleanup) {
-        // Nicht an den Seitenanfang springen. Das entlädt die Beiträge,
-        // in denen die Lesestelle gerade gesucht wurde.
-        const resolved = resolveReadingPosition(searchBookmark);
-        if (resolved?.post?.element) {
-            await applyResolvedReadingPosition(resolved, {
+        // Die alte Lesestelle liegt noch unter dem Fenster. Nicht „nicht gefunden“ sagen.
+        if (bookmarkStillBelowWindow(searchBookmark)) {
+            noteWindowStillTooYoung();
+            scrollState.searchDirection = 'down';
+            scrollState.slowScrollLockedDirection = null;
+            scrollState.slowScrollFineAttempts = 0;
+            scrollState.isSlowScrollMode = false;
+            return false;
+        }
+
+        let resolved = resolveReadingPosition(searchBookmark);
+        if (!resolved?.post?.element || !resolved.post.element.isConnected || resolvedPostIsTooYoung(resolved, searchBookmark)) {
+            resolved = nearestVisibleReadingPost(searchBookmark);
+        }
+        if (resolved?.post?.element && !resolvedPostIsTooYoung(resolved, searchBookmark)) {
+            const landed = await applyResolvedReadingPosition(resolved, {
                 adopt: true,
                 expectedBookmark: searchBookmark,
                 verifySource: 'search-fine-exhausted',
             });
+            if (!landed) {
+                await markNearestVisibleReadingPost(searchBookmark);
+            } else {
+                const popupKey = getResolvePopupKey(resolved);
+                if (popupKey) {
+                    showPopup(popupKey, 6000, {
+                        strategy: getResolveStrategyLabel(resolved.strategy, getUserLanguage())
+                    });
+                }
+            }
             diagEndFlow('ok', 'SEARCH_FINE_RESOLVE', `Resolve ${resolved.strategy} nach Feinbereich`, {
                 target: diagBookmark(searchBookmark),
             });
@@ -3699,21 +3720,38 @@
             return true;
         }
 
-        debugLog('Search', 'Feinbereich ohne Treffer — kein Emergency-Adopt');
+        const closest = closestVisibleReadingPost(searchBookmark);
+        if (closest?.post?.element) {
+            await applyResolvedReadingPosition(closest, {
+                adopt: true,
+                expectedBookmark: searchBookmark,
+                verifySource: 'visible-closest',
+            });
+            showPopup('approximatePosition', 6000, {
+                strategy: getResolveStrategyLabel(closest.strategy, getUserLanguage())
+            });
+            clearMapSnapshotForSearch();
+            endManualSearchSession();
+            dismissActionPopup();
+            if (typeof onCleanup === 'function') onCleanup();
+            return true;
+        }
+
+        debugLog('Search', 'Feinbereich ohne sichtbaren Ersatzpost');
         showPopup('tweetIdNotFound', 6000, {
             authorHandler: searchBookmark.authorHandler,
             tweetId: searchBookmark.tweetId,
         });
         diagEndFlow('warn', 'SEARCH_FINE_EXHAUSTED', 'Feinbereich ohne exakten Treffer', {
             target: diagBookmark(searchBookmark),
-            resolveStrategy: resolved?.strategy ?? null,
-            resolveConfidence: resolved?.confidence ?? null,
+            resolveStrategy: null,
+            resolveConfidence: null,
         });
         clearMapSnapshotForSearch();
         endManualSearchSession();
         dismissActionPopup();
         if (typeof onCleanup === 'function') onCleanup();
-        return false;
+        return true;
     }
 
     function getFrozenSearchBookmarkIdx() {
@@ -4639,22 +4677,36 @@
             resolved = resolveReadingPosition(bookmark);
         }
 
+        if (resolved?.strategy !== 'exact' &&
+            (bookmarkStillBelowWindow(bookmark) || resolvedPostIsTooYoung(resolved, bookmark))) {
+            log('Resolve', 'Ersatz übersprungen — Lesestelle liegt noch weiter unten');
+            dismissActionPopup();
+            endManualSearchSession();
+            searchControl.isFallbackSearching = false;
+            return false;
+        }
+
         searchControl.isFallbackSearching = true;
 
-        if (resolved) {
-            await applyResolvedReadingPosition(resolved, {
+        if (resolved?.post?.element) {
+            const landed = await applyResolvedReadingPosition(resolved, {
                 expectedBookmark: bookmark,
                 verifySource: reason || 'land-resolve',
             });
             dismissActionPopup();
-
-            const popupKey = getResolvePopupKey(resolved);
-            if (popupKey) {
-                const lang = getUserLanguage();
-                showPopup(popupKey, 6000, {
-                    strategy: getResolveStrategyLabel(resolved.strategy, lang)
-                });
+            if (!landed) {
+                await markNearestVisibleReadingPost(bookmark);
+            } else {
+                const popupKey = getResolvePopupKey(resolved);
+                if (popupKey) {
+                    const lang = getUserLanguage();
+                    showPopup(popupKey, 6000, {
+                        strategy: getResolveStrategyLabel(resolved.strategy, lang)
+                    });
+                }
             }
+        } else if (await markNearestVisibleReadingPost(bookmark)) {
+            dismissActionPopup();
         } else {
             log('Resolve', 'Kein article im DOM — Landing nicht möglich');
             diagPush('RESOLVE_EMPTY_DOM', 'error', `Kein Landing möglich (${reason})`, {
@@ -4698,21 +4750,6 @@
         return Math.round(vh * CONFIG.SEARCH_JUMP_MAX_VH);
     }
 
-    /**
-     * Ältester normaler Beitrag im Fenster, in ms.
-     * Reposts zählen nicht: deren Uhrzeit ist die des Originals, nicht die Stelle im Feed.
-     */
-    function oldestVisibleOriginalMs() {
-        let oldest = null;
-        for (const vis of getVisiblePosts()) {
-            if (!vis?.tweetId || vis.isRepost) continue;
-            const ms = Date.parse(vis.timestamp || '');
-            if (!Number.isFinite(ms)) continue;
-            if (oldest === null || ms < oldest) oldest = ms;
-        }
-        return oldest;
-    }
-
     function bookmarkTargetMs(bookmark) {
         const raw = getComparisonTimestamp(bookmark);
         const ms = raw ? Date.parse(raw) : NaN;
@@ -4726,12 +4763,135 @@
         }
     }
 
-    /** Fenster zeigt noch jüngere Beiträge als die Lesestelle. Nicht aufhören. */
+    /**
+     * Fenster ist noch jünger als die Lesestelle.
+     * Ein einzelner alter Beitrag (Zitat, unerkannt als Repost) reicht nicht:
+     * es zählt der Median der normalen Beiträge. Sind alle Tweet-IDs noch
+     * höher, liegt die Stelle sicher weiter unten.
+     */
     function viewportStillNewerThanBookmark(bookmark) {
-        const oldest = oldestVisibleOriginalMs();
         const target = bookmarkTargetMs(bookmark);
-        if (oldest === null || target === null) return false;
-        return oldest > target;
+        const times = [];
+        let bookmarkId = null;
+        let allIdsNewer = !bookmark?.isRepost && !!bookmark?.tweetId;
+        if (allIdsNewer) {
+            try {
+                bookmarkId = BigInt(bookmark.tweetId);
+            } catch (e) {
+                allIdsNewer = false;
+            }
+        }
+        let sawOriginal = false;
+        for (const vis of getVisiblePosts()) {
+            if (!vis?.tweetId || vis.isRepost) continue;
+            sawOriginal = true;
+            const ms = Date.parse(vis.timestamp || '');
+            if (Number.isFinite(ms)) times.push(ms);
+            if (allIdsNewer && bookmarkId !== null) {
+                try {
+                    if (BigInt(vis.tweetId) <= bookmarkId) allIdsNewer = false;
+                } catch (e) {
+                    allIdsNewer = false;
+                }
+            }
+        }
+        if (!sawOriginal) return false;
+        if (allIdsNewer) return true;
+        if (!times.length || target === null) return false;
+        times.sort((a, b) => a - b);
+        return times[Math.floor(times.length / 2)] > target;
+    }
+
+    /** Ziel-Index der Landkarte liegt noch unter dem sichtbaren Fenster. */
+    function bookmarkIndexStillBelow(bookmark) {
+        const useSnapshot = searchControl.isSearching && scrollState.mapSnapshotOrderedKeys?.length;
+        const idx = useSnapshot ? getFrozenSearchBookmarkIdx() : findBookmarkIndexInMap(bookmark);
+        if (idx < 0) return false;
+        const viewport = useSnapshot ? getSearchViewportIndexRange() : getVisibleMapIndexRange();
+        return viewport.max >= 0 && idx > viewport.max;
+    }
+
+    function bookmarkStillBelowWindow(bookmark) {
+        return viewportStillNewerThanBookmark(bookmark) || bookmarkIndexStillBelow(bookmark);
+    }
+
+    function readingPostFromVisible(vis, confidence, reason) {
+        const parsed = parseLoadedPost(vis.element);
+        const post = parsed || {
+            element: vis.element,
+            tweetId: vis.tweetId,
+            authorHandler: vis.authorHandler,
+            timestamp: vis.timestamp,
+            isRepost: !!vis.isRepost
+        };
+        if (!post.element) return null;
+        return { post, confidence, strategy: 'older', reason };
+    }
+
+    /**
+     * Nächster sichtbarer normaler Beitrag, der nicht jünger ist als die Lesestelle.
+     * Jüngere Beiträge im Fenster sind kein Ersatz für eine Stelle, die noch tiefer liegt.
+     */
+    function nearestVisibleReadingPost(bookmark) {
+        const target = bookmarkTargetMs(bookmark);
+        const visible = getVisiblePosts().filter(v => v?.element && v.tweetId && !v.isRepost);
+        if (!visible.length) return null;
+        let best = null;
+        let bestDiff = Infinity;
+        for (const vis of visible) {
+            const ms = Date.parse(vis.timestamp || '');
+            if (!Number.isFinite(ms) || target === null) continue;
+            if (ms > target) continue;
+            const diff = target - ms;
+            if (diff < bestDiff) {
+                bestDiff = diff;
+                best = vis;
+            }
+        }
+        if (!best) return null;
+        return readingPostFromVisible(best, 60, 'visible-nearest');
+    }
+
+    function closestVisibleReadingPost(bookmark) {
+        const target = bookmarkTargetMs(bookmark);
+        const visible = getVisiblePosts().filter(v => v?.element && v.tweetId);
+        if (!visible.length) return null;
+        let best = null;
+        let bestDiff = Infinity;
+        for (const vis of visible) {
+            const ms = Date.parse(vis.timestamp || '');
+            const diff = Number.isFinite(ms) && target !== null ? Math.abs(target - ms) : Number.MAX_SAFE_INTEGER;
+            if (diff < bestDiff) {
+                bestDiff = diff;
+                best = vis;
+            }
+        }
+        return best ? readingPostFromVisible(best, 55, 'visible-closest') : null;
+    }
+
+    function resolvedPostIsTooYoung(resolved, bookmark) {
+        const target = bookmarkTargetMs(bookmark);
+        const ms = Date.parse(resolved?.post?.timestamp || '');
+        if (target === null || !Number.isFinite(ms)) return false;
+        return ms > target + 60 * 1000;
+    }
+
+    async function markNearestVisibleReadingPost(bookmark) {
+        const nearest = nearestVisibleReadingPost(bookmark);
+        if (!nearest?.post?.element) return false;
+        const landed = await applyResolvedReadingPosition(nearest, {
+            adopt: true,
+            expectedBookmark: bookmark,
+            verifySource: 'visible-nearest',
+        });
+        if (!landed) {
+            applyHighlightToPost(nearest.post.element, { confidence: nearest.confidence, strategy: nearest.strategy });
+        }
+        showPopup('approximatePosition', 6000, {
+            strategy: getResolveStrategyLabel(nearest.strategy, getUserLanguage())
+        });
+        log('Resolve', `Nächsten sichtbaren Post markiert: @${nearest.post.authorHandler || '?'} ${nearest.post.tweetId}`);
+        return true;
     }
 
     function noteWindowStillTooYoung() {
@@ -4828,6 +4988,15 @@
                 : CONFIG.MAX_STAGNANT_SCROLLS;
 
             if (scrollState.stagnantScrollCount > stagnantLimit) {
+                if (bookmarkStillBelowWindow(lastReadPost)) {
+                    log('Search', 'Keine neuen Posts, die Lesestelle liegt noch tiefer. Alte Stelle bleibt.');
+                    clearMapSnapshotForSearch();
+                    endManualSearchSession();
+                    if (typeof onStagnationCleanup === 'function') {
+                        try { onStagnationCleanup(); } catch (e) { /* ignore */ }
+                    }
+                    return;
+                }
                 log('Search', `Suche abgebrochen: Keine neuen Posts nach Stagnation (${stagnantLimit}).`);
                 diagPush('SEARCH_STAGNATION', 'warn', 'Scroll-Suche stagniert — Fallback-Resolve', {
                     stagnantScrolls: scrollState.stagnantScrollCount,
@@ -4836,10 +5005,6 @@
                 });
                 clearMapSnapshotForSearch();
                 endManualSearchSession();
-                updateActionPopup('tweetIdNotFound', {
-                    authorHandler: lastReadPost?.authorHandler,
-                    tweetId: lastReadPost?.tweetId
-                });
                 void landReadingPositionFromResolve('stagnation');
 
                 if (typeof onStagnationCleanup === 'function') {
@@ -4875,10 +5040,6 @@
         const startFallbackSearch = () => {
             clearMapSnapshotForSearch();
             endManualSearchSession();
-            updateActionPopup('tweetIdNotFound', {
-                authorHandler: lastReadPost?.authorHandler,
-                tweetId: lastReadPost?.tweetId
-            });
             void landReadingPositionFromResolve('search-abort');
             if (typeof onCleanup === 'function') {
                 try { onCleanup(); } catch (e) { /* ignore cleanup errors */ }
@@ -5245,16 +5406,16 @@
                 debugLog('Search', mapDistance === 0
                     ? 'Ziel-Bereich schon sichtbar, Beitrag fehlt — kein Hin- und Her'
                     : 'Dieselben Beiträge schon geprüft, Richtung würde drehen — kein Hin- und Her');
-                await finishSearchWhenFineExhausted(searchBookmark, searchCleanup);
-                return;
+                const ended = await finishSearchWhenFineExhausted(searchBookmark, searchCleanup);
+                if (ended) return;
             }
         }
 
         if (!windowTooYoung && isSearchFineZoneDistance(mapDistance)) {
             scrollState.slowScrollFineAttempts++;
             if (scrollState.slowScrollFineAttempts > CONFIG.SLOW_SEARCH_FINE_MAX_ATTEMPTS) {
-                await finishSearchWhenFineExhausted(searchBookmark, searchCleanup);
-                return;
+                const ended = await finishSearchWhenFineExhausted(searchBookmark, searchCleanup);
+                if (ended) return;
             }
         }
 
@@ -6130,11 +6291,21 @@
                     frozen: diagBookmark(restoreBookmark),
                     snapshot: diagSnapshot(),
                 });
-                showPopup('tweetIdNotFound', 6000, {
-                    authorHandler: restoreBookmark.authorHandler,
-                    tweetId: restoreBookmark.tweetId
-                });
-                diagEndFlow('fail', 'NEWPOSTS_NO_RESOLVE', 'Weder Lesestelle noch neue Posts');
+                if (bookmarkStillBelowWindow(restoreBookmark)) {
+                    log('Restore', 'Lesestelle liegt noch weiter unten. Alte Stelle bleibt.');
+                    diagEndFlow('fail', 'NEWPOSTS_NO_RESOLVE', 'Lesestelle noch unter dem Fenster');
+                    return;
+                }
+                const marked = await markNearestVisibleReadingPost(restoreBookmark);
+                if (!marked) {
+                    showPopup('tweetIdNotFound', 6000, {
+                        authorHandler: restoreBookmark.authorHandler,
+                        tweetId: restoreBookmark.tweetId
+                    });
+                }
+                diagEndFlow(marked ? 'ok' : 'fail', 'NEWPOSTS_NO_RESOLVE', marked
+                    ? 'Nächsten sichtbaren Post markiert'
+                    : 'Weder Lesestelle noch neue Posts');
                 return;
             }
 
