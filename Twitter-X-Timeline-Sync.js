@@ -15,7 +15,7 @@
 // @description:ko Twitter/X에서 마지막 읽기 위치를 추적하고 동기화합니다. 수동 및 자동 옵션 포함. 새로운 게시물을 확인하면서 현재 위치를 잃지 않도록 이상적입니다. 트윗 ID를 사용하여 정확한 위치 지정을 하고, 리포스트를 지원합니다。
 // @icon https://x.com/favicon.ico
 // @namespace https://github.com/Copiis/x-leseposition-medien-download
-// @version 2026.10.11d
+// @version 2026.10.11e
 // @author Copiis
 // @license MIT
 // @match https://x.com/*
@@ -88,6 +88,9 @@
         SLOW_SEARCH_FINE_STEP_PX: 280,       // Kleine Schritte wenn das Ziel schon nah ist.
         SEARCH_JUMP_MAX_VH: 0.85,            // Ein Schritt, mit Überlappung zum vorigen Bild.
         SEARCH_SETTLE_MS: 240,               // Kurz warten, bis neue Tweet-IDs da sind oder scrollY stillsteht.
+        SEARCH_STEP_MIN_MS: 280,             // Nicht im nächsten Frame schon wieder springen.
+        SEARCH_BOUNCE_PX: 72,                // Kleiner als ein Suchschritt, größer als eine Scrollbalkenbreite.
+        SEARCH_BOUNCE_MAX: 3,                // So oft darf ein Sprung verpuffen, dann ist es eine Schleife.
         SLOW_SEARCH_FINE_MAX_ATTEMPTS: 15,   // Danach Resolve an der aktuellen Stelle, nicht an den Seitenanfang.
         SEARCH_FINE_ZONE_HYSTERESIS: 2,      // Abstand 0–2: keine großen Sprünge mehr (Ping-Pong-Schutz)
         SEARCH_TOP_RETRY_MAX_IDX: 25,        // Nahe am Map-Anfang früher in den Feinbereich.
@@ -882,6 +885,11 @@
         searchIndexHitNudged: false,
         windowTooYoungLogged: false,
         lastSearchScrollDirection: null,
+        searchBounceCount: 0,
+        directionFlipStreak: 0,
+        settleOscillated: false,
+        scrollLoopStopped: false,
+        recentStepDeltas: [],
     };
 
     // === Search Control Flags ===
@@ -935,6 +943,12 @@
         searchControl.manualSearchActive = true;
         searchControl.isSearching = true;
         searchControl.isSearchCancelled = false;
+        scrollState.searchBounceCount = 0;
+        scrollState.directionFlipStreak = 0;
+        scrollState.settleOscillated = false;
+        scrollState.scrollLoopStopped = false;
+        scrollState.recentStepDeltas = [];
+        holdScrollAnchor();
     }
 
     function endManualSearchSession(clearSearching = true) {
@@ -944,7 +958,42 @@
         if (clearSearching) {
             searchControl.isSearching = false;
         }
+        releaseScrollAnchor();
         flushDeferredTimelineMapUpdate('search-end');
+    }
+
+    // X schiebt die Scrollposition nach, wenn darüber Zellen kommen oder gehen.
+    // Zusammen mit unserem Sprung wird daraus ein Hin-und-her von etwa einer
+    // Scrollbalkenbreite. Während der Suche bleibt das Ankern aus.
+    function holdScrollAnchor() {
+        const root = document.documentElement;
+        scrollAnchorToken++;
+        if (!root || root.dataset.xtsAnchorHeld === '1') return;
+        root.dataset.xtsAnchorHeld = '1';
+        root.dataset.xtsAnchorPrev = root.style.overflowAnchor || '';
+        root.style.overflowAnchor = 'none';
+    }
+
+    let scrollAnchorToken = 0;
+
+    function releaseScrollAnchor() {
+        const root = document.documentElement;
+        if (!root || root.dataset.xtsAnchorHeld !== '1') return;
+        const token = scrollAnchorToken;
+        const apply = () => {
+            if (token !== scrollAnchorToken) return;
+            if (root.dataset.xtsAnchorHeld !== '1') return;
+            root.style.overflowAnchor = root.dataset.xtsAnchorPrev || '';
+            delete root.dataset.xtsAnchorHeld;
+            delete root.dataset.xtsAnchorPrev;
+        };
+        // Nach einer Schleife noch kurz aus lassen. Sonst nimmt X das Pendeln
+        // wieder auf, sobald das Ankern zurückkommt.
+        if (scrollState.scrollLoopStopped) {
+            setTimeout(apply, 1600);
+            return;
+        }
+        apply();
     }
 
     function isPostLupeProtectionActive() {
@@ -1755,7 +1804,7 @@
         return;
     }
 
-    log('Init', 'Initialisiere Skript auf /home... (Version 2026.10.11d)');
+    log('Init', 'Initialisiere Skript auf /home... (Version 2026.10.11e)');
 
     const observer = new MutationObserver((mutations, obs) => {
         if (document.body) {
@@ -4424,6 +4473,11 @@
         let stagnantScroll = 0;
 
         searchControl.isAutoScrolling = true;
+        scrollState.searchBounceCount = 0;
+        scrollState.settleOscillated = false;
+        scrollState.scrollLoopStopped = false;
+        scrollState.recentStepDeltas = [];
+        holdScrollAnchor();
         try {
             for (let step = 0; step <= maxSteps; step++) {
                 const exact = findBookmarkExactInDom(bookmark);
@@ -4484,13 +4538,22 @@
                 if (step >= maxSteps) break;
 
                 const beforeSig = visibleTweetSignature();
-                window.scrollBy({ top: searchJumpMagnitude(bookmark), behavior: 'auto' });
-                await waitForFeedSettle(beforeSig, 480);
+                const jump = searchJumpMagnitude(bookmark);
+                const beforeY = window.scrollY || 0;
+                window.scrollBy({ top: jump, behavior: 'auto' });
+                await waitForFeedSettle(beforeSig, 700);
+                if (scrollState.settleOscillated || rememberSearchStep(jump, beforeY)) {
+                    noteScrollLoopStopped();
+                    break;
+                }
             }
         } finally {
             searchControl.isAutoScrolling = false;
             noteProgrammaticScrollEnded();
+            releaseScrollAnchor();
         }
+
+        if (scrollState.scrollLoopStopped) return null;
 
         const finalExact = findBookmarkExactInDom(bookmark);
         if (finalExact) {
@@ -4947,38 +5010,62 @@
     }
 
     /**
-     * Wartet per Frame, bis neue Tweet-IDs da sind und scrollY stillsteht,
+     * Wartet, bis neue Tweet-IDs da sind und scrollY stillsteht,
      * oder bis ohne neue IDs eine kurze Ruhezeit um ist.
+     * Kleine Richtungswechsel in dichter Folge sind die Auf-und-ab-Schleife.
      */
-    function waitForFeedSettle(beforeSig, maxMs = 480) {
+    function waitForFeedSettle(beforeSig, maxMs = 700) {
         const settleMs = CONFIG.SEARCH_SETTLE_MS;
+        const minMs = CONFIG.SEARCH_STEP_MIN_MS;
         return new Promise(resolve => {
             const start = performance.now();
             let lastY = window.scrollY;
             let stableFrames = 0;
             let stableSince = start;
+            let lastSig = beforeSig;
+            let lastSigCheck = 0;
+            let lastSmallSign = 0;
+            let smallFlips = 0;
             const tick = (now) => {
                 const y = window.scrollY;
-                if (Math.abs(y - lastY) > 1) {
+                const delta = y - lastY;
+                if (Math.abs(delta) > 1) {
                     stableFrames = 0;
+                    if (Math.abs(delta) < CONFIG.SEARCH_BOUNCE_PX) {
+                        const sign = delta > 0 ? 1 : -1;
+                        if (lastSmallSign && sign !== lastSmallSign) smallFlips++;
+                        lastSmallSign = sign;
+                    } else {
+                        lastSmallSign = 0;
+                        smallFlips = 0;
+                    }
                 } else {
                     stableFrames++;
                     if (stableFrames === 1) stableSince = now;
                 }
                 lastY = y;
-                const sig = visibleTweetSignature();
-                const idsChanged = sig !== beforeSig;
+                if (smallFlips >= 4) {
+                    scrollState.settleOscillated = true;
+                    resolve(lastSig);
+                    return;
+                }
+                const elapsed = now - start;
+                if (now - lastSigCheck >= 100) {
+                    lastSig = visibleTweetSignature();
+                    lastSigCheck = now;
+                }
+                const idsChanged = lastSig !== beforeSig;
                 const stillMs = now - stableSince;
-                if (idsChanged && stableFrames >= 2) {
-                    resolve(sig);
+                if (elapsed >= minMs && idsChanged && stableFrames >= 2) {
+                    resolve(lastSig);
                     return;
                 }
-                if (!idsChanged && stableFrames >= 2 && stillMs >= settleMs) {
-                    resolve(sig);
+                if (elapsed >= minMs && !idsChanged && stableFrames >= 2 && stillMs >= settleMs) {
+                    resolve(lastSig);
                     return;
                 }
-                if (now - start >= maxMs) {
-                    resolve(sig);
+                if (elapsed >= maxMs) {
+                    resolve(lastSig);
                     return;
                 }
                 requestAnimationFrame(tick);
@@ -4987,19 +5074,77 @@
         });
     }
 
+    function noteScrollLoopStopped() {
+        log('Search', 'Suche angehalten: die Seite springt nur noch hin und her.');
+        scrollState.settleOscillated = false;
+        scrollState.scrollLoopStopped = true;
+    }
+
+    function stopSearchScrollLoop(onCleanup) {
+        noteScrollLoopStopped();
+        diagEndFlow('warn', 'SCROLL_LOOP', 'Scroll-Schleife angehalten');
+        clearMapSnapshotForSearch();
+        endManualSearchSession();
+        dismissActionPopup();
+        if (typeof onCleanup === 'function') {
+            try { onCleanup(); } catch (e) { /* ignore */ }
+        }
+    }
+
+    function rememberSearchStep(step, beforeY) {
+        const actual = (window.scrollY || 0) - beforeY;
+        const deltas = scrollState.recentStepDeltas;
+        deltas.push(actual);
+        if (deltas.length > 4) deltas.shift();
+        if (deltas.length >= 4) {
+            const sum = deltas.reduce((a, b) => a + b, 0);
+            let sawDown = false;
+            let sawUp = false;
+            for (const delta of deltas) {
+                if (delta > 40) sawDown = true;
+                else if (delta < -40) sawUp = true;
+            }
+            if (sawDown && sawUp && Math.abs(sum) < CONFIG.SEARCH_BOUNCE_PX) {
+                debugLog('Search', `Schleife über ${deltas.map(d => Math.round(d)).join(', ')}px`);
+                scrollState.searchBounceCount = CONFIG.SEARCH_BOUNCE_MAX;
+                return true;
+            }
+        }
+        const swallowed = Math.abs(step) > 80 && Math.abs(actual) < CONFIG.SEARCH_BOUNCE_PX;
+        const reversed = step > 0 ? actual < -8 : actual > 8;
+        if (swallowed || reversed) {
+            scrollState.searchBounceCount++;
+            debugLog('Search', `Sprung ohne Weg (${Math.round(actual)}px statt ${Math.round(step)}px, ${scrollState.searchBounceCount})`);
+            return scrollState.searchBounceCount >= CONFIG.SEARCH_BOUNCE_MAX;
+        }
+        if (Math.abs(actual) >= CONFIG.SEARCH_BOUNCE_PX) {
+            scrollState.searchBounceCount = 0;
+        }
+        return false;
+    }
+
     /**
      * Ein Bildschirm weiter, dann prüfen, sobald der Feed nachzieht.
      * Die eingefrorene Such-Landkarte wird hier nicht neu eingelesen.
      */
     async function performScrollAndContinue(continueFn, onStagnationCleanup = null) {
+        if (scrollState.scrollLoopStopped || scrollState.searchBounceCount >= CONFIG.SEARCH_BOUNCE_MAX) {
+            stopSearchScrollLoop(onStagnationCleanup);
+            return;
+        }
         const beforeHeight = document.body.scrollHeight || document.documentElement.scrollHeight;
         const beforeSig = visibleTweetSignature();
         const magnitude = searchJumpMagnitude(lastReadPost);
         const step = scrollState.searchDirection === 'up' ? -magnitude : magnitude;
+        const beforeY = window.scrollY || 0;
         debugLog('Search', `Sprung ${step}px (Slow: ${scrollState.isSlowScrollMode}, Dir: ${scrollState.searchDirection})`);
         window.scrollBy({ top: step, behavior: 'auto' });
 
-        await waitForFeedSettle(beforeSig, 480);
+        await waitForFeedSettle(beforeSig, 700);
+        if (scrollState.settleOscillated || rememberSearchStep(step, beforeY)) {
+            stopSearchScrollLoop(onStagnationCleanup);
+            return;
+        }
 
         // Nach dem Scrollen kann X einen "versteckte Beiträge"-Button eingefügt haben.
         await tryClickShowHiddenPostsButton('scroll-search');
@@ -5401,6 +5546,7 @@
             return;
         }
 
+        const previousDirection = scrollState.searchDirection;
         updateSearchDirectionFromMap(searchBookmark);
         // Dieselbe gespeicherte Stelle findet das manuelle Laden. Die Landkarte
         // darf die automatische Suche nicht beenden, solange der Beitrag noch
@@ -5412,6 +5558,18 @@
             scrollState.slowScrollLockedDirection = null;
             scrollState.slowScrollFineAttempts = 0;
             scrollState.isSlowScrollMode = false;
+            scrollState.directionFlipStreak = 0;
+        } else if (scrollState.searchDirection !== previousDirection) {
+            // Ein einzelner Wechsel ist oft nur das Pendeln der Landkarte.
+            scrollState.directionFlipStreak++;
+            if (scrollState.directionFlipStreak < 2) {
+                debugLog('Search', `Richtungswechsel ${previousDirection} → ${scrollState.searchDirection} zurückgestellt`);
+                scrollState.searchDirection = previousDirection;
+            } else {
+                scrollState.directionFlipStreak = 0;
+            }
+        } else {
+            scrollState.directionFlipStreak = 0;
         }
 
         scrollState.lastSearchScrollDirection = scrollState.searchDirection;
@@ -6281,6 +6439,11 @@
             // Suche ist vorbei. Ab hier darf manuelles Scrollen sofort eine neue Lesestelle setzen.
             const scrollHold = manualScrollGeneration;
             releaseNewPostsSearchHold();
+            if (scrollState.scrollLoopStopped) {
+                scrollState.scrollLoopStopped = false;
+                diagEndFlow('warn', 'SCROLL_LOOP', 'Scroll-Schleife angehalten');
+                return;
+            }
             if (!resolved) {
                 diagPush('NEWPOSTS_EMPTY_FEED', 'error', 'Kein Treffer nach New-Posts Scroll-Restore', {
                     frozen: diagBookmark(restoreBookmark),
