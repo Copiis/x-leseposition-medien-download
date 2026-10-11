@@ -15,7 +15,7 @@
 // @description:ko Twitter/X에서 마지막 읽기 위치를 추적하고 동기화합니다. 수동 및 자동 옵션 포함. 새로운 게시물을 확인하면서 현재 위치를 잃지 않도록 이상적입니다. 트윗 ID를 사용하여 정확한 위치 지정을 하고, 리포스트를 지원합니다。
 // @icon https://x.com/favicon.ico
 // @namespace https://github.com/Copiis/x-leseposition-medien-download
-// @version 2026.10.11c
+// @version 2026.10.11d
 // @author Copiis
 // @license MIT
 // @match https://x.com/*
@@ -71,7 +71,7 @@
         NEW_POSTS_GRACE_MS: 1800,            // Nach "Neue Beiträge" (etwas länger wegen Feed-Sprung)
         BACKGROUND_SLEEP_MS: 45000,          // Ab dieser Hintergrundzeit gilt der Tab als eingeschlafen
         WAKE_RESTORE_GRACE_MS: 12000,        // Nach dem Aufwachen auf nachgeladene Posts warten, dann Lesestelle suchen
-        NEW_POSTS_SCROLL_SEARCH_MAX_ATTEMPTS: 60,
+        NEW_POSTS_SCROLL_SEARCH_MAX_ATTEMPTS: 800, // Wie die manuelle Suche: nicht nach ein paar Bildschirmen aufhören.
         NEW_POSTS_SCROLL_STAGNANT_LOADS: 3,    // Keine neuen articles und keine neuen Tweet-IDs mehr
         NEW_POSTS_SCROLL_STAGNANT_HEIGHT: 2,   // scrollHeight unverändert
 
@@ -1755,7 +1755,7 @@
         return;
     }
 
-    log('Init', 'Initialisiere Skript auf /home... (Version 2026.10.11c)');
+    log('Init', 'Initialisiere Skript auf /home... (Version 2026.10.11d)');
 
     const observer = new MutationObserver((mutations, obs) => {
         if (document.body) {
@@ -4739,7 +4739,10 @@
         const vh = window.innerHeight || 800;
         // Landkarte kann „Ziel schon hier“ sagen, während die Beiträge im
         // Fenster noch deutlich jünger sind. Dann weiter in Bildschirm-Schritten.
-        if (viewportStillNewerThanBookmark(bookmark)) {
+        // Manuelles Laden findet die Stelle, weil es weiterrollt. Solange im
+        // Fenster noch kein normaler Beitrag so alt ist wie die Lesestelle,
+        // bleiben die Schritte ein Bildschirm. Die Landkarte hat hier zu früh stop gesagt.
+        if (viewportStillNewerThanBookmark(bookmark) || bookmarkNotReachedByTweetId(bookmark)) {
             return Math.round(vh * CONFIG.SEARCH_JUMP_MAX_VH);
         }
         const distance = getMapDistanceToTarget(bookmark);
@@ -4811,8 +4814,36 @@
         return viewport.max >= 0 && idx > viewport.max;
     }
 
+    /**
+     * Ein normaler Beitrag im Fenster hat schon eine Tweet-ID der Lesestelle
+     * oder eine kleinere. Vorher liegt die gespeicherte Stelle noch tiefer.
+     * Reposts zählen nicht: ihre ID ist die des Originals.
+     */
+    function bookmarkNotReachedByTweetId(bookmark) {
+        if (!bookmark?.tweetId || bookmark.isRepost) return false;
+        let bookmarkId;
+        try {
+            bookmarkId = BigInt(bookmark.tweetId);
+        } catch (e) {
+            return false;
+        }
+        let sawOriginal = false;
+        for (const vis of getVisiblePosts()) {
+            if (!vis?.tweetId || vis.isRepost) continue;
+            sawOriginal = true;
+            try {
+                if (BigInt(vis.tweetId) <= bookmarkId) return false;
+            } catch (e) {
+                continue;
+            }
+        }
+        return sawOriginal;
+    }
+
     function bookmarkStillBelowWindow(bookmark) {
-        return viewportStillNewerThanBookmark(bookmark) || bookmarkIndexStillBelow(bookmark);
+        return bookmarkNotReachedByTweetId(bookmark)
+            || viewportStillNewerThanBookmark(bookmark)
+            || bookmarkIndexStillBelow(bookmark);
     }
 
     function readingPostFromVisible(vis, confidence, reason) {
@@ -4905,7 +4936,7 @@
         // Ganz oben liegt die Lesestelle nicht schon über dem Fenster.
         // Sonst bricht die Suche ab, bevor sie überhaupt nach unten rollt.
         if (timelineScrollOffset() <= CONFIG.AT_TOP_SCROLL_PX) return false;
-        if (viewportStillNewerThanBookmark(bookmark)) {
+        if (bookmarkNotReachedByTweetId(bookmark) || viewportStillNewerThanBookmark(bookmark)) {
             noteWindowStillTooYoung();
             return false;
         }
@@ -4989,28 +5020,25 @@
 
             if (scrollState.stagnantScrollCount > stagnantLimit) {
                 if (bookmarkStillBelowWindow(lastReadPost)) {
-                    log('Search', 'Keine neuen Posts, die Lesestelle liegt noch tiefer. Alte Stelle bleibt.');
+                    // Kurzes Stocken ist kein Ende. Die Versuchszahl beendet die Suche.
+                    scrollState.stagnantScrollCount = 0;
+                    debugLog('Search', 'Stocken, Lesestelle noch tiefer — weiter nach unten');
+                } else {
+                    log('Search', `Suche abgebrochen: Keine neuen Posts nach Stagnation (${stagnantLimit}).`);
+                    diagPush('SEARCH_STAGNATION', 'warn', 'Scroll-Suche stagniert — Fallback-Resolve', {
+                        stagnantScrolls: scrollState.stagnantScrollCount,
+                        awaitingMapAnchors: awaitingAnchors,
+                        snapshot: diagSnapshot(),
+                    });
                     clearMapSnapshotForSearch();
                     endManualSearchSession();
+                    void landReadingPositionFromResolve('stagnation');
+
                     if (typeof onStagnationCleanup === 'function') {
                         try { onStagnationCleanup(); } catch (e) { /* ignore */ }
                     }
                     return;
                 }
-                log('Search', `Suche abgebrochen: Keine neuen Posts nach Stagnation (${stagnantLimit}).`);
-                diagPush('SEARCH_STAGNATION', 'warn', 'Scroll-Suche stagniert — Fallback-Resolve', {
-                    stagnantScrolls: scrollState.stagnantScrollCount,
-                    awaitingMapAnchors: awaitingAnchors,
-                    snapshot: diagSnapshot(),
-                });
-                clearMapSnapshotForSearch();
-                endManualSearchSession();
-                void landReadingPositionFromResolve('stagnation');
-
-                if (typeof onStagnationCleanup === 'function') {
-                    try { onStagnationCleanup(); } catch (e) { /* ignore */ }
-                }
-                return;
             }
 
             if (awaitingAnchors && scrollState.stagnantScrollCount > CONFIG.MAX_STAGNANT_SCROLLS) {
@@ -5327,17 +5355,11 @@
         }
         posts.forEach(post => io.observe(post));
         let found = false;
-        let newlyChecked = 0;
-        let alreadyChecked = 0;
         for (const post of posts) {
             const parsed = parseLoadedPost(post);
             if (!parsed?.tweetId) continue;
             const checkKey = `${parsed.tweetId}-${parsed.isRepost}`;
-            if (checkedTweetIds.has(checkKey)) {
-                alreadyChecked++;
-                continue;
-            }
-            newlyChecked++;
+            if (checkedTweetIds.has(checkKey)) continue;
             checkedTweetIds.add(checkKey);
             if (parsed.tweetId === searchBookmark.tweetId &&
                 parsed.authorHandler === searchBookmark.authorHandler &&
@@ -5368,7 +5390,6 @@
         }
         if (found) return;
 
-        const mapDistance = getMapDistanceToTarget(searchBookmark);
         const searchCleanup = () => {
             window.removeEventListener('keydown', handleSpaceKey);
             io.disconnect();
@@ -5381,42 +5402,16 @@
         }
 
         updateSearchDirectionFromMap(searchBookmark);
-        const samePostsAgain = newlyChecked === 0 && alreadyChecked > 0;
-        const reversing = !!(scrollState.lastSearchScrollDirection &&
-            scrollState.searchDirection !== scrollState.lastSearchScrollDirection);
-        // Landkarte kann das Ziel schon im Fenster sehen, während die
-        // Beiträge dort noch Stunden jünger sind als die Lesestelle.
-        const windowTooYoung = viewportStillNewerThanBookmark(searchBookmark);
-        if (windowTooYoung) {
+        // Dieselbe gespeicherte Stelle findet das manuelle Laden. Die Landkarte
+        // darf die automatische Suche nicht beenden, solange der Beitrag noch
+        // nicht im DOM ist und das Fenster noch jüngere Tweet-IDs zeigt.
+        const notReached = bookmarkStillBelowWindow(searchBookmark);
+        if (notReached) {
             noteWindowStillTooYoung();
             scrollState.searchDirection = 'down';
             scrollState.slowScrollLockedDirection = null;
             scrollState.slowScrollFineAttempts = 0;
             scrollState.isSlowScrollMode = false;
-        } else if (mapDistance === 0 || (samePostsAgain && reversing)) {
-            // Dieselben Beiträge sind schon geprüft. Liegt der Ziel-Index in diesem
-            // Abschnitt, oder würde die Richtung drehen, ist die Entscheidung da:
-            // die Lesestelle ist nicht unter diesen Posts. Nicht nochmal rauf und runter.
-            // Index liegt im Fenster, der Beitrag aber nicht im DOM.
-            // Einmal weiterrollen und nachladen, nicht an den Seitenanfang springen.
-            if (mapDistance === 0 && !samePostsAgain && !scrollState.searchIndexHitNudged) {
-                scrollState.searchIndexHitNudged = true;
-                debugLog('Search', 'Ziel-Index im Fenster, Beitrag nicht im DOM — ein Bildschirm weiter');
-            } else {
-                debugLog('Search', mapDistance === 0
-                    ? 'Ziel-Bereich schon sichtbar, Beitrag fehlt — kein Hin- und Her'
-                    : 'Dieselben Beiträge schon geprüft, Richtung würde drehen — kein Hin- und Her');
-                const ended = await finishSearchWhenFineExhausted(searchBookmark, searchCleanup);
-                if (ended) return;
-            }
-        }
-
-        if (!windowTooYoung && isSearchFineZoneDistance(mapDistance)) {
-            scrollState.slowScrollFineAttempts++;
-            if (scrollState.slowScrollFineAttempts > CONFIG.SLOW_SEARCH_FINE_MAX_ATTEMPTS) {
-                const ended = await finishSearchWhenFineExhausted(searchBookmark, searchCleanup);
-                if (ended) return;
-            }
         }
 
         scrollState.lastSearchScrollDirection = scrollState.searchDirection;
