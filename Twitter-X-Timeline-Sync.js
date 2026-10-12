@@ -15,7 +15,7 @@
 // @description:ko Twitter/X에서 마지막 읽기 위치를 추적하고 동기화합니다. 수동 및 자동 옵션 포함. 새로운 게시물을 확인하면서 현재 위치를 잃지 않도록 이상적입니다. 트윗 ID를 사용하여 정확한 위치 지정을 하고, 리포스트를 지원합니다。
 // @icon https://x.com/favicon.ico
 // @namespace https://github.com/Copiis/x-leseposition-medien-download
-// @version 2026.10.11e
+// @version 2026.10.12a
 // @author Copiis
 // @license MIT
 // @match https://x.com/*
@@ -919,6 +919,7 @@
         hiddenBookmark: null,
         hiddenNearTop: false,
         restoreStartedAt: 0,
+        suppressTopMarkUntil: 0,
     };
 
     /** Laufendes Warten auf neue Posts. Hintergrund-Tabs verwerfen dessen Timer. */
@@ -1549,6 +1550,26 @@
         }
     }
 
+    function clearFreshUpScroll() {
+        scrollState.hasScrolledUp = false;
+        scrollState.lastUpScrollAt = 0;
+        scrollState.upScrollPeakY = null;
+        scrollState.scrollUpMaxTweetId = null;
+        scrollState.lastScrollUpPromoteAt = 0;
+        if (scrollState.lastMapScrollDirection === 'up') {
+            scrollState.lastMapScrollDirection = 'neutral';
+        }
+        clearUpSettlePromote();
+    }
+
+    // Am Anfang der Timeline, solange neue Beiträge geladen werden oder die
+    // Pille da ist: den neuesten Post nicht zur Lesestelle machen.
+    function newPostsBlockTopMark() {
+        if (Date.now() < (newPostsState.suppressTopMarkUntil || 0)) return true;
+        if (searchControl.newPostsRestoreActive || searchControl.isSearching) return true;
+        return !!getNewPostsIndicator();
+    }
+
     function repostStillAtUpPeak() {
         if (!scrollState.lastUpScrollAt) return false;
         if (scrollState.lastMapScrollDirection === 'down') return false;
@@ -1594,13 +1615,16 @@
             }
 
             const deltaY = window.scrollY - lastScrollY;
-            if (Math.abs(deltaY) > 8) {
+            const blockNewestMark = isNearTimelineTop() && newPostsBlockTopMark();
+            if (Math.abs(deltaY) > 8 && !blockNewestMark) {
                 noteManualScrollMovedReading();
             }
             let mapScrollDir = 'neutral';
             const upStillFresh = scrollState.lastUpScrollAt > 0 &&
                 (Date.now() - scrollState.lastUpScrollAt) < CONFIG.SCROLL_UP_SETTLE_MS;
-            if (deltaY < -CONFIG.MAP_SCROLL_DIRECTION_THRESHOLD) {
+            if (blockNewestMark) {
+                // Sprung nach oben durch neue Beiträge: kein Hochscrollen.
+            } else if (deltaY < -CONFIG.MAP_SCROLL_DIRECTION_THRESHOLD) {
                 scrollState.hasScrolledUp = true;
                 mapScrollDir = 'up';
                 scrollState.lastMapScrollDirection = 'up';
@@ -1646,7 +1670,7 @@
                     dropped < CONFIG.SCROLL_UP_SETTLE_PX;
                 if (mapScrollDir === 'down') {
                     refreshMapForLesestelle('scroll-down');
-                } else if (settlingAfterUp) {
+                } else if (settlingAfterUp && !blockNewestMark) {
                     void tryPromoteNewerVisiblePostOnScrollUp('up');
                 }
                 syncHighlightIfDrifted();
@@ -1658,11 +1682,11 @@
                 return;
             }
 
-            // Am Timeline-Top nur ein frisches Hochscrollen die Lesestelle
-            // nach vorn setzen. Ein altes hasScrolledUp bleibt oft stehen;
-            // nach „Neue Beiträge“ wäre sonst der neueste Post die Lesestelle.
-            const freshUp = mapScrollDir === 'up' || repostStillAtUpPeak();
-            const markPromise = (isNearTimelineTop() && !freshUp)
+            // Am Timeline-Anfang mit neuen Beiträgen bleibt die gespeicherte
+            // Lesestelle. Der Sprung nach oben ist kein Hochscrollen und
+            // markiert nicht den neuesten Beitrag.
+            const freshUp = !blockNewestMark && (mapScrollDir === 'up' || repostStillAtUpPeak());
+            const markPromise = (blockNewestMark || (isNearTimelineTop() && !freshUp))
                 ? Promise.resolve(false)
                 : markTopVisiblePost(true, false, mapScrollDir);
             if (!isNearTimelineTop()) {
@@ -2637,6 +2661,7 @@
     async function tryPromoteNewerVisiblePostOnScrollUp(mapDirection) {
         if (isLesestelleMutationBlocked()) return false;
         if (newPostsState.restoreGraceUntil > Date.now()) return false;
+        if (isNearTimelineTop() && newPostsBlockTopMark()) return false;
         if (!isScrollUpActive(mapDirection)) return false;
         if (!lastReadPost?.tweetId) return false;
 
@@ -2655,7 +2680,8 @@
             context: captureReadingContext(newer.element)
         };
 
-        if (isLesestelleMutationBlocked() || newPostsState.restoreGraceUntil > Date.now()) {
+        if (isLesestelleMutationBlocked() || newPostsState.restoreGraceUntil > Date.now() ||
+            (isNearTimelineTop() && newPostsBlockTopMark())) {
             debugLog('Save', 'Hochscroll-Promotion abgebrochen — New-Posts/Restore aktiv');
             return false;
         }
@@ -6425,9 +6451,10 @@
         searchControl.newPostsRestoreActive = false;
         newPostsState.restoreGraceUntil = 0;
         newPostsState.lastRestoreCompletedAt = Date.now();
+        newPostsState.suppressTopMarkUntil = Date.now() + CONFIG.NEW_POSTS_GRACE_MS;
         lastScrollY = window.scrollY;
         scrollState.lastMapScrollY = window.scrollY;
-        scrollState.hasScrolledUp = false;
+        clearFreshUpScroll();
     }
 
     async function finishNewPostsRestore(restoreBookmark, postsBeforeNewPosts) {
@@ -6550,13 +6577,10 @@
         return;
     }
 
-    // Nur ein gerade laufendes Hochscrollen darf die Lesestelle vor dem
-    // Laden nach vorn setzen. Ein hängengebliebenes Hochscroll-Flag am
-    // Timeline-Anfang würde sonst den neuesten Beitrag speichern, und die
-    // Suche liefe auf diese neue Stelle statt auf die gespeicherte.
-    if (isNearTimelineTop() && repostStillAtUpPeak()) {
-        await tryPromoteNewerVisiblePostOnScrollUp('up');
-    }
+    // Die gespeicherte Lesestelle bleibt das Suchziel. Hochscrollen an den
+    // Anfang darf den neuesten Beitrag nicht vorher als Lesestelle speichern.
+    clearFreshUpScroll();
+    newPostsState.suppressTopMarkUntil = Date.now() + CONFIG.NEW_POSTS_GRACE_MS;
 
     const restoreBookmark = snapshotReadingBookmark();
     if (!restoreBookmark) {
