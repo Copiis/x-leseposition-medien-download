@@ -15,7 +15,7 @@
 // @description:ko Twitter/X에서 마지막 읽기 위치를 추적하고 동기화합니다. 수동 및 자동 옵션 포함. 새로운 게시물을 확인하면서 현재 위치를 잃지 않도록 이상적입니다. 트윗 ID를 사용하여 정확한 위치 지정을 하고, 리포스트를 지원합니다。
 // @icon https://x.com/favicon.ico
 // @namespace https://github.com/Copiis/x-leseposition-medien-download
-// @version 2026.10.12a
+// @version 2026.10.12b
 // @author Copiis
 // @license MIT
 // @match https://x.com/*
@@ -91,6 +91,8 @@
         SEARCH_STEP_MIN_MS: 280,             // Nicht im nächsten Frame schon wieder springen.
         SEARCH_BOUNCE_PX: 72,                // Kleiner als ein Suchschritt, größer als eine Scrollbalkenbreite.
         SEARCH_BOUNCE_MAX: 3,                // So oft darf ein Sprung verpuffen, dann ist es eine Schleife.
+        SEARCH_RELOAD_WAIT_MS: 2000,         // Noch keine neuen Beiträge: so lange auf das Nachladen warten.
+        SEARCH_UNLOADED_JUMPS_MAX: 8,        // Danach aufhören, wenn auch das Warten nichts nachlädt.
         SLOW_SEARCH_FINE_MAX_ATTEMPTS: 15,   // Danach Resolve an der aktuellen Stelle, nicht an den Seitenanfang.
         SEARCH_FINE_ZONE_HYSTERESIS: 2,      // Abstand 0–2: keine großen Sprünge mehr (Ping-Pong-Schutz)
         SEARCH_TOP_RETRY_MAX_IDX: 25,        // Nahe am Map-Anfang früher in den Feinbereich.
@@ -890,6 +892,8 @@
         settleOscillated: false,
         scrollLoopStopped: false,
         recentStepDeltas: [],
+        unloadedJumpCount: 0,
+        unloadedWaitLogged: false,
     };
 
     // === Search Control Flags ===
@@ -949,6 +953,8 @@
         scrollState.settleOscillated = false;
         scrollState.scrollLoopStopped = false;
         scrollState.recentStepDeltas = [];
+        scrollState.unloadedJumpCount = 0;
+        scrollState.unloadedWaitLogged = false;
         holdScrollAnchor();
     }
 
@@ -4503,6 +4509,8 @@
         scrollState.settleOscillated = false;
         scrollState.scrollLoopStopped = false;
         scrollState.recentStepDeltas = [];
+        scrollState.unloadedJumpCount = 0;
+        scrollState.unloadedWaitLogged = false;
         holdScrollAnchor();
         try {
             for (let step = 0; step <= maxSteps; step++) {
@@ -4568,7 +4576,7 @@
                 const beforeY = window.scrollY || 0;
                 window.scrollBy({ top: jump, behavior: 'auto' });
                 await waitForFeedSettle(beforeSig, 700);
-                if (scrollState.settleOscillated || rememberSearchStep(jump, beforeY)) {
+                if (await searchShouldStopAfterJump(jump, beforeY, beforeSig, bookmark)) {
                     noteScrollLoopStopped();
                     break;
                 }
@@ -5149,6 +5157,77 @@
         return false;
     }
 
+    /** Wartet, bis andere Tweet-IDs im Fenster stehen. true = nachgeladen. */
+    function waitForReloadedPosts(beforeSig, maxMs) {
+        const deadline = performance.now() + maxMs;
+        return new Promise(resolve => {
+            const tick = () => {
+                if (visibleTweetSignature() !== beforeSig) {
+                    resolve(true);
+                    return;
+                }
+                if (performance.now() >= deadline) {
+                    resolve(false);
+                    return;
+                }
+                setTimeout(tick, 120);
+            };
+            tick();
+        });
+    }
+
+    /**
+     * true = echte Auf-und-ab-Schleife, Suche anhalten.
+     * Ein Sprung ohne neue Beiträge ist noch keine Schleife: die Lesestelle
+     * liegt noch tiefer, der Feed hat nur noch nicht nachgeladen.
+     */
+    async function searchShouldStopAfterJump(step, beforeY, beforeSig, bookmark) {
+        const oscillated = scrollState.settleOscillated;
+        const bounced = rememberSearchStep(step, beforeY);
+        if (!oscillated && !bounced) {
+            if (visibleTweetSignature() !== beforeSig) scrollState.unloadedJumpCount = 0;
+            return false;
+        }
+        const postsLoaded = visibleTweetSignature() !== beforeSig;
+        // Leeres Fenster heißt: der Sprung hat die Beiträge noch nicht nachgeladen.
+        let sawOriginal = false;
+        for (const vis of getVisiblePosts()) {
+            if (vis?.tweetId && !vis.isRepost) {
+                sawOriginal = true;
+                break;
+            }
+        }
+        const stillBelow = bookmarkStillBelowWindow(bookmark) || !sawOriginal;
+        if (postsLoaded) {
+            scrollState.unloadedJumpCount = 0;
+            scrollState.settleOscillated = false;
+            scrollState.searchBounceCount = 0;
+            scrollState.recentStepDeltas = [];
+            return false;
+        }
+        // Stelle schon erreicht und trotzdem Pendeln: das ist die Schleife.
+        if (!stillBelow) return true;
+
+        scrollState.settleOscillated = false;
+        scrollState.searchBounceCount = 0;
+        scrollState.recentStepDeltas = [];
+        if (!scrollState.unloadedWaitLogged) {
+            scrollState.unloadedWaitLogged = true;
+            log('Search', 'Beiträge noch nicht nachgeladen — Suche wartet und läuft weiter.');
+        } else {
+            debugLog('Search', 'Weiter warten auf nachgeladene Beiträge');
+        }
+        const loaded = await waitForReloadedPosts(beforeSig, CONFIG.SEARCH_RELOAD_WAIT_MS);
+        if (loaded) {
+            scrollState.unloadedJumpCount = 0;
+            scrollState.settleOscillated = false;
+            scrollState.searchBounceCount = 0;
+            return false;
+        }
+        scrollState.unloadedJumpCount = (scrollState.unloadedJumpCount || 0) + 1;
+        return scrollState.unloadedJumpCount >= CONFIG.SEARCH_UNLOADED_JUMPS_MAX;
+    }
+
     /**
      * Ein Bildschirm weiter, dann prüfen, sobald der Feed nachzieht.
      * Die eingefrorene Such-Landkarte wird hier nicht neu eingelesen.
@@ -5167,7 +5246,7 @@
         window.scrollBy({ top: step, behavior: 'auto' });
 
         await waitForFeedSettle(beforeSig, 700);
-        if (scrollState.settleOscillated || rememberSearchStep(step, beforeY)) {
+        if (await searchShouldStopAfterJump(step, beforeY, beforeSig, lastReadPost)) {
             stopSearchScrollLoop(onStagnationCleanup);
             return;
         }
