@@ -15,7 +15,7 @@
 // @description:ko Twitter/X에서 마지막 읽기 위치를 추적하고 동기화합니다. 수동 및 자동 옵션 포함. 새로운 게시물을 확인하면서 현재 위치를 잃지 않도록 이상적입니다. 트윗 ID를 사용하여 정확한 위치 지정을 하고, 리포스트를 지원합니다。
 // @icon https://x.com/favicon.ico
 // @namespace https://github.com/Copiis/x-leseposition-medien-download
-// @version 2026.10.12b
+// @version 2026.10.12c
 // @author Copiis
 // @license MIT
 // @match https://x.com/*
@@ -1834,7 +1834,7 @@
         return;
     }
 
-    log('Init', 'Initialisiere Skript auf /home... (Version 2026.10.11e)');
+    log('Init', 'Initialisiere Skript auf /home... (Version 2026.10.12c)');
 
     const observer = new MutationObserver((mutations, obs) => {
         if (document.body) {
@@ -4717,25 +4717,17 @@
 
         const fresh = resolveFreshPostElement(post.element, post.tweetId, post.authorHandler) || post.element;
 
-        let skipScroll = scroll && isPostAtReadingOffset(fresh);
-        if (skipScroll && verifySource === 'new-posts-restore' && expectedBookmark) {
-            // Nach New-Posts: nur ohne Scroll beenden, wenn der eingefrorene Bookmark wirklich am 175px-Ziel liegt
-            skipScroll = topPostMatchesBookmark(fresh, expectedBookmark) && isPostAtReadingOffset(fresh);
-            if (!skipScroll) {
-                debugLog('Position', 'New-Posts-Restore: Scroll erzwungen (Bookmark nicht am Ziel-Offset)');
-            }
-        }
-
-        if (skipScroll) {
-            debugLog('Position', 'Restore-Scroll übersprungen — bereits am Ziel-Offset');
-            diagPush('POSITION_SKIP', 'info', 'Restore ohne Scroll (bereits am Offset)', {
+        const scrollOpts = verifySource === 'new-posts-restore'
+            ? { ignoreAnchorStale: true }
+            : {};
+        if (scroll && isPostAtReadingOffset(fresh)) {
+            debugLog('Position', 'Restore liegt auf der Lesezeile — nach dem Nachladen noch einmal prüfen');
+            diagPush('POSITION_SKIP', 'info', 'Restore schon am Offset, Ausrichten prüft nach', {
                 deviation: Math.round(getPostOffsetDeviation(fresh)),
             });
-            applyHighlightToPost(fresh, { confidence, strategy });
-        } else if (scroll) {
-            const scrollOpts = verifySource === 'new-posts-restore'
-                ? { ignoreAnchorStale: true }
-                : {};
+        }
+
+        if (scroll) {
             await new Promise(resolve => scrollToPostWithHighlight(post.element, resolve, scrollOpts));
             if (verifySource !== 'new-posts-restore' && expectedBookmark && isLiveReadingAheadOf(expectedBookmark)) {
                 syncHighlightIfDrifted();
@@ -5926,132 +5918,145 @@
         if (onComplete) onComplete();
         return;
     }
-    const activePostInitial = resolveFreshPostElement(post, anchorTweetId, anchorAuthor) || post;
+    // Ein gerade nachgeladener Post schiebt die Lesestelle nach unten.
+    // Solange sie im Fenster steht, gehört ihre Oberkante auf die Lesezeile,
+    // nicht nur der Rahmen. overflow-anchor würde den Sprung sonst zurücknehmen.
+    const offset = CONFIG.RESTORE_SCROLL_OFFSET;
+    const tolerance = CONFIG.POSITION_CORRECTION_TOLERANCE;
+    const generation = manualScrollGeneration;
+    let ownedAnchor = false;
+    let attempts = 0;
+    let unmoved = 0;
+    let settleOpen = true;
 
-    if (isPostAtReadingOffset(activePostInitial)) {
-        finishPostHighlightAtOffset(
-            activePostInitial,
-            anchorTweetId,
-            anchorAuthor,
-            onComplete,
-            `Bereits am Ziel (rect.top≈${CONFIG.RESTORE_SCROLL_OFFSET}px, Δ=${Math.round(getPostOffsetDeviation(activePostInitial))}px) — kein Scroll`,
-            options
-        );
-        return;
-    }
-
-    searchControl.isAutoScrolling = true;
-    const maxPositionAttempts = CONFIG.MAX_POSITION_ATTEMPTS;
-    let positionAttempts = 0;
-    let lastMeasuredTop = null;
-    const tryPositionPost = () => {
-        const activePost = resolveFreshPostElement(post, anchorTweetId, anchorAuthor) || post;
-
-        if (isPostAtReadingOffset(activePost)) {
-            doPrecisePositioning();
-            return;
-        }
-
-        // Grob-Scroll nur wenn der Post weit vom Ziel-Offset entfernt ist (nicht bei Top-Post ≈175px).
-        if (positionAttempts === 0) {
-            const roughRect = activePost.getBoundingClientRect();
-            const deviation = Math.abs(roughRect.top - CONFIG.RESTORE_SCROLL_OFFSET);
-            const roughScrollThreshold = Math.max(220, window.innerHeight * 0.22);
-
-            if (deviation < roughScrollThreshold) {
-                doPrecisePositioning();
-                return;
-            }
-
-            const currentScroll = window.scrollY;
-            const roughTarget = currentScroll + roughRect.top - (window.innerHeight * 0.55);
-            if (!scrollFeedTo(roughTarget, 'grob')) {
-                finishPositioning('Grober Sprung an den Seitenanfang verworfen.');
-                return;
-            }
-            requestAnimationFrame(() => requestAnimationFrame(doPrecisePositioning));
-            return;
-        }
-
-        doPrecisePositioning();
+    const anchorHeld = () => document.documentElement?.dataset.xtsAnchorHeld === '1';
+    const holdAlign = () => {
+        if (anchorHeld()) return;
+        holdScrollAnchor();
+        ownedAnchor = true;
+    };
+    const releaseAlign = () => {
+        if (!ownedAnchor) return;
+        ownedAnchor = false;
+        releaseScrollAnchor();
+    };
+    const fresh = () => resolveFreshPostElement(post, anchorTweetId, anchorAuthor) || post;
+    const stillOurs = () => {
+        if (generation !== manualScrollGeneration) return false;
+        if (liveReadingIsAheadOfPost(post)) return false;
+        if (!ignoreAnchorStale && isScrollAnchorStale(anchorTweetId, anchorAuthor)) return false;
+        return true;
+    };
+    const endSettle = () => {
+        if (!settleOpen) return;
+        settleOpen = false;
+        releaseAlign();
     };
 
-    const finishPositioning = (reason) => {
-        finishPostHighlightAtOffset(post, anchorTweetId, anchorAuthor, onComplete, reason, options);
+    const scheduleSettle = () => {
+        const delays = [400, 1100];
+        let pending = delays.length;
+        delays.forEach((delay) => {
+            setTimeout(() => {
+                pending--;
+                const last = pending === 0;
+                if (!settleOpen) return;
+                if (!stillOurs() ||
+                    searchControl.isSearching ||
+                    searchControl.manualSearchActive ||
+                    searchControl.newPostsRestoreActive) {
+                    endSettle();
+                    return;
+                }
+                const active = fresh();
+                const rect = active?.getBoundingClientRect?.();
+                const vh = window.innerHeight || 800;
+                const visible = !!rect && rect.height >= 5 && rect.bottom > 40 && rect.top < vh;
+                const delta = rect ? rect.top - offset : 0;
+                if (!visible) {
+                    endSettle();
+                    return;
+                }
+                if (Math.abs(delta) <= tolerance) {
+                    if (last) endSettle();
+                    return;
+                }
+                debugLog('Position', `Lesestelle nach dem Nachladen noch nicht an der Linie (Δ=${Math.round(delta)}px) — richte aus`);
+                searchControl.isAutoScrolling = true;
+                holdAlign();
+                const beforeY = window.scrollY || 0;
+                const accepted = scrollFeedTo(beforeY + delta, 'nachziehen');
+                if (accepted && Math.abs((window.scrollY || 0) - beforeY) <= 2) {
+                    window.scrollBy({ top: delta, behavior: 'auto' });
+                }
+                requestAnimationFrame(() => {
+                    applyHighlightToPost(fresh());
+                    searchControl.isAutoScrolling = false;
+                    noteProgrammaticScrollEnded();
+                    if (last) endSettle();
+                });
+            }, delay);
+        });
     };
 
-    const doPrecisePositioning = () => {
-        const activePost = resolveFreshPostElement(post, anchorTweetId, anchorAuthor) || post;
-        const rect = activePost.getBoundingClientRect();
-        const scrollY = window.scrollY;
-        const offset = CONFIG.RESTORE_SCROLL_OFFSET;
-        const targetY = scrollY + rect.top - offset;
-        const deviation = Math.abs(rect.top - offset);
+    const finishAligned = (reason, active) => {
+        finishPostHighlightAtOffset(active || fresh(), anchorTweetId, anchorAuthor, () => {
+            if (onComplete) onComplete();
+            if (settleOpen && !anchorHeld()) holdAlign();
+            scheduleSettle();
+        }, reason, options);
+    };
 
-        debugLog('Position', `rect.top:${rect.top} scrollY:${scrollY} targetY:${targetY} Δ:${Math.round(deviation)} Versuch:${positionAttempts+1}`);
-
-        if (liveReadingIsAheadOfPost(activePost) || liveReadingIsAheadOfPost(post)) {
-            debugLog('Position', 'Positionierung abgebrochen — Lesestelle ist neuer als das Scroll-Ziel');
+    const step = () => {
+        if (!stillOurs()) {
             searchControl.isAutoScrolling = false;
             noteProgrammaticScrollEnded();
+            endSettle();
             syncHighlightIfDrifted();
             if (onComplete) onComplete();
             return;
         }
-        if (!ignoreAnchorStale && isScrollAnchorStale(anchorTweetId, anchorAuthor)) {
-            finishPostHighlightAtOffset(
-                activePost,
-                anchorTweetId,
-                anchorAuthor,
-                onComplete,
-                'Positionierung abgebrochen — Lesestelle hat sich geändert',
-                options
-            );
+        const active = fresh();
+        const rect = active.getBoundingClientRect();
+        const delta = rect.top - offset;
+        applyHighlightToPost(active);
+
+        if (rect.height < 5) {
+            finishAligned('Artikel ohne Höhe — kein Sprung an den Seitenanfang.', active);
+            return;
+        }
+        if (Math.abs(delta) <= tolerance) {
+            finishAligned(`Beitrag an der Leselinie (rect.top=${Math.round(rect.top)}, Ziel=${offset}px).`, active);
+            return;
+        }
+        if (attempts >= 4 || unmoved >= 2) {
+            finishAligned(`Ausrichten beendet (rect.top=${Math.round(rect.top)}, Ziel=${offset}px).`, active);
             return;
         }
 
-        applyHighlightToPost(activePost);
-
-        if (deviation <= CONFIG.POSITION_CORRECTION_TOLERANCE) {
-            finishPositioning(`Beitrag bereits nah am Ziel (rect.top=${rect.top}, Ziel=${offset}px).`);
+        attempts++;
+        holdAlign();
+        const beforeY = window.scrollY || 0;
+        const vh = window.innerHeight || 800;
+        const inView = rect.bottom > 0 && rect.top < vh;
+        debugLog('Position', `Ausrichten rect.top:${Math.round(rect.top)} Δ:${Math.round(delta)} Versuch:${attempts}`);
+        const accepted = scrollFeedTo(beforeY + delta, 'fein');
+        if (!accepted) {
+            finishAligned('Feiner Sprung an den Seitenanfang verworfen.', active);
             return;
         }
-
-        if (!scrollFeedTo(targetY, 'fein')) {
-            finishPositioning('Feiner Sprung an den Seitenanfang verworfen.');
-            return;
+        let moved = Math.abs((window.scrollY || 0) - beforeY) > 2;
+        if (!moved && inView) {
+            window.scrollBy({ top: delta, behavior: 'auto' });
+            moved = Math.abs((window.scrollY || 0) - beforeY) > 2;
         }
-
-        requestAnimationFrame(() => requestAnimationFrame(() => {
-            const freshPost = resolveFreshPostElement(post, anchorTweetId, anchorAuthor) || post;
-            const newRect = freshPost.getBoundingClientRect();
-            const postDeviation = Math.abs(newRect.top - offset);
-            const isWellPositioned = postDeviation <= CONFIG.POSITION_CORRECTION_TOLERANCE;
-            const isStuckAtTop = lastMeasuredTop !== null
-                && Math.abs(newRect.top - lastMeasuredTop) < 2
-                && postDeviation <= CONFIG.POSITION_CORRECTION_TOLERANCE + 5;
-
-            if (isWellPositioned || isStuckAtTop) {
-                finishPositioning(`Beitrag positioniert (rect.top=${newRect.top}, Ziel=${offset}px).`);
-            } else if (positionAttempts < 1) {
-                positionAttempts++;
-                lastMeasuredTop = newRect.top;
-                const vh = window.innerHeight || 800;
-                const correction = Math.max(-vh, Math.min(vh, (newRect.top - offset) * 0.8));
-                window.scrollBy({ top: -correction, behavior: 'auto' });
-                debugLog('Position', `Eine Korrektur um ${Math.round(-correction)}px, dann fertig`);
-                requestAnimationFrame(() => requestAnimationFrame(() => {
-                    const corrected = resolveFreshPostElement(post, anchorTweetId, anchorAuthor) || post;
-                    finishPositioning(`Beitrag nach einer Korrektur (rect.top=${corrected.getBoundingClientRect().top}).`);
-                }));
-            } else {
-                log('Position', 'Maximale Positionierungsversuche erreicht. rect.top:', newRect.top);
-                finishPositioning('Positionierung mit Toleranz abgeschlossen.');
-            }
-        }));
+        if (!moved) unmoved++;
+        else unmoved = 0;
+        requestAnimationFrame(() => requestAnimationFrame(step));
     };
 
-    tryPositionPost();
+    searchControl.isAutoScrolling = true;
+    step();
 }
 
     function createSearchPopup(position) {
