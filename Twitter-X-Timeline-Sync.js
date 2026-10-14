@@ -15,7 +15,7 @@
 // @description:ko Twitter/X에서 마지막 읽기 위치를 추적하고 동기화합니다. 수동 및 자동 옵션 포함. 새로운 게시물을 확인하면서 현재 위치를 잃지 않도록 이상적입니다. 트윗 ID를 사용하여 정확한 위치 지정을 하고, 리포스트를 지원합니다。
 // @icon https://x.com/favicon.ico
 // @namespace https://github.com/Copiis/x-leseposition-medien-download
-// @version 2026.10.13a
+// @version 2026.10.14a
 // @author Copiis
 // @license MIT
 // @match https://x.com/*
@@ -61,6 +61,8 @@
         TIME_DIFF_ACCEPTABLE_MS: 60 * 60 * 1000,
         DEBOUNCE_SCROLL_MS: 150,
         NEW_POSTS_CHECK_INTERVAL_MS: 3000,
+        FOCUS_PILL_WATCH_MS: 20000,          // Nach Fokus/Sichtbarkeit so lange auf die spät kommende Pille warten.
+        NEW_POSTS_PILL_RETRY_MS: 2500,       // Dieselbe Pille kurz nicht erneut klicken; bleibt sie, kommt ein neuer Versuch.
 
         // === Schwellen für Auto-Laden neuer Beiträge ===
         NEAR_TOP_SCROLL_THRESHOLD: 100,      // Lesestelle/Pausen: noch „nah am Anfang“, nicht tief im Feed.
@@ -1739,6 +1741,39 @@
     let lastScrollY = window.scrollY;
     let upSettleTimer = null;
     let syntheticNewPostsClick = false;
+    let newPostsPillClickedAt = 0;
+    let newPostsPillClickCount = 0;
+    let newPostsPillClickText = '';
+    let focusPillWatchUntil = 0;
+    let pillPresentAtWatchStart = false;
+    let newPostsObserverClickTimer = null;
+
+    function focusWatchAllowsOffTopClick() {
+        // Nach dem Zurückkommen zeigt X die Pille oft erst ein paar Sekunden später.
+        // War sie beim Wechsel noch nicht da, wird sie geladen — auch unterhalb vom
+        // Seitenanfang. Danach sucht der bestehende Pfad die Lesestelle.
+        return Date.now() < focusPillWatchUntil && !pillPresentAtWatchStart;
+    }
+
+    function armFocusPillWatch() {
+        if (!window.location.pathname.startsWith('/home')) return;
+        if (!isScriptActivated && lastReadPost?.tweetId) {
+            isScriptActivated = true;
+        }
+        if (!isScriptActivated) return;
+        if (searchControl.isSearching || searchControl.isFallbackSearching ||
+            searchControl.isAutoScrolling || searchControl.manualSearchActive ||
+            searchControl.newPostsRestoreActive) {
+            return;
+        }
+        const now = Date.now();
+        if (now >= focusPillWatchUntil) {
+            pillPresentAtWatchStart = !!getNewPostsIndicator();
+        }
+        focusPillWatchUntil = now + CONFIG.FOCUS_PILL_WATCH_MS;
+        observeForNewPosts();
+        burstCheckNewPosts();
+    }
 
     function clearUpSettlePromote() {
         if (upSettleTimer) {
@@ -1969,44 +2004,29 @@
         bindHomePageListeners();
 
         window.addEventListener('focus', () => {
-            if (document.visibilityState === 'visible') notePageVisible('focus');
-            if (!isScriptActivated || searchControl.isSearching || searchControl.isFallbackSearching || searchControl.isAutoScrolling) {
-                return;
-            }
-
-            // Stelle sicher, dass der New-Posts-Observer aktiv ist, wenn wir oben in der Timeline sind
-            if (isNearTimelineTop()) {
-                if (!window.newPostsObserver) {
-                    observeForNewPosts();
-                }
-                burstCheckNewPosts();
-            }
+            if (document.visibilityState !== 'visible') return;
+            notePageVisible('focus');
+            armFocusPillWatch();
         });
 
-        // Zusätzlicher visibilitychange Listener für zuverlässiges Erkennen nach Background-Tab
+        // visibilitychange: X zeichnet die Pille oft erst Sekunden nach dem Zurückkommen.
         document.addEventListener('visibilitychange', () => {
             if (document.visibilityState === 'hidden') {
                 notePageHidden();
                 return;
             }
             notePageVisible('visibility');
-            if (document.visibilityState === 'visible' &&
-                isScriptActivated &&
-                !searchControl.isSearching &&
-                !searchControl.isFallbackSearching &&
-                !searchControl.isAutoScrolling &&
-                isNearTimelineTop()) {
-
-                if (!window.newPostsObserver) {
-                    observeForNewPosts();
-                }
-                burstCheckNewPosts();
-            }
+            armFocusPillWatch();
         });
 
-        document.addEventListener('resume', () => notePageVisible('resume'));
+        document.addEventListener('resume', () => {
+            notePageVisible('resume');
+            armFocusPillWatch();
+        });
         window.addEventListener('pageshow', () => {
-            if (document.visibilityState === 'visible') notePageVisible('pageshow');
+            if (document.visibilityState !== 'visible') return;
+            notePageVisible('pageshow');
+            armFocusPillWatch();
         });
 
         const debouncedDownload = debounce(() => {
@@ -2046,16 +2066,26 @@
 
     function burstCheckNewPosts() {
         if (newPostsBurstTimer) return;
-        if (!isNearTimelineTop() || isNewPostsAutoLoadPaused()) return;
+        const watching = () => Date.now() < focusPillWatchUntil;
+        if (!watching() && !isNearTimelineTop()) return;
         let attempt = 0;
         const step = () => {
             newPostsBurstTimer = null;
-            if (!isScriptActivated || searchControl.isSearching || searchControl.isFallbackSearching || searchControl.isAutoScrolling) return;
-            if (!isNearTimelineTop() || isNewPostsAutoLoadPaused()) return;
+            if (!isScriptActivated) return;
+            const stillWatching = watching();
+            if (searchControl.isSearching || searchControl.isFallbackSearching ||
+                searchControl.isAutoScrolling || searchControl.newPostsRestoreActive) {
+                if (!stillWatching) return;
+                newPostsBurstTimer = setTimeout(step, 700);
+                return;
+            }
+            // Pause heißt nur: noch keine Pille und die Lesestelle steht schon.
+            // Nach dem Fokus kommt die Pille oft erst ein paar Sekunden später.
+            if (!stillWatching && (!isNearTimelineTop() || isNewPostsAutoLoadPaused())) return;
             tryAutoClickNewPosts();
             attempt++;
-            if (attempt > 8) return;
-            newPostsBurstTimer = setTimeout(step, 280 + attempt * 110);
+            if (attempt > (stillWatching ? 28 : 8)) return;
+            newPostsBurstTimer = setTimeout(step, stillWatching ? 700 : (280 + attempt * 110));
         };
         step();
     }
@@ -2063,7 +2093,7 @@
     function bootHomePage() {
         if (homeBootStarted || !window.location.pathname.startsWith('/home')) return;
         homeBootStarted = true;
-        log('Init', 'Initialisiere Skript auf /home... (Version 2026.10.13a)');
+        log('Init', 'Initialisiere Skript auf /home... (Version 2026.10.14a)');
 
         const run = () => {
             if (!window.location.pathname.startsWith('/home')) return;
@@ -6075,21 +6105,30 @@
             searchControl.isSearching ||
             searchControl.isFallbackSearching ||
             searchControl.isAutoScrolling ||
-            searchControl.newPostsRestoreActive ||
-            !isAtTimelineTop()) {
+            searchControl.newPostsRestoreActive) {
             return;
         }
-        if (Date.now() - newPostsState.lastRestoreCompletedAt < 6000) {
-            return;
-        }
-        if (isNewPostsAutoLoadPaused()) {
-            return;
-        }
+        // Im Leerlauf nur ganz oben. Nach dem Zurückkommen darf eine Pille,
+        // die erst danach erscheint, auch weiter unten geladen werden.
+        const catchLatePill = focusWatchAllowsOffTopClick();
+        if (!isAtTimelineTop() && !catchLatePill) return;
+        if (!catchLatePill && Date.now() - newPostsState.lastRestoreCompletedAt < 6000) return;
+        if (isNewPostsAutoLoadPaused()) return;
+        if (Date.now() - newPostsPillClickedAt < CONFIG.NEW_POSTS_PILL_RETRY_MS) return;
         const indicator = getNewPostsIndicator();
-        if (indicator && indicator.dataset.processed !== 'true') {
-            newPostsState.wakeClickArmedAt = Date.now();
-            clickNewPostsIndicator();
+        if (!indicator) {
+            // Weg ist die Pille: der nächste Stapel darf wieder geladen werden.
+            if (Date.now() - newPostsPillClickedAt >= CONFIG.NEW_POSTS_PILL_RETRY_MS) {
+                newPostsPillClickCount = 0;
+                newPostsPillClickText = '';
+            }
+            return;
         }
+        const label = (indicator.textContent || '').replace(/\s+/g, ' ').trim();
+        // Ein Klick, der die Pille nicht schließt, nicht endlos wiederholen.
+        if (newPostsPillClickCount >= 3 && label === newPostsPillClickText) return;
+        newPostsState.wakeClickArmedAt = Date.now();
+        clickNewPostsIndicator();
     }
 
     function finishPostHighlightAtOffset(element, anchorTweetId, anchorAuthor, onComplete, reason, options = {}) {
@@ -6435,34 +6474,22 @@
         lastCheck = now;
 
         const indicator = getNewPostsIndicator();
-        if (indicator) {
-            if (isNearTimelineTop() && !isAtTimelineTop()) {
-                debugLog('NewPosts', 'Indicator gesehen bei scrollY=' + Math.round(timelineScrollOffset()) + ' – noch nicht ganz oben, kein Auto-Laden.');
-                return;
-            }
-            if (isAtTimelineTop()) {
-                if (isNewPostsAutoLoadPaused()) {
-                    debugLog('NewPosts', 'Indicator gesehen — Auto-Click pausiert (bereits am Offset, warte auf neuere Posts).');
+        if (indicator && (isAtTimelineTop() || focusWatchAllowsOffTopClick()) &&
+            !isNewPostsAutoLoadPaused() && !newPostsObserverClickTimer) {
+            debugLog('NewPosts', 'Indicator erkannt – Auto-Click in 600ms (nach Lesestellen-Prüfung)');
+            newPostsObserverClickTimer = setTimeout(() => {
+                newPostsObserverClickTimer = null;
+                if (searchControl.manualSearchActive) {
+                    debugLog('NewPosts', 'Auto-Click übersprungen — manuelle Suche aktiv.');
                     return;
                 }
-                debugLog('NewPosts', 'Indicator erkannt – Auto-Click in 600ms (nach Lesestellen-Prüfung)');
-                setTimeout(() => {
-                    if (searchControl.manualSearchActive) {
-                        debugLog('NewPosts', 'Auto-Click übersprungen — manuelle Suche aktiv.');
-                        return;
-                    }
-                    if (searchControl.newPostsRestoreActive) {
-                        debugLog('NewPosts', 'Auto-Click übersprungen — Restore läuft.');
-                        diagBlocked('GUARD_OBSERVER_DEBOUNCE', 'Observer-Auto-Click während Restore blockiert');
-                        return;
-                    }
-                    tryAutoClickNewPosts();
-                }, 600);
-                window.newPostsObserver.disconnect();
-            } else {
-                debugLog('NewPosts', 'Indicator gesehen bei scrollY=' + Math.round(window.scrollY) + ' – ignoriert (nicht nah am Top, kein Auto-Laden).');
-                window.newPostsObserver.disconnect();
-            }
+                if (searchControl.newPostsRestoreActive) {
+                    debugLog('NewPosts', 'Auto-Click übersprungen — Restore läuft.');
+                    diagBlocked('GUARD_OBSERVER_DEBOUNCE', 'Observer-Auto-Click während Restore blockiert');
+                    return;
+                }
+                tryAutoClickNewPosts();
+            }, 600);
         }
 
         // Gap / "versteckte Beiträge anzeigen" Buttons behandeln (auch während Suche und Scroll)
@@ -6503,27 +6530,47 @@
     const isSmallTopPill = (host) => {
         if (!host?.getBoundingClientRect) return false;
         const rect = host.getBoundingClientRect();
-        return rect.top >= -40 && rect.top <= 280 &&
-            rect.width >= 40 && rect.width <= 420 &&
-            rect.height >= 12 && rect.height <= 64;
+        return rect.top >= -80 && rect.top <= 420 &&
+            rect.width >= 40 && rect.width <= 520 &&
+            rect.height >= 12 && rect.height <= 96;
+    };
+
+    const isTwitterBlue = (value) => {
+        const compact = (value || '').replace(/\s+/g, '');
+        return compact === 'rgb(29,155,240)' || compact.startsWith('rgba(29,155,240,');
+    };
+
+    const nodeIsBlue = (node) => {
+        if (!node) return false;
+        const styleAttr = node.getAttribute?.('style') || '';
+        if (styleAttr.includes('29, 155, 240') || styleAttr.includes('29,155,240')) return true;
+        let bg = '';
+        let fg = '';
+        try {
+            const style = getComputedStyle(node);
+            bg = style.backgroundColor || '';
+            fg = style.color || '';
+        } catch (e) { /* Farbe nicht lesbar */ }
+        // Die Pille ist mal blau hinterlegt, mal nur der Text.
+        return isTwitterBlue(bg) || isTwitterBlue(fg);
     };
 
     const isBluePillSurface = (host) => {
-        let node = host;
-        for (let depth = 0; node && depth < 5; depth++, node = node.parentElement) {
-            const styleAttr = node.getAttribute?.('style') || '';
-            if (styleAttr.includes('29, 155, 240') || styleAttr.includes('29,155,240')) return true;
-            if (node.querySelector?.('[style*="29, 155, 240"], [style*="29,155,240"]')) return true;
-            let bg = '';
-            try { bg = getComputedStyle(node).backgroundColor || ''; } catch (e) { bg = ''; }
-            const compact = bg.replace(/\s+/g, '');
-            if (compact === 'rgb(29,155,240)' || compact.startsWith('rgba(29,155,240,')) return true;
+        if (!host) return false;
+        if (host.querySelector?.('[style*="29, 155, 240"], [style*="29,155,240"]')) return true;
+        const extra = host.querySelector?.('span');
+        const starts = extra && extra !== host ? [host, extra] : [host];
+        for (const start of starts) {
+            let node = start;
+            for (let depth = 0; node && depth < 6; depth++, node = node.parentElement) {
+                if (nodeIsBlue(node)) return true;
+            }
         }
         return false;
     };
 
     const acceptPill = (host, txt) => {
-        if (!host || host.dataset?.processed === 'true') return null;
+        if (!host) return null;
         if (!matchesNewPostsText(txt) || !isSmallTopPill(host) || !isBluePillSurface(host)) return null;
         const numMatch = String(txt).match(/(\d+)/);
         pendingNewPosts = numMatch ? parseInt(numMatch[1], 10) : 1;
@@ -6548,7 +6595,7 @@
 
     for (const selector of selectors) {
         const btn = document.querySelector(selector);
-        if (btn && btn.dataset.processed !== 'true') {
+        if (btn) {
             const span = getSelectorFallback(btn, ['span', '[data-testid="pillLabel"]']);
             const textContent = (span ? span.textContent : btn.getAttribute('aria-label') || '').toLowerCase().trim();
 
@@ -6718,6 +6765,12 @@
         }
 
         if (lastReadPost?.tweetId && BigInt(tweetId) < BigInt(lastReadPost.tweetId)) {
+            if (focusWatchAllowsOffTopClick()) {
+                // Nach dem Zurückkommen die Pille laden und danach die gespeicherte Stelle suchen.
+                // Runterscrollen hat die Lesestelle nicht mitgenommen.
+                debugLog('NewPosts', 'Nach dem Zurückkommen: gespeicherte Lesestelle bleibt, Pille wird geladen.');
+                return true;
+            }
             log('NewPosts', `Viewport-Top (@${authorHandler} ${tweetId}) ist älter als Lesestelle (@${lastReadPost.authorHandler} ${lastReadPost.tweetId}) — kein Auto-Laden/Restore.`);
             diagPush('BOOKMARK_OLDER_SKIPPED', 'warn',
                 'Viewport-Top ist älter als Lesestelle — kein Sync vor New-Posts', {
@@ -6837,8 +6890,13 @@
                     return;
                 }
                 const pill = typeof getNewPostsIndicator === 'function' ? getNewPostsIndicator() : null;
-                if (pill && pill.dataset.processed !== 'true' && isNearTimelineTop() && !isNewPostsAutoLoadPaused()) {
+                if (pill && !isNewPostsAutoLoadPaused()) {
                     newPostsState.wakeClickArmedAt = Date.now();
+                    if (!isAtTimelineTop()) {
+                        // Langes Hintergrund: die Pille laden, auch wenn die Lesestelle nicht ganz oben steht.
+                        pillPresentAtWatchStart = false;
+                        focusPillWatchUntil = Date.now() + CONFIG.FOCUS_PILL_WATCH_MS;
+                    }
                     tryAutoClickNewPosts();
                     return;
                 }
@@ -7033,7 +7091,7 @@
 
     const viewportAnchor = getLesestelleAnchorPost();
     const viewportTweetId = viewportAnchor ? getPostTweetId(viewportAnchor) : null;
-    if (!fromUser && viewportTweetId && restoreBookmark?.tweetId &&
+    if (!fromUser && !focusWatchAllowsOffTopClick() && viewportTweetId && restoreBookmark?.tweetId &&
         BigInt(viewportTweetId) < BigInt(restoreBookmark.tweetId) &&
         !isNearTimelineTop()) {
         debugLog('NewPosts', 'Auto-Laden übersprungen — Viewport zeigt älteren Post als Lesestelle.');
@@ -7068,10 +7126,20 @@
     suppressionState.until = Date.now() + CONFIG.NEW_POSTS_GRACE_MS;
     scrollState.hasScrolledUp = false;
 
-    btn.dataset.processed = 'true';
+    // Den Text anklicken, damit das Event durch die Pille nach oben blubbert.
+    // Kein dauerhaftes dataset.processed: X benutzt denselben Knoten wieder,
+    // und eine gesetzte Markierung hat die nächste Pille dann nie geladen.
+    const clickTarget = btn.querySelector?.('span') || btn;
+    const clickLabel = (clickTarget.textContent || btn.textContent || '').replace(/\s+/g, ' ').trim();
+    if (clickLabel !== newPostsPillClickText) {
+        newPostsPillClickText = clickLabel;
+        newPostsPillClickCount = 0;
+    }
+    newPostsPillClickCount++;
+    newPostsPillClickedAt = Date.now();
     syntheticNewPostsClick = true;
     try {
-        btn.click();
+        clickTarget.click();
     } finally {
         syntheticNewPostsClick = false;
     }
