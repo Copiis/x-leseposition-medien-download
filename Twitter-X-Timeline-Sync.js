@@ -15,7 +15,7 @@
 // @description:ko Twitter/X에서 마지막 읽기 위치를 추적하고 동기화합니다. 수동 및 자동 옵션 포함. 새로운 게시물을 확인하면서 현재 위치를 잃지 않도록 이상적입니다. 트윗 ID를 사용하여 정확한 위치 지정을 하고, 리포스트를 지원합니다。
 // @icon https://x.com/favicon.ico
 // @namespace https://github.com/Copiis/x-leseposition-medien-download
-// @version 2026.10.14a
+// @version 2026.10.14b
 // @author Copiis
 // @license MIT
 // @match https://x.com/*
@@ -96,6 +96,7 @@
         SEARCH_BOUNCE_MAX: 3,                // So oft darf ein Sprung verpuffen, dann ist es eine Schleife.
         SEARCH_RELOAD_WAIT_MS: 2000,         // Noch keine neuen Beiträge: so lange auf das Nachladen warten.
         SEARCH_UNLOADED_JUMPS_MAX: 8,        // Danach aufhören, wenn auch das Warten nichts nachlädt.
+        FALLBACK_NEAR_MS: 90 * 60 * 1000,   // Ersatz nur, wenn die Tweet-ID höchstens 90 Minuten älter ist. Gleicher Name reicht nicht.
         SLOW_SEARCH_FINE_MAX_ATTEMPTS: 15,   // Danach Resolve an der aktuellen Stelle, nicht an den Seitenanfang.
         SEARCH_FINE_ZONE_HYSTERESIS: 2,      // Abstand 0–2: keine großen Sprünge mehr (Ping-Pong-Schutz)
         SEARCH_TOP_RETRY_MAX_IDX: 25,        // Nahe am Map-Anfang früher in den Feinbereich.
@@ -3728,6 +3729,10 @@
                     continue;
                 }
             }
+            if (!postIsNearBookmark(parsed, bookmark)) {
+                debugLog('Resolve', `Map-Nachfolger zu weit von der Lesestelle — @${parsed.authorHandler} ${parsed.tweetId}`);
+                continue;
+            }
 
             const entry = timelineMapByKey.get(key);
             return {
@@ -4680,6 +4685,7 @@
                         if (i < 0 || i >= timelineMapOrderedKeys.length) continue;
                         const parsed = domByKey.get(timelineMapOrderedKeys[i]);
                         if (!parsed) continue;
+                        if (offset !== 0 && !postIsNearBookmark(parsed, bookmark)) continue;
                         return {
                             post: parsed,
                             confidence: offset === 0 ? 95 : Math.max(15, 55 - offset * 4),
@@ -4697,12 +4703,14 @@
 
         if (visibleParsed.length > 0) {
             const pick = visibleParsed[Math.floor(visibleParsed.length / 2)];
-            return {
-                post: pick,
-                confidence: 15,
-                strategy: 'emergency',
-                reason: 'viewport-middle'
-            };
+            if (postIsNearBookmark(pick, bookmark)) {
+                return {
+                    post: pick,
+                    confidence: 15,
+                    strategy: 'emergency',
+                    reason: 'viewport-middle'
+                };
+            }
         }
 
         const sorted = [...all].sort((a, b) => {
@@ -4710,6 +4718,7 @@
             const bTop = b.element.getBoundingClientRect().top;
             return Math.abs(aTop - CONFIG.RESTORE_SCROLL_OFFSET) - Math.abs(bTop - CONFIG.RESTORE_SCROLL_OFFSET);
         });
+        if (!postIsNearBookmark(sorted[0], bookmark)) return null;
         return {
             post: sorted[0],
             confidence: 10,
@@ -5040,6 +5049,20 @@
         }
 
         const fresh = resolveFreshPostElement(post.element, post.tweetId, post.authorHandler, !!post.isRepost) || post.element;
+        const nearBookmark = expectedBookmark || lastReadPost;
+        if (strategy !== 'exact' && !postIsNearBookmark(post, nearBookmark)) {
+            debugLog('Resolve', `Ersatz verworfen — @${post.authorHandler} ${post.tweetId} liegt nicht an der Lesestelle`);
+            return false;
+        }
+        if (strategy !== 'exact' && fresh?.getBoundingClientRect) {
+            const here = window.scrollY || 0;
+            const targetY = here + fresh.getBoundingClientRect().top - CONFIG.RESTORE_SCROLL_OFFSET;
+            const vh = window.innerHeight || 800;
+            if (here - targetY > vh * 1.25) {
+                debugLog('Resolve', 'Ersatz verworfen — der Sprung würde an den Seitenanfang gehen');
+                return false;
+            }
+        }
 
         const scrollOpts = verifySource === 'new-posts-restore'
             ? { ignoreAnchorStale: true }
@@ -5091,8 +5114,10 @@
         }
 
         if (resolved?.strategy !== 'exact' &&
-            (bookmarkStillBelowWindow(bookmark) || resolvedPostIsTooYoung(resolved, bookmark))) {
-            log('Resolve', 'Ersatz übersprungen — Lesestelle liegt noch weiter unten');
+            (bookmarkStillBelowWindow(bookmark) ||
+                resolvedPostIsTooYoung(resolved, bookmark) ||
+                !postIsNearBookmark(resolved?.post, bookmark))) {
+            log('Resolve', 'Ersatz übersprungen — Lesestelle liegt noch weiter unten oder der Treffer ist zu weit weg. Seite bleibt.');
             dismissActionPopup();
             endManualSearchSession();
             searchControl.isFallbackSearching = false;
@@ -5166,17 +5191,35 @@
         return Math.round(vh * CONFIG.SEARCH_JUMP_MAX_VH);
     }
 
+    function tweetIdMs(tweetId) {
+        if (!tweetId) return null;
+        try {
+            return Number((BigInt(tweetId) >> 22n) + 1288834974657n);
+        } catch (e) {
+            return null;
+        }
+    }
+
     function bookmarkTargetMs(bookmark) {
         const raw = getComparisonTimestamp(bookmark);
         const ms = raw ? Date.parse(raw) : NaN;
         if (Number.isFinite(ms)) return ms;
-        if (!bookmark?.tweetId) return null;
-        try {
-            const id = BigInt(bookmark.tweetId);
-            return Number((id >> 22n) + 1288834974657n);
-        } catch (e) {
-            return null;
-        }
+        return tweetIdMs(bookmark?.tweetId);
+    }
+
+    /**
+     * Gleicher Name ist kein Treffer. Die Tweet-ID muss die Lesestelle sein
+     * oder höchstens FALLBACK_NEAR_MS älter. Jüngere Posts zählen nicht.
+     */
+    function postIsNearBookmark(post, bookmark) {
+        if (!post?.tweetId || !bookmark?.tweetId) return false;
+        if (post.tweetId === bookmark.tweetId && !!post.isRepost === !!bookmark.isRepost) return true;
+        const target = bookmarkTargetMs(bookmark);
+        const parsedCandidate = Date.parse(post.timestamp || '');
+        const candidate = tweetIdMs(post.tweetId) ?? (Number.isFinite(parsedCandidate) ? parsedCandidate : null);
+        if (target === null || candidate === null) return false;
+        if (candidate > target + 60 * 1000) return false;
+        return target - candidate <= CONFIG.FALLBACK_NEAR_MS;
     }
 
     /**
@@ -5239,8 +5282,9 @@
     }
 
     /**
-     * Ein normaler Beitrag im Fenster hat schon eine Tweet-ID der Lesestelle
-     * oder eine kleinere. Vorher liegt die gespeicherte Stelle noch tiefer.
+     * Der Median der sichtbaren Original-IDs ist noch jünger als die Lesestelle.
+     * Ein einzelner älterer Beitrag reicht nicht, sonst bricht die Suche ab
+     * und der Fallback nimmt weiter oben einen anderen Post desselben Namens.
      * Reposts zählen nicht: ihre ID ist die des Originals.
      */
     function bookmarkNotReachedByTweetId(bookmark) {
@@ -5251,17 +5295,18 @@
         } catch (e) {
             return false;
         }
-        let sawOriginal = false;
+        const ids = [];
         for (const vis of getVisiblePosts()) {
             if (!vis?.tweetId || vis.isRepost) continue;
-            sawOriginal = true;
             try {
-                if (BigInt(vis.tweetId) <= bookmarkId) return false;
+                ids.push(BigInt(vis.tweetId));
             } catch (e) {
                 continue;
             }
         }
-        return sawOriginal;
+        if (!ids.length) return false;
+        ids.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+        return ids[Math.floor(ids.length / 2)] > bookmarkId;
     }
 
     function sawVisibleOriginal() {
@@ -5318,7 +5363,7 @@
                 best = vis;
             }
         }
-        if (!best) return null;
+        if (!best || !postIsNearBookmark(best, bookmark)) return null;
         return readingPostFromVisible(best, 60, 'visible-nearest');
     }
 
@@ -5336,7 +5381,8 @@
                 best = vis;
             }
         }
-        return best ? readingPostFromVisible(best, 55, 'visible-closest') : null;
+        if (!best || !postIsNearBookmark(best, bookmark)) return null;
+        return readingPostFromVisible(best, 55, 'visible-closest');
     }
 
     function resolvedPostIsTooYoung(resolved, bookmark) {
@@ -6240,10 +6286,15 @@
      * weiter unten steht, ist ein leerer Artikel (rect ≈ 0) und würde die
      * Lesestelle entladen.
      */
-    function scrollFeedTo(targetY, reason) {
+    function scrollFeedTo(targetY, reason, options = {}) {
         const y = Math.max(0, Number(targetY) || 0);
         const here = window.scrollY || 0;
         const vh = window.innerHeight || 800;
+        const upward = here - y;
+        if (!options.allowLongUp && upward > vh * 1.25) {
+            debugLog('Position', `Langer Sprung nach oben verworfen (${reason}, ${Math.round(here)} → ${Math.round(y)})`);
+            return false;
+        }
         if (here > vh && y <= CONFIG.AT_TOP_SCROLL_PX) {
             debugLog('Position', `Sprung an den Seitenanfang verworfen (${reason}, ${Math.round(here)} → ${Math.round(y)})`);
             return false;
@@ -6346,7 +6397,7 @@
                 searchControl.isAutoScrolling = true;
                 holdAlign();
                 const beforeY = window.scrollY || 0;
-                const accepted = scrollFeedTo(beforeY + delta, 'nachziehen');
+                const accepted = scrollFeedTo(beforeY + delta, 'nachziehen', { allowLongUp: true });
                 if (accepted && Math.abs((window.scrollY || 0) - beforeY) <= 2) {
                     window.scrollBy({ top: delta, behavior: 'auto' });
                 }
@@ -6401,7 +6452,11 @@
         const vh = window.innerHeight || 800;
         const inView = rect.bottom > 0 && rect.top < vh;
         debugLog('Position', `Ausrichten rect.top:${Math.round(rect.top)} Δ:${Math.round(delta)} Versuch:${attempts}`);
-        const accepted = scrollFeedTo(beforeY + delta, 'fein');
+        const exactSaved = !!(anchorTweetId && lastReadPost?.tweetId &&
+            anchorTweetId === lastReadPost.tweetId &&
+            anchorAuthor === lastReadPost.authorHandler &&
+            !!anchorRepost === !!lastReadPost.isRepost);
+        const accepted = scrollFeedTo(beforeY + delta, 'fein', { allowLongUp: exactSaved });
         if (!accepted) {
             finishAligned('Feiner Sprung an den Seitenanfang verworfen.', active);
             return;
