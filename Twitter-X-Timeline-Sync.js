@@ -15,7 +15,7 @@
 // @description:ko Twitter/X에서 마지막 읽기 위치를 추적하고 동기화합니다. 수동 및 자동 옵션 포함. 새로운 게시물을 확인하면서 현재 위치를 잃지 않도록 이상적입니다. 트윗 ID를 사용하여 정확한 위치 지정을 하고, 리포스트를 지원합니다。
 // @icon https://x.com/favicon.ico
 // @namespace https://github.com/Copiis/x-leseposition-medien-download
-// @version 2026.10.14b
+// @version 2026.10.14c
 // @author Copiis
 // @license MIT
 // @match https://x.com/*
@@ -1748,6 +1748,12 @@
     let focusPillWatchUntil = 0;
     let pillPresentAtWatchStart = false;
     let newPostsObserverClickTimer = null;
+    // null: Home-Reiter noch nicht erkannt. true: „Folge ich“. false: „Für dich“.
+    // Beide Reiter bleiben auf x.com/home, die Adresse ändert sich nicht.
+    let followingTabActive = null;
+    let followingClickArmAt = 0;
+    let timelineMapObserver = null;
+    let homeTabClickBound = false;
 
     function focusWatchAllowsOffTopClick() {
         // Nach dem Zurückkommen zeigt X die Pille oft erst ein paar Sekunden später.
@@ -1758,6 +1764,7 @@
 
     function armFocusPillWatch() {
         if (!window.location.pathname.startsWith('/home')) return;
+        if (followingTabActive === false) return;
         if (!isScriptActivated && lastReadPost?.tweetId) {
             isScriptActivated = true;
         }
@@ -1770,10 +1777,206 @@
         const now = Date.now();
         if (now >= focusPillWatchUntil) {
             pillPresentAtWatchStart = !!getNewPostsIndicator();
+            // Neuer Blick auf den Tab: die Klick-Sperre der vorigen Pille gilt nicht mehr.
+            newPostsPillClickCount = 0;
+            newPostsPillClickText = '';
+            newPostsPillClickedAt = 0;
+            newPostsState.autoLoadPaused = false;
         }
         focusPillWatchUntil = now + CONFIG.FOCUS_PILL_WATCH_MS;
         observeForNewPosts();
         burstCheckNewPosts();
+    }
+
+    const FOLLOWING_TAB_LABELS = new Set([
+        'folge ich',
+        'following',
+        'siguiendo',
+        'abonnements',
+        'seguindo',
+        'seguiti',
+        'フォロー中',
+        'подписки',
+        '正在关注',
+        '팔로잉',
+        'volgend',
+        'följer',
+        'følger'
+    ]);
+    const FOR_YOU_TAB_LABELS = new Set([
+        'für dich',
+        'for you',
+        'para ti',
+        'pour vous',
+        'para você',
+        'per te',
+        'おすすめ',
+        'для вас',
+        '为你推荐',
+        '추천',
+        'voor jou',
+        'för dig',
+        'til dig'
+    ]);
+
+    function normalizeHomeTabLabel(text) {
+        return (text || '').replace(/\s+/g, ' ').trim().toLowerCase();
+    }
+
+    function homeFeedTabEntries() {
+        const entries = [];
+        const tabs = document.querySelectorAll('[role="tab"]');
+        for (const tab of tabs) {
+            if (tab.closest('article')) continue;
+            const label = normalizeHomeTabLabel(tab.innerText || tab.textContent);
+            const kind = FOLLOWING_TAB_LABELS.has(label) ? 'following'
+                : FOR_YOU_TAB_LABELS.has(label) ? 'for-you'
+                : '';
+            if (!kind) continue;
+            entries.push({
+                kind,
+                selected: tab.getAttribute('aria-selected') === 'true' ||
+                    tab.getAttribute('aria-current') === 'page'
+            });
+        }
+        return entries;
+    }
+
+    // null: Reiter noch nicht erkennbar. true: „Folge ich“. false: „Für dich“.
+    function readFollowingTabSelected() {
+        const entries = homeFeedTabEntries();
+        if (!entries.some((entry) => entry.kind === 'following')) return null;
+        if (!entries.some((entry) => entry.kind === 'for-you')) return null;
+        const selected = entries.find((entry) => entry.selected);
+        if (!selected) return null;
+        return selected.kind === 'following';
+    }
+
+    function pauseTimelineForOtherHomeTab() {
+        newPostsState.autoLoadPaused = true;
+        if (newPostsObserverClickTimer) {
+            clearTimeout(newPostsObserverClickTimer);
+            newPostsObserverClickTimer = null;
+        }
+        if (newPostsBurstTimer) {
+            clearTimeout(newPostsBurstTimer);
+            newPostsBurstTimer = null;
+        }
+        clearUpSettlePromote();
+        const busy = searchControl.isSearching || searchControl.newPostsRestoreActive ||
+            searchControl.isFallbackSearching || searchControl.isAutoScrolling ||
+            searchControl.manualSearchActive;
+        if (!busy) return;
+        searchControl.isSearchCancelled = true;
+        searchControl.manualSearchActive = false;
+        searchControl.isSearching = false;
+        searchControl.isFallbackSearching = false;
+        searchControl.isAutoScrolling = false;
+        searchControl.newPostsRestoreActive = false;
+        noteProgrammaticScrollEnded();
+        releaseScrollAnchor();
+        debugLog('Init', 'Suche angehalten — Reiter ist nicht „Folge ich“.');
+    }
+
+    function resumeTimelineOnFollowingTab(reason, armPill) {
+        if (!isScriptActivated) {
+            isScriptActivated = true;
+            log('Init', 'Skript aktiv, weil „Folge ich“ gewählt ist.');
+        } else if (armPill) {
+            log('Init', '„Folge ich“ angeklickt — Skript liest wieder mit (' + reason + ').');
+        }
+        bindHomePageListeners();
+        observeForNewPosts();
+        setupTimelineMapObserver();
+        if (!armPill) return;
+        newPostsPillClickCount = 0;
+        newPostsPillClickText = '';
+        newPostsPillClickedAt = 0;
+        newPostsState.autoLoadPaused = false;
+        newPostsState.wakeClickArmedAt = 0;
+        newPostsState.suppressTopMarkUntil = 0;
+        searchControl.isSearchCancelled = false;
+        searchControl.manualSearchActive = false;
+        searchControl.isSearching = false;
+        searchControl.isFallbackSearching = false;
+        searchControl.isAutoScrolling = false;
+        searchControl.newPostsRestoreActive = false;
+        // War die Pille schon da, nicht unterhalb vom Anfang laden.
+        // Fehlt sie noch, fängt die Beobachtung sie ab, auch etwas unter dem Anfang.
+        pillPresentAtWatchStart = !!getNewPostsIndicator();
+        focusPillWatchUntil = Date.now() + CONFIG.FOCUS_PILL_WATCH_MS;
+        noteProgrammaticScrollEnded();
+        burstCheckNewPosts();
+        tryAutoClickNewPosts();
+        updateHighlightedPost();
+        setTimeout(() => {
+            if (followingTabActive !== true) return;
+            updateHighlightedPost();
+        }, 800);
+    }
+
+    function syncFollowingTabActivation(reason) {
+        if (!window.location.pathname.startsWith('/home')) {
+            followingTabActive = null;
+            return;
+        }
+        const selected = readFollowingTabSelected();
+        if (selected === null) return;
+        if (selected === followingTabActive) return;
+        const previous = followingTabActive;
+        followingTabActive = selected;
+        if (!selected) {
+            log('Init', 'Reiter „Für dich“ — Neue Posts warten auf „Folge ich“.');
+            pauseTimelineForOtherHomeTab();
+            return;
+        }
+        resumeTimelineOnFollowingTab(reason, previous === false);
+    }
+
+    function activateBecauseFollowingClicked() {
+        if (!window.location.pathname.startsWith('/home')) return;
+        if (readFollowingTabSelected() === false) return;
+        const now = Date.now();
+        const fresh = followingTabActive !== true || now - followingClickArmAt > 1500;
+        followingTabActive = true;
+        if (!fresh) {
+            observeForNewPosts();
+            tryAutoClickNewPosts();
+            return;
+        }
+        followingClickArmAt = now;
+        resumeTimelineOnFollowingTab('klick', true);
+    }
+
+    function homeTabLabelFromClick(event) {
+        const el = event.target instanceof Element ? event.target : null;
+        if (!el || el.closest('article')) return '';
+        const tab = el.closest('[role="tab"]');
+        if (tab) return normalizeHomeTabLabel(tab.innerText || tab.textContent);
+        const span = el.closest('span');
+        if (!span) return '';
+        return normalizeHomeTabLabel(span.textContent);
+    }
+
+    function onHomeTabClick(event) {
+        const label = homeTabLabelFromClick(event);
+        if (!label) return;
+        if (FOLLOWING_TAB_LABELS.has(label)) {
+            setTimeout(activateBecauseFollowingClicked, 50);
+            setTimeout(activateBecauseFollowingClicked, 400);
+            setTimeout(activateBecauseFollowingClicked, 1200);
+            return;
+        }
+        if (FOR_YOU_TAB_LABELS.has(label)) {
+            setTimeout(() => syncFollowingTabActivation('reiter'), 50);
+            setTimeout(() => syncFollowingTabActivation('reiter'), 400);
+        }
+    }
+
+    function bindFollowingTabClick() {
+        if (homeTabClickBound) return;
+        homeTabClickBound = true;
+        document.addEventListener('click', onHomeTabClick, true);
     }
 
     function clearUpSettlePromote() {
@@ -1843,6 +2046,7 @@
     let onHomePillClick = null;
 
     function bindHomePageListeners() {
+        bindFollowingTabClick();
         if (homeListenersBound || !onHomeScrollDebounced || !onHomePillClick || !onHomeScrollProgrammatic) return;
         if (!window.location.pathname.startsWith('/home')) return;
         if (!unloadUnbindArmed) {
@@ -1854,6 +2058,8 @@
         window.addEventListener('scroll', onHomeScrollDebounced, { passive: true });
         document.addEventListener('click', onHomePillClick, true);
         checkNewPostsIntervalId = setInterval(() => {
+            syncFollowingTabActivation('interval');
+            if (followingTabActive === false) return;
             nudgeStalledNewPostsRestore();
             tryAutoClickNewPosts();
             tryClickShowHiddenPostsButton('interval');
@@ -1882,6 +2088,11 @@
             }
         };
         onHomeScrollDebounced = debounce(() => {
+            if (followingTabActive === false) {
+                lastScrollY = window.scrollY;
+                scrollState.lastMapScrollY = window.scrollY;
+                return;
+            }
             if (!isScriptActivated) {
                 isScriptActivated = true;
                 observeForNewPosts();
@@ -2003,6 +2214,12 @@
             void clickNewPostsIndicator({ fromUser: true });
         };
         bindHomePageListeners();
+        const watchHomeTabs = (left) => {
+            syncFollowingTabActivation('init');
+            if (followingTabActive !== null || left <= 0) return;
+            setTimeout(() => watchHomeTabs(left - 1), 400);
+        };
+        watchHomeTabs(8);
 
         window.addEventListener('focus', () => {
             if (document.visibilityState !== 'visible') return;
@@ -2067,12 +2284,13 @@
 
     function burstCheckNewPosts() {
         if (newPostsBurstTimer) return;
+        if (followingTabActive === false) return;
         const watching = () => Date.now() < focusPillWatchUntil;
         if (!watching() && !isNearTimelineTop()) return;
         let attempt = 0;
         const step = () => {
             newPostsBurstTimer = null;
-            if (!isScriptActivated) return;
+            if (!isScriptActivated || followingTabActive === false) return;
             const stillWatching = watching();
             if (searchControl.isSearching || searchControl.isFallbackSearching ||
                 searchControl.isAutoScrolling || searchControl.newPostsRestoreActive) {
@@ -2094,7 +2312,7 @@
     function bootHomePage() {
         if (homeBootStarted || !window.location.pathname.startsWith('/home')) return;
         homeBootStarted = true;
-        log('Init', 'Initialisiere Skript auf /home... (Version 2026.10.14a)');
+        log('Init', 'Initialisiere Skript auf /home... (Version 2026.10.14c)');
 
         const run = () => {
             if (!window.location.pathname.startsWith('/home')) return;
@@ -2306,6 +2524,7 @@
     if (!window.location.href.includes('/home') || isLesestelleMutationBlocked()) {
         return false;
     }
+    if (followingTabActive === false) return false;
 
     if (!allowOlderRegression &&
         searchControl.lastManualSearchEndedAt > 0 &&
@@ -3624,6 +3843,7 @@
             timelineMapPendingSource = source;
             return;
         }
+        if (followingTabActive === false) return;
         if (!window.location.href.includes('/home')) return;
 
         for (const entry of timelineMapByKey.values()) entry.inDom = false;
@@ -3633,6 +3853,11 @@
 
     function flushMapMutations() {
         mapMutationTimer = null;
+        if (followingTabActive === false) {
+            mapMutationArticles.clear();
+            mapMutationRemoved.splice(0, mapMutationRemoved.length);
+            return;
+        }
         const articles = [...mapMutationArticles];
         const removed = mapMutationRemoved.splice(0, mapMutationRemoved.length);
         mapMutationArticles.clear();
@@ -3658,8 +3883,13 @@
             setTimeout(setupTimelineMapObserver, 500);
             return;
         }
+        if (timelineMapObserver) {
+            timelineMapObserver.disconnect();
+            timelineMapObserver = null;
+        }
 
         const observer = new MutationObserver((mutations) => {
+            if (followingTabActive === false) return;
             const articles = [];
             const removed = [];
             for (const mutation of mutations) {
@@ -3680,8 +3910,11 @@
             if (!articles.length && !removed.length) return;
             queueMapMutation(articles, removed);
         });
+        timelineMapObserver = observer;
         observer.observe(container, { childList: true, subtree: true });
-        ingestArticles(container.querySelectorAll("article[data-testid='tweet']"), 'init');
+        if (followingTabActive !== false) {
+            ingestArticles(container.querySelectorAll("article[data-testid='tweet']"), 'init');
+        }
     }
 
     function isPostNewerThanBookmark(post, bookmark) {
@@ -6147,6 +6380,7 @@
     }
 
     function tryAutoClickNewPosts() {
+        if (followingTabActive === false) return;
         if (!isScriptActivated ||
             searchControl.isSearching ||
             searchControl.isFallbackSearching ||
@@ -6154,10 +6388,12 @@
             searchControl.newPostsRestoreActive) {
             return;
         }
-        // Im Leerlauf nur ganz oben. Nach dem Zurückkommen darf eine Pille,
-        // die erst danach erscheint, auch weiter unten geladen werden.
+        // Im Leerlauf nur ganz oben. Nach dem Zurückkommen oder nach „Folge ich“
+        // reicht die Nähe zum Anfang. Eine Pille, die erst danach erscheint,
+        // darf auch weiter unten geladen werden.
+        const watch = Date.now() < focusPillWatchUntil;
         const catchLatePill = focusWatchAllowsOffTopClick();
-        if (!isAtTimelineTop() && !catchLatePill) return;
+        if (!isAtTimelineTop() && !catchLatePill && !(watch && isNearTimelineTop())) return;
         if (!catchLatePill && Date.now() - newPostsState.lastRestoreCompletedAt < 6000) return;
         if (isNewPostsAutoLoadPaused()) return;
         if (Date.now() - newPostsPillClickedAt < CONFIG.NEW_POSTS_PILL_RETRY_MS) return;
@@ -6527,6 +6763,7 @@
         const now = Date.now();
         if (now - lastCheck < THROTTLE_MS) return;
         lastCheck = now;
+        if (followingTabActive === false) return;
 
         const indicator = getNewPostsIndicator();
         if (indicator && (isAtTimelineTop() || focusWatchAllowsOffTopClick()) &&
@@ -6567,6 +6804,20 @@
 
     log('NewPosts', 'Observer gestartet (throttled + targeted)');
 }
+
+    function pillHostIsShown(host) {
+        if (!host?.isConnected) return false;
+        let node = host;
+        while (node && node !== document.documentElement) {
+            if (node.getAttribute?.('aria-hidden') === 'true') return false;
+            try {
+                const style = getComputedStyle(node);
+                if (style.display === 'none' || style.visibility === 'hidden') return false;
+            } catch (e) { /* Sichtbarkeit nicht lesbar */ }
+            node = node.parentElement;
+        }
+        return true;
+    }
 
     function getNewPostsIndicator() {
 
@@ -6625,16 +6876,17 @@
     };
 
     const acceptPill = (host, txt) => {
-        if (!host) return null;
+        if (!host || !pillHostIsShown(host)) return null;
         if (!matchesNewPostsText(txt) || !isSmallTopPill(host) || !isBluePillSurface(host)) return null;
         const numMatch = String(txt).match(/(\d+)/);
         pendingNewPosts = numMatch ? parseInt(numMatch[1], 10) : 1;
         return host;
     };
 
-    // Live-Crawl 06/2026: Pill-Button mit data-testid="pillLabel" + „Neue Posts sehen“
-    const pillLabel = document.querySelector('[data-testid="pillLabel"]');
-    if (pillLabel) {
+    // Live-Crawl 06/2026: Pill-Button mit data-testid="pillLabel" + „Neue Posts sehen“.
+    // Nach dem Reiterwechsel kann die Pille des anderen Feeds noch im DOM stehen.
+    const pillLabels = document.querySelectorAll('[data-testid="pillLabel"]');
+    for (const pillLabel of pillLabels) {
         const btn = pillLabel.closest('button, [role="button"]') || pillLabel.parentElement;
         const combined = ((pillLabel.textContent || '') + ' ' + (btn?.getAttribute?.('aria-label') || '')).trim();
         const found = acceptPill(btn, combined);
@@ -6649,8 +6901,8 @@
     ];
 
     for (const selector of selectors) {
-        const btn = document.querySelector(selector);
-        if (btn) {
+        const buttons = document.querySelectorAll(selector);
+        for (const btn of buttons) {
             const span = getSelectorFallback(btn, ['span', '[data-testid="pillLabel"]']);
             const textContent = (span ? span.textContent : btn.getAttribute('aria-label') || '').toLowerCase().trim();
 
@@ -6894,6 +7146,7 @@
         newPostsState.lastWakeAt = Date.now();
         if (sleptMs < CONFIG.BACKGROUND_SLEEP_MS) return;
         if (!window.location.pathname.startsWith('/home')) return;
+        if (followingTabActive === false) return;
         if (!searchControl.manualSearchActive) {
             searchControl.isSearchCancelled = false;
         }
@@ -7098,6 +7351,7 @@
         debugLog('NewPosts', 'Klick läuft schon — zweiter Aufruf verworfen.');
         return;
     }
+    if (followingTabActive === false && options.fromUser !== true) return;
     newPostsClickLocked = true;
     try {
     const fromUser = options.fromUser === true;
