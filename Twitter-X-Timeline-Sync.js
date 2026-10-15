@@ -15,7 +15,7 @@
 // @description:ko Twitter/X에서 마지막 읽기 위치를 추적하고 동기화합니다. 수동 및 자동 옵션 포함. 새로운 게시물을 확인하면서 현재 위치를 잃지 않도록 이상적입니다. 트윗 ID를 사용하여 정확한 위치 지정을 하고, 리포스트를 지원합니다。
 // @icon https://x.com/favicon.ico
 // @namespace https://github.com/Copiis/x-leseposition-medien-download
-// @version 2026.10.14c
+// @version 2026.10.14f
 // @author Copiis
 // @license MIT
 // @match https://x.com/*
@@ -35,231 +35,6 @@
 //
 (function () {
     'use strict';
-
-
-    // =====================================================
-    // PHASE 1 + PHASE 2 - Clean utilities (re-applied on fresh base)
-    // =====================================================
-
-    const CONFIG = {
-        // === Such- & Scroll-Limits ===
-        MAX_SCROLL_ATTEMPTS: 150,
-        MAX_LOADED_POSTS_BEFORE_FALLBACK: 1500,
-        // Erweiterte Limits, solange noch keine historischen Landkarten-Posts im DOM sind
-        MAP_ANCHOR_SEARCH_MAX_ATTEMPTS: 800,
-        MAP_ANCHOR_SEARCH_MAX_LOADED: 6000,
-        MAP_ANCHOR_SEARCH_MAX_STAGNANT: 120,
-        MAX_STAGNANT_SCROLLS: 35,
-        MAX_FALLBACK_ATTEMPTS: 35,
-        MAX_POSITION_ATTEMPTS: 2,
-
-        // === Zeitbasierte Werte (in ms) ===
-        POSITION_AGE_WARNING: 24 * 60 * 60 * 1000,
-        ONE_HOUR_IN_MS: 60 * 60 * 1000,
-        FOUR_HOURS_IN_MS: 4 * 60 * 60 * 1000,
-        SEVEN_DAYS_IN_MS: 7 * 24 * 60 * 60 * 1000,
-        TIME_DIFF_ACCEPTABLE_MS: 60 * 60 * 1000,
-        DEBOUNCE_SCROLL_MS: 150,
-        NEW_POSTS_CHECK_INTERVAL_MS: 3000,
-        FOCUS_PILL_WATCH_MS: 20000,          // Nach Fokus/Sichtbarkeit so lange auf die spät kommende Pille warten.
-        NEW_POSTS_PILL_RETRY_MS: 2500,       // Dieselbe Pille kurz nicht erneut klicken; bleibt sie, kommt ein neuer Versuch.
-
-        // === Schwellen für Auto-Laden neuer Beiträge ===
-        NEAR_TOP_SCROLL_THRESHOLD: 100,      // Lesestelle/Pausen: noch „nah am Anfang“, nicht tief im Feed.
-        AT_TOP_SCROLL_PX: 16,               // Neue Beiträge automatisch nur ganz oben. 100px lud schon, obwohl die Seite noch nicht oben war.
-
-        // === Unterdrückungszeiten nach Restore / Neuen Posts (Punkt 3 vereinfacht) ===
-        RESTORE_GRACE_MS: 1200,              // Kurzer harter Mindestschutz nach manuellem Restore (früher 3.5s+)
-        POST_LUPE_NEWER_BLOCK_MS: 5000,      // Nach Lupe: keine automatische Lesestellen-Vorwärts-Sprünge
-        NEW_POSTS_GRACE_MS: 1800,            // Nach "Neue Beiträge" (etwas länger wegen Feed-Sprung)
-        BACKGROUND_SLEEP_MS: 45000,          // Ab dieser Hintergrundzeit gilt der Tab als eingeschlafen
-        WAKE_RESTORE_GRACE_MS: 12000,        // Nach dem Aufwachen auf nachgeladene Posts warten, dann Lesestelle suchen
-        NEW_POSTS_SCROLL_SEARCH_MAX_ATTEMPTS: 800, // Wie die manuelle Suche: nicht nach ein paar Bildschirmen aufhören.
-        NEW_POSTS_SCROLL_STAGNANT_LOADS: 3,    // Keine neuen articles und keine neuen Tweet-IDs mehr
-        NEW_POSTS_SCROLL_STAGNANT_HEIGHT: 2,   // scrollHeight unverändert
-
-        // === Positionierung ===
-        READING_POSITION_TOP_OFFSET: 5,      // Oberster sichtbarer Post ab 5px unter Viewport-Oberkante (Lesestelle)
-        RESTORE_SCROLL_OFFSET: 175,          // Ziel: obere Kante des Posts 175px unter Viewport-Oberkante (Lupe/Restore/New-Posts)
-        POSITION_CORRECTION_TOLERANCE: 35,   // Toleranz in scrollToPostWithHighlight
-        // === DOM-Heuristiken ===
-        SMALL_SVG_MAX_SIZE: 22,              // Max. Breite/Höhe für Repost-Icon-Erkennung
-
-        // === Such-Verhalten ===
-        // Grobe Suche rückt um höchstens einen Bildschirm vor. X lädt nur das
-        // Sichtbare; ein größerer Sprung lässt die Lesestelle aus und rollt bis unten.
-        SLOW_SEARCH_FINE_STEP_PX: 280,       // Kleine Schritte wenn das Ziel schon nah ist.
-        SEARCH_JUMP_MAX_VH: 0.85,            // Ein Schritt, mit Überlappung zum vorigen Bild.
-        SEARCH_SETTLE_MS: 240,               // Kurz warten, bis neue Tweet-IDs da sind oder scrollY stillsteht.
-        SEARCH_STEP_MIN_MS: 280,             // Nicht im nächsten Frame schon wieder springen.
-        SEARCH_BOUNCE_PX: 72,                // Kleiner als ein Suchschritt, größer als eine Scrollbalkenbreite.
-        SEARCH_BOUNCE_MAX: 3,                // So oft darf ein Sprung verpuffen, dann ist es eine Schleife.
-        SEARCH_RELOAD_WAIT_MS: 2000,         // Noch keine neuen Beiträge: so lange auf das Nachladen warten.
-        SEARCH_UNLOADED_JUMPS_MAX: 8,        // Danach aufhören, wenn auch das Warten nichts nachlädt.
-        FALLBACK_NEAR_MS: 90 * 60 * 1000,   // Ersatz nur, wenn die Tweet-ID höchstens 90 Minuten älter ist. Gleicher Name reicht nicht.
-        SLOW_SEARCH_FINE_MAX_ATTEMPTS: 15,   // Danach Resolve an der aktuellen Stelle, nicht an den Seitenanfang.
-        SEARCH_FINE_ZONE_HYSTERESIS: 2,      // Abstand 0–2: keine großen Sprünge mehr (Ping-Pong-Schutz)
-        SEARCH_TOP_RETRY_MAX_IDX: 25,        // Nahe am Map-Anfang früher in den Feinbereich.
-
-        // === Context-Match (Phase 2) ===
-        CONTEXT_NEIGHBOR_COUNT: 5,
-        CONTEXT_MATCH_MIN_SCORE: 25,
-        MASS_INFLUX_PENDING_THRESHOLD: 8,
-
-        // === Timeline-Landkarte (steuert Lesestelle = oberster Post nach Map-Update) ===
-        MAX_TIMELINE_MAP: 2500,
-        TIMELINE_MAP_DEBOUNCE_MS: 200,
-        TIMELINE_MAP_PERSIST_MS: 30000,
-        MAP_SCROLL_DIRECTION_THRESHOLD: 40,
-        SCROLL_UP_PROMOTE_COOLDOWN_MS: 500,
-        SCROLL_UP_SESSION_MS: 15000,
-        // Nach dem Hochscrollen darf ein kurzes Nachgeben den obersten Repost
-        // noch als Lesestelle übernehmen, ohne dass weiteres Runterscrollen
-        // ältere Stellen setzt. Die Zeile „hat repostet“ kommt oft erst
-        // nach dem letzten Scroll-Event, deshalb die etwas längere Nachprüfung.
-        SCROLL_UP_SETTLE_MS: 800,
-        SCROLL_UP_SETTLE_PX: 48,
-        SCROLL_UP_REPOST_RECHECK_MS: 1200,
-    };
-
-    const repostCache = new WeakMap();
-
-    function detectRepost(postElement) {
-        // socialContext zuerst: ein Knoten, kein Lauf über alle path-Attribute.
-        // Den Icon-Pfad nur anfassen, wenn die Textzeile noch fehlt.
-        const repostPathPattern = /M4\.75 3\.79l4\.603.*zm11\.5 2\.71H11V4h5\.25|repost-arrow|repost-icon/i;
-        const repostTextPattern = /\b(repost(?:ed|et)?|hat repostet|retweeté|retwittato|リポストしました|перепостил|republicou|إعادة نشر|repostado|리트윗|reposted by|repostet by|retweeted by)\b/i;
-
-        const socialContext = postElement.querySelector('span[data-testid="socialContext"]');
-        if (socialContext) {
-            if (repostTextPattern.test(socialContext.textContent || '')) return true;
-            const path = socialContext.querySelector('path');
-            if (path && repostPathPattern.test(path.getAttribute('d') || '')) return true;
-        }
-
-        const svgs = postElement.querySelectorAll('svg');
-        const limit = Math.min(svgs.length, 4);
-        for (let i = 0; i < limit; i++) {
-            const svg = svgs[i];
-            const rect = svg.getBoundingClientRect();
-            if (rect.height > CONFIG.SMALL_SVG_MAX_SIZE || rect.width > CONFIG.SMALL_SVG_MAX_SIZE) continue;
-            const path = svg.querySelector('path');
-            if (path && repostPathPattern.test(path.getAttribute('d') || '')) return true;
-        }
-
-        return false;
-    }
-
-    function isRepost(postElement) {
-        if (!postElement) return false;
-        // Cache hängt an der Tweet-ID. X recycelt article-Knoten; eine andere ID verwirft den Eintrag.
-        const tweetId = getPostTweetId(postElement) || '';
-        const cached = repostCache.get(postElement);
-        if (cached && cached.tweetId === tweetId) {
-            if (cached.isRepost) return true;
-            const lateLabel = !!postElement.querySelector('span[data-testid="socialContext"]');
-            const stillFresh = Date.now() - cached.negativeAt < CONFIG.SCROLL_UP_REPOST_RECHECK_MS;
-            if (!lateLabel && !stillFresh) return false;
-        }
-        const result = detectRepost(postElement);
-        if (result) {
-            repostCache.set(postElement, { tweetId, isRepost: true, negativeAt: 0 });
-            return true;
-        }
-        if (postElement.querySelector('time[datetime]')) {
-            const negativeAt = cached && cached.tweetId === tweetId && cached.negativeAt
-                ? cached.negativeAt
-                : Date.now();
-            repostCache.set(postElement, { tweetId, isRepost: false, negativeAt });
-        }
-        return false;
-    }
-
-    function getReposterHandler(postElement) {
-        if (!postElement) return null;
-
-        // Try socialContext first
-        const socialContext = postElement.querySelector('span[data-testid="socialContext"]');
-        if (socialContext) {
-            const link = socialContext.querySelector('a[role="link"][href^="/"]:not([href*="/status/"])');
-            if (link) {
-                const href = link.getAttribute('href') || '';
-                const match = href.match(/^\/([^/?#]+)/);
-                if (match && match[1] && !['home', 'explore', 'notifications', 'messages', 'i'].includes(match[1])) {
-                    debugLog('Repost', 'getReposterHandler success via socialContext →', match[1]);
-                    return match[1];
-                }
-            }
-        }
-
-        // Fallback
-        const allLinks = postElement.querySelectorAll('a[role="link"][href^="/"]:not([href*="/status/"])');
-        for (const link of allLinks) {
-            const href = link.getAttribute('href') || '';
-            const match = href.match(/^\/([^/?#]+)/);
-            if (match && match[1] && !['home', 'explore', 'notifications', 'messages', 'i'].includes(match[1])) {
-                debugLog('Repost', 'getReposterHandler success via fallback link →', match[1]);
-                return match[1];
-            }
-        }
-
-        return null;
-    }
-
-    const REPOST_LOG_KEY = (account) => `repostLog_${account}`;
-    const MAX_REPOST_LOG = 500;
-    const MAX_POST_HISTORY = 500;   // Erhöht von 100 auf 500 (User-Wunsch 30.05.2026)
-
-    function addRepostToLog(repostData) {
-        if (!repostData || !repostData.reposter || !repostData.originalAuthor) {
-            debugLog('Repost', 'Skipped - missing reposter or originalAuthor');
-            return;
-        }
-
-        const account = repostData.account || 'unknown';
-        const key = REPOST_LOG_KEY(account);
-
-        let repostLogEntries = GM_getValue(key, []);
-
-        // Deduplication
-        const isDuplicate = repostLogEntries.some(entry => 
-            entry.reposter === repostData.reposter &&
-            entry.originalAuthor === repostData.originalAuthor &&
-            Math.abs(new Date(entry.repostDate).getTime() - new Date(repostData.repostDate).getTime()) < 1000 * 60 * 60 * 24
-        );
-
-        if (isDuplicate) {
-            debugLog('Repost', 'Duplicate skipped for', repostData.reposter, '→', repostData.originalAuthor);
-            return;
-        }
-
-        repostLogEntries.push({
-            reposter: repostData.reposter,
-            originalAuthor: repostData.originalAuthor,
-            repostDate: repostData.repostDate,
-            discoveredAt: repostData.discoveredAt || new Date().toISOString()
-        });
-
-        if (repostLogEntries.length > MAX_REPOST_LOG) {
-            repostLogEntries = repostLogEntries.slice(-MAX_REPOST_LOG);
-        }
-
-        GM_setValue(key, repostLogEntries);
-        log('Repost', `Repost erfasst: @${repostData.reposter} → @${repostData.originalAuthor}`);
-        debugLog('Repost', 'Total reposts logged for account', account, '=', repostLogEntries.length);
-    }
-
-    function parsePost(postElement) {
-        if (!postElement) return null;
-        return {
-            element: postElement,
-            tweetId: getPostTweetId(postElement),
-            authorHandler: getPostAuthorHandler(postElement),
-            timestamp: getPostTimestamp(postElement),
-            isRepost: isRepost(postElement)
-        };
-    }
-
 
     const translations = {
         en: {
@@ -609,12 +384,18 @@
         return message;
     }
 
-    function getSelectorFallback(element, selectors) {
-        for (const selector of selectors) {
-            const found = element.querySelector(selector);
-            if (found) return found;
-        }
-        return null;
+    // =====================================================
+    // Lesestelle — ein Ablauf
+    // idle: mitlesen. pill: neue Posts laden. seek: gespeicherte Stelle suchen. align: auf die Lesezeile rücken.
+    // Nur der Reiter „Folge ich“. „Für dich“ bleibt auf x.com/home und wird ignoriert.
+    // =====================================================
+
+    const DEBUG = false;
+    function log(category, ...args) {
+        console.log('[' + category + ']', ...args);
+    }
+    function debugLog(category, ...args) {
+        if (DEBUG) console.log('[' + category + ']', ...args);
     }
 
     function debounce(fn, delay) {
@@ -624,6 +405,190 @@
             timeout = setTimeout(() => fn(...args), delay);
         };
     }
+
+    const AT_TOP_PX = 16;
+    const NEAR_TOP_PX = 100;
+    const READING_LINE_PX = 175;
+    const ALIGN_TOLERANCE_PX = 35;
+    const PILL_WATCH_MS = 20000;
+    const PILL_RETRY_MS = 2500;
+    const PILL_MAX_CLICKS = 3;
+    const SEARCH_MAX_STEPS = 800;
+    const SEARCH_JUMP_VH = 0.85;
+    const FINE_STEP_PX = 280;
+    const RELOAD_WAIT_MS = 2000;
+    const EMPTY_WAITS_MAX = 8;
+    const NEAR_MS = 90 * 60 * 1000;
+    const NEWER_SLACK_MS = 60 * 1000;
+    const SLEEP_MS = 45000;
+    const MAP_MAX = 2500;
+    const HISTORY_MAX = 500;
+    const REPOST_LOG_MAX = 500;
+    const SCROLL_DEAD_PX = 8;
+    const SMALL_SVG_MAX = 22;
+    const IMPORT_FILE_MAX_BYTES = 2 * 1024 * 1024;
+    const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
+
+    const STORAGE_KEY = (account) => 'lastReadPost_' + account;
+    const HISTORY_KEY = (account) => 'postHistory_' + account;
+    const REPOST_LOG_KEY = (account) => 'repostLog_' + account;
+    const TIMELINE_MAP_KEY = (account) => 'timelineMap_' + account;
+    const AUTO_DOWNLOAD_KEY = 'autoDownloadEnabled';
+    const MAX_DOWNLOADED_POSTS = 2000;
+
+    const EXTRA = {
+        de: { needFollowing: 'ℹ️ Bitte den Reiter „Folge ich“ wählen.' },
+        en: { needFollowing: 'ℹ️ Switch to the Following tab.' }
+    };
+
+    function userText(key, params = {}) {
+        const lang = getUserLanguage();
+        const extra = (EXTRA[lang] && EXTRA[lang][key]) || EXTRA.en[key];
+        if (extra) {
+            let message = extra;
+            Object.keys(params).forEach((param) => {
+                message = message.replace('{' + param + '}', params[param]);
+            });
+            return message;
+        }
+        return getTranslatedMessage(key, lang, params);
+    }
+
+    function showPopup(messageKey, duration = 5000, params = {}) {
+        const message = userText(messageKey, params);
+        const fadeDuration = 1000;
+        const localPopup = document.createElement('div');
+        Object.assign(localPopup.style, {
+            position: 'fixed',
+            top: '20px',
+            left: '50%',
+            transform: 'translateX(-50%)',
+            backgroundColor: 'rgba(0, 0, 0, 0.9)',
+            color: '#ffffff',
+            padding: '10px 20px',
+            borderRadius: '8px',
+            fontSize: '14px',
+            boxShadow: '0 0 10px rgba(246, 146, 25, 0.8)',
+            zIndex: '10000',
+            maxWidth: '500px',
+            whiteSpace: 'pre-wrap',
+            transition: 'opacity ' + (fadeDuration / 1000) + 's ease',
+            opacity: '1'
+        });
+        localPopup.textContent = message;
+        if (!document.body) return;
+        document.body.appendChild(localPopup);
+        setTimeout(() => {
+            localPopup.style.opacity = '0';
+            setTimeout(() => {
+                if (localPopup.parentNode) localPopup.parentNode.removeChild(localPopup);
+            }, fadeDuration + 200);
+        }, duration || 5000);
+    }
+
+    // ---------- reine Entscheidungen ----------
+
+    function tweetIdMs(tweetId) {
+        if (!tweetId) return null;
+        try {
+            return Number((BigInt(tweetId) >> 22n) + 1288834974657n);
+        } catch (e) {
+            return null;
+        }
+    }
+
+    function bookmarkTargetMs(bm) {
+        if (!bm || !bm.tweetId) return null;
+        if (bm.isRepost) {
+            const parsed = Date.parse(bm.readAt || bm.timestamp || '');
+            if (Number.isFinite(parsed)) return parsed;
+        }
+        const fromId = tweetIdMs(bm.tweetId);
+        if (fromId !== null) return fromId;
+        const parsed = Date.parse(bm.timestamp || '');
+        return Number.isFinite(parsed) ? parsed : null;
+    }
+
+    function postIsNear(post, bm) {
+        if (!post || !post.tweetId || !bm || !bm.tweetId) return false;
+        if (post.tweetId === bm.tweetId && !!post.isRepost === !!bm.isRepost) return true;
+        const target = bookmarkTargetMs(bm);
+        const fromId = tweetIdMs(post.tweetId);
+        const parsed = Date.parse(post.timestamp || '');
+        const candidate = fromId !== null ? fromId : (Number.isFinite(parsed) ? parsed : null);
+        if (target === null || candidate === null) return false;
+        if (candidate > target + NEWER_SLACK_MS) return false;
+        return target - candidate <= NEAR_MS;
+    }
+
+    function getComparisonTimestamp(postData) {
+        if (!postData) return null;
+        return postData.isRepost
+            ? (postData.readAt || postData.timestamp || null)
+            : (postData.timestamp || null);
+    }
+
+    function isCandidateNewer(candidate, current) {
+        if (!current || !current.tweetId) return true;
+        if (!candidate || !candidate.tweetId) return false;
+        const candText = String(candidate.tweetId);
+        const currText = String(current.tweetId);
+        if (!/^\d{1,25}$/.test(candText) || !/^\d{1,25}$/.test(currText)) return false;
+        let candId;
+        let currId;
+        try {
+            candId = BigInt(candText);
+            currId = BigInt(currText);
+        } catch (e) {
+            return false;
+        }
+        if (candId > currId) return true;
+        const candIsRep = !!candidate.isRepost;
+        const currIsRep = !!current.isRepost;
+        if (candIsRep === currIsRep) {
+            const candT = getComparisonTimestamp(candidate);
+            const currT = getComparisonTimestamp(current);
+            if (candT && currT) return new Date(candT).getTime() > new Date(currT).getTime();
+            return false;
+        }
+        if (candIsRep && !currIsRep) return true;
+        return false;
+    }
+
+    function normalizeHomeTabLabel(text) {
+        return (text || '').replace(/\s+/g, ' ').trim().toLowerCase();
+    }
+
+    const FOLLOWING_TAB_LABELS = new Set([
+        'folge ich', 'following', 'siguiendo', 'abonnements', 'seguindo', 'seguiti',
+        'フォロー中', 'подписки', '正在关注', '팔로잉', 'volgend', 'följer', 'følger'
+    ]);
+    const FOR_YOU_TAB_LABELS = new Set([
+        'für dich', 'for you', 'para ti', 'pour vous', 'para você', 'per te',
+        'おすすめ', 'для вас', '为你推荐', '추천', 'voor jou', 'för dig', 'til dig'
+    ]);
+
+    function tabKind(label) {
+        if (FOLLOWING_TAB_LABELS.has(label)) return 'following';
+        if (FOR_YOU_TAB_LABELS.has(label)) return 'for-you';
+        return '';
+    }
+
+    function medianNumber(values) {
+        if (!values.length) return null;
+        const sorted = values.slice().sort((a, b) => a - b);
+        return sorted[Math.floor(sorted.length / 2)];
+    }
+
+    function windowReachedBookmark(visibleOriginalTimes, bm) {
+        const target = bookmarkTargetMs(bm);
+        if (target === null) return false;
+        const median = medianNumber(visibleOriginalTimes);
+        if (median === null) return false;
+        return median <= target;
+    }
+
+    // ---------- Account ----------
 
     let cachedUserHandle = null;
 
@@ -645,9 +610,7 @@
     function rememberUserHandle(handle) {
         if (!isPlausibleUserHandle(handle)) return;
         cachedUserHandle = handle;
-        try {
-            localStorage.setItem('currentUserHandle', handle);
-        } catch (e) {}
+        try { localStorage.setItem('currentUserHandle', handle); } catch (e) { /* leer */ }
     }
 
     async function getCurrentUserHandle() {
@@ -663,9 +626,7 @@
                 cachedUserHandle = stored;
                 return stored;
             }
-        } catch (e) {}
-
-        // Nur beim allerersten Mal warten, wenn noch kein Handle bekannt ist.
+        } catch (e) { /* leer */ }
         return new Promise((resolve) => {
             let handle = null;
             const navContainer = document.querySelector("nav[role='navigation']") ||
@@ -683,455 +644,487 @@
             setTimeout(() => {
                 if (isPlausibleUserHandle(handle)) return;
                 observer.disconnect();
-                log('Init', 'Warning: Benutzerhandle konnte nicht ermittelt werden, Fallback auf: unknown');
+                log('Init', 'Benutzerhandle nicht ermittelt');
                 resolve('unknown');
             }, 3000);
         });
     }
 
-    const DEBUG = false;
+    // ---------- DOM der Beiträge ----------
 
-    // Hinweis (2026-05-30 nach Punkt 2): Alle direkten console.log / if(DEBUG) console.log wurden
-    // auf das zentrale log('Kategorie', ...) + debugLog('Kategorie', ...) System umgestellt.
-    // Repost-Logs sind bewusst auf DEBUG-only reduziert (kein Spam beim normalen Scrollen).
-    // Kategorien: Search, Fallback, Position, Save, Load, Restore, NewPosts, Repost, Init, UI, Highlight, Cache, Error
+    const repostCache = new WeakMap();
 
-    /**
-     * Logging Helpers (Vereinheitlicht - 30.05.2026)
-     * 
-     * log(category, ...args)     → Wird immer ausgegeben (wichtige User-Informationen)
-     * debugLog(category, ...args) → Nur bei DEBUG=true (detaillierte Entwickler-Infos)
-     */
-
-    function log(category, ...args) {
-        console.log(`[${category}]`, ...args);
-    }
-
-    function debugLog(category, ...args) {
-        if (DEBUG) {
-            console.log(`[${category}]`, ...args);
+    function detectRepost(postElement) {
+        const repostPathPattern = /M4\.75 3\.79l4\.603.*zm11\.5 2\.71H11V4h5\.25|repost-arrow|repost-icon/i;
+        const repostTextPattern = /\b(repost(?:ed|et)?|hat repostet|retweeté|retwittato|リポストしました|перепостил|republicou|إعادة نشر|repostado|리트윗|reposted by|repostet by|retweeted by)\b/i;
+        const socialContext = postElement.querySelector('span[data-testid="socialContext"]');
+        if (socialContext) {
+            if (repostTextPattern.test(socialContext.textContent || '')) return true;
+            const path = socialContext.querySelector('path');
+            if (path && repostPathPattern.test(path.getAttribute('d') || '')) return true;
         }
-    }
-
-    // ============================================================
-    // Diagnostic Logging — strukturierte Logs für Fehleranalyse (AI + User)
-    //
-    // Severity: info (console.log) | warn/anomaly (console.warn) | error (console.error)
-    // Codes: FLOW_*, BOOKMARK_*, RESTORE_*, SEARCH_*, GUARD_*
-    // Bei Problemen: nach [Diag:ERROR] oder [Diag:WARN] filtern, dann [Diag:SESSION]
-    // ============================================================
-
-    const DIAG = {
-        enabled: false,
-        flowCounter: 0,
-        activeFlow: null,
-        sessionAnomalies: [],
-        maxSessionAnomalies: 40,
-    };
-
-    function diagBookmark(bm) {
-        if (!bm?.tweetId) return null;
-        return {
-            id: String(bm.tweetId),
-            author: bm.authorHandler || '?',
-            repost: !!bm.isRepost,
-            label: `@${bm.authorHandler || '?'} ${bm.tweetId}${bm.isRepost ? ' (Repost)' : ''}`,
-        };
-    }
-
-    function diagSnapshot(extra = {}) {
-        return {
-            scrollY: Math.round(window.scrollY),
-            articles: document.querySelectorAll('article').length,
-            bookmark: diagBookmark(lastReadPost)?.label || '(keins)',
-            flags: {
-                manualSearch: searchControl.manualSearchActive,
-                newPostsRestore: searchControl.newPostsRestoreActive,
-                isSearching: searchControl.isSearching,
-                isFallback: searchControl.isFallbackSearching,
-            },
-            activeFlow: DIAG.activeFlow?.name || null,
-            flowId: DIAG.activeFlow?.id || null,
-            timelineMap: timelineMapOrderedKeys.length,
-            ...extra,
-        };
-    }
-
-    function diagPush(code, severity, message, context = {}) {
-        if (!DIAG.enabled) return;
-        const entry = {
-            code,
-            severity,
-            message,
-            flow: DIAG.activeFlow?.name || null,
-            flowId: DIAG.activeFlow?.id || null,
-            ...context,
-        };
-        if (severity !== 'info') {
-            DIAG.sessionAnomalies.push(entry);
-            if (DIAG.sessionAnomalies.length > DIAG.maxSessionAnomalies) {
-                DIAG.sessionAnomalies.shift();
-            }
+        const svgs = postElement.querySelectorAll('svg');
+        const limit = Math.min(svgs.length, 4);
+        for (let i = 0; i < limit; i++) {
+            const svg = svgs[i];
+            const rect = svg.getBoundingClientRect();
+            if (rect.height > SMALL_SVG_MAX || rect.width > SMALL_SVG_MAX) continue;
+            const path = svg.querySelector('path');
+            if (path && repostPathPattern.test(path.getAttribute('d') || '')) return true;
         }
-        const prefix = `[Diag:${severity.toUpperCase()}]`;
-        const line = { code, msg: message, ...context };
-        if (severity === 'error') {
-            console.error(prefix, line);
-        } else if (severity === 'warn' || severity === 'anomaly') {
-            console.warn(prefix, line);
-        } else {
-            console.log(prefix, line);
-        }
-    }
-
-    function diagBeginFlow(name, context = {}) {
-        DIAG.flowCounter += 1;
-        DIAG.activeFlow = { id: DIAG.flowCounter, name, started: Date.now() };
-        diagPush('FLOW_START', 'info', `▶ ${name} #${DIAG.flowCounter}`, {
-            snapshot: diagSnapshot(context),
-        });
-        return DIAG.flowCounter;
-    }
-
-    function diagEndFlow(outcome, code, message, context = {}) {
-        const flow = DIAG.activeFlow;
-        if (!flow) return;
-        const ms = Date.now() - flow.started;
-        const severity = outcome === 'ok' ? 'info' : outcome === 'warn' ? 'warn' : 'error';
-        const icon = outcome === 'ok' ? '✓' : outcome === 'warn' ? '⚠' : '✗';
-        diagPush(code, severity, `${icon} ${flow.name} #${flow.id} (${ms}ms): ${message}`, {
-            snapshot: diagSnapshot(context),
-            durationMs: ms,
-        });
-        if (severity !== 'info') {
-            const recent = DIAG.sessionAnomalies
-                .filter(a => a.severity === 'warn' || a.severity === 'error' || a.severity === 'anomaly')
-                .slice(-6)
-                .map(a => `${a.code}: ${a.message}`);
-            if (recent.length > 0) {
-                console.warn('[Diag:SESSION] Letzte Anomalien:', recent);
-            }
-        }
-        DIAG.activeFlow = null;
-    }
-
-    function diagBlocked(code, message, extra = {}) {
-        diagPush(code, 'warn', `BLOCKED — ${message}`, { snapshot: diagSnapshot(extra) });
-    }
-
-    function diagVerifyLanding(expectedBookmark, resolved, source) {
-        if (!expectedBookmark?.tweetId || !resolved?.post?.tweetId) return true;
-        const idMatch = String(expectedBookmark.tweetId) === String(resolved.post.tweetId);
-        const authorMatch = expectedBookmark.authorHandler === resolved.post.authorHandler;
-        const repostMatch = !!expectedBookmark.isRepost === !!resolved.post.isRepost;
-        if (idMatch && authorMatch && repostMatch) {
-            diagPush('LANDING_OK', 'info', `Landing korrekt (${source})`, {
-                expected: diagBookmark(expectedBookmark),
-                strategy: resolved.strategy,
-                confidence: resolved.confidence,
-            });
-            return true;
-        }
-        diagPush('RESTORE_TARGET_MISMATCH', 'error',
-            `Landing auf falschem Post (${source}) — erwartet vs. tatsächlich`, {
-                expected: diagBookmark(expectedBookmark),
-                actual: diagBookmark(resolved.post),
-                strategy: resolved.strategy,
-                confidence: resolved.confidence,
-                idMatch,
-                authorMatch,
-                repostMatch,
-                snapshot: diagSnapshot(),
-            });
         return false;
     }
 
-    // ============================================================
-    // Globale State-Variablen (Punkt 4 - gruppiert mit kleinen Objekten)
-    //
-    // Vorteil: Logisch zusammengehörige Variablen sind jetzt gebündelt.
-    // Kein monolithisches "state"-Objekt (wurde bewusst vermieden).
-    //
-    // Übersicht:
-    //   scrollState         → Alles rund um Scrollen + Suchphasen
-    //   searchControl       → Steuerflags für Suche (isSearching etc.)
-    //   suppressionState    → Grace-Timer nach Restore/New Posts (Punkt 3)
-    //   lastReadPost        → Die eigentliche Leseposition (bleibt top-level)
-    //   lastHighlightedPost → Für den glühenden Rand
-    //   isScriptActivated   → Ob das Skript aktiv ist (Buttons etc.)
-    //   downloadedPosts / postCache → Persistenz & Cache
-    // ============================================================
+    function getPostTweetId(post) {
+        if (!post) return null;
+        const linkElement = post.querySelector("a[role='link'][href*='/status/']");
+        if (!linkElement) return null;
+        const href = linkElement.getAttribute('href') || '';
+        const match = href.match(/\/status\/(\d+)/);
+        return match ? match[1] : null;
+    }
 
-    // === Scroll & Search State ===
-    const scrollState = {
-        isSlowScrollMode: false,
-        searchDirection: 'down',
-        stagnantScrollCount: 0,
-        lastScrollHeight: 0,
-        totalLoadedPosts: 0,
+    function isRepost(postElement) {
+        if (!postElement) return false;
+        const tweetId = getPostTweetId(postElement) || '';
+        const cached = repostCache.get(postElement);
+        if (cached && cached.tweetId === tweetId && (cached.isRepost || Date.now() - cached.negativeAt < 1500)) {
+            return cached.isRepost;
+        }
+        const result = detectRepost(postElement);
+        repostCache.set(postElement, {
+            tweetId,
+            isRepost: result,
+            negativeAt: result ? 0 : Date.now()
+        });
+        return result;
+    }
 
-        // Neue Regel (User-Wunsch): Reposts dürfen nur als Lesestelle gespeichert werden,
-        // wenn der User vorher aktiv nach oben gescrollt hat.
-        hasScrolledUp: false,
-        lastScrollUpPromoteAt: 0,
-        lastUpScrollAt: 0,
-        upScrollPeakY: null,
-        scrollUpMaxTweetId: null,
-        programmaticScrollEndedAt: 0,
-        lastMapScrollY: 0,
-        lastMapScrollDirection: 'neutral',
-        mapSnapshotAtSearchStart: null,
-        mapSnapshotOrderedKeys: null,
-        mapSnapshotTweetIdToIdx: null,
-        mapSnapshotBookmarkKey: null,
-        mapSnapshotBookmarkIdx: -1,
-        searchCoarseDirection: null,
-        slowScrollLockedDirection: null,
-        slowScrollFineAttempts: 0,
-        searchIndexHitNudged: false,
-        windowTooYoungLogged: false,
-        lastSearchScrollDirection: null,
-        searchBounceCount: 0,
-        directionFlipStreak: 0,
-        settleOscillated: false,
-        scrollLoopStopped: false,
-        recentStepDeltas: [],
-        unloadedJumpCount: 0,
-        unloadedWaitLogged: false,
-    };
+    function getReposterHandler(postElement) {
+        if (!postElement) return null;
+        const socialContext = postElement.querySelector('span[data-testid="socialContext"]');
+        const links = socialContext
+            ? socialContext.querySelectorAll('a[role="link"][href^="/"]:not([href*="/status/"])')
+            : [];
+        for (const link of links) {
+            const href = link.getAttribute('href') || '';
+            const match = href.match(/^\/([^/?#]+)/);
+            if (match && isPlausibleUserHandle(match[1])) return match[1];
+        }
+        return null;
+    }
 
-    // === Search Control Flags ===
-    const searchControl = {
-        isSearching: false,
-        isFallbackSearching: false,
-        isSearchCancelled: false,
-        isAutoScrolling: false,
-        manualSearchActive: false,
-        newPostsRestoreActive: false,
-        lastManualSearchEndedAt: 0,
-    };
+    function getPostAuthorHandler(post) {
+        if (!post) return null;
+        const repostFlag = isRepost(post);
+        let handlerElement = null;
+        if (repostFlag) {
+            const innerArticle = post.querySelector('article');
+            if (innerArticle) {
+                handlerElement = innerArticle.querySelector("a[role='link'][href^='/']:not([href*='/status/'])");
+            }
+            if (!handlerElement) {
+                const socialContext = post.querySelector('span[data-testid="socialContext"]');
+                const allLinks = Array.from(post.querySelectorAll("a[role='link'][href^='/']:not([href*='/status/'])"));
+                handlerElement = allLinks.find((link) => !socialContext || !socialContext.contains(link)) || null;
+            }
+        } else {
+            handlerElement = post.querySelector("a[role='link'][href*='/']:not([href*='/status/'])");
+        }
+        if (!handlerElement) return null;
+        const href = handlerElement.getAttribute('href') || '';
+        const match = href.match(/^\/([^/?#]+)/);
+        if (!match) return null;
+        const handle = match[1];
+        if (!handle || ['i', 'home', 'explore', 'messages', 'notifications'].includes(handle)) return null;
+        return /^[a-zA-Z0-9_]{1,15}$/.test(handle) ? handle : null;
+    }
 
-    const newPostsState = {
-        autoLoadPaused: false,
-        lastPausedLogAt: 0,
-        lastLesestelleLogKey: null,
-        lastRestoreCompletedAt: 0,
-        restoreGraceUntil: 0,
-        hiddenAt: 0,
-        lastSleepMs: 0,
-        lastWakeAt: 0,
-        wakeGeneration: 0,
-        wakeSearchStarted: false,
-        wakeClickArmedAt: 0,
-        hiddenBaselineKeys: null,
-        hiddenBookmark: null,
-        hiddenNearTop: false,
-        restoreStartedAt: 0,
-        suppressTopMarkUntil: 0,
-    };
+    function getPostTimestamp(post) {
+        if (!post) return null;
+        const timeElement = post.querySelector('time[datetime]');
+        return timeElement ? timeElement.getAttribute('datetime') : null;
+    }
 
-    /** Laufendes Warten auf neue Posts. Hintergrund-Tabs verwerfen dessen Timer. */
-    let activeNewPostsWait = null;
-
-    function snapshotReadingBookmark(bookmark = lastReadPost) {
-        if (!bookmark?.tweetId || !bookmark?.authorHandler || !bookmark?.timestamp) {
-            return null;
+    function readArticle(postElement) {
+        if (!postElement) return null;
+        const tweetId = getPostTweetId(postElement);
+        const authorHandler = getPostAuthorHandler(postElement);
+        if (!tweetId || !authorHandler) return null;
+        const repostFlag = isRepost(postElement);
+        let timestamp = getPostTimestamp(postElement);
+        if (!timestamp) {
+            const ms = tweetIdMs(tweetId);
+            if (ms) timestamp = new Date(ms).toISOString();
         }
         return {
-            tweetId: bookmark.tweetId,
-            authorHandler: bookmark.authorHandler,
-            timestamp: bookmark.timestamp,
-            isRepost: !!bookmark.isRepost,
-            readAt: bookmark.readAt || bookmark.timestamp,
-            account: bookmark.account,
-            context: bookmark.context
+            element: postElement,
+            tweetId,
+            authorHandler,
+            timestamp,
+            isRepost: repostFlag,
+            readAt: repostFlag ? new Date().toISOString() : (timestamp || null)
         };
     }
 
-    function beginManualSearchSession() {
-        searchControl.manualSearchActive = true;
-        searchControl.isSearching = true;
-        searchControl.isSearchCancelled = false;
-        scrollState.searchBounceCount = 0;
-        scrollState.directionFlipStreak = 0;
-        scrollState.settleOscillated = false;
-        scrollState.scrollLoopStopped = false;
-        scrollState.recentStepDeltas = [];
-        scrollState.unloadedJumpCount = 0;
-        scrollState.unloadedWaitLogged = false;
-        holdScrollAnchor();
+    function feedArticles() {
+        const column = document.querySelector("[data-testid='primaryColumn']") || document;
+        return Array.from(column.querySelectorAll("article[data-testid='tweet']"));
     }
 
-    function endManualSearchSession(clearSearching = true) {
-        searchControl.manualSearchActive = false;
-        searchControl.lastManualSearchEndedAt = Date.now();
-        searchControl.isSearchCancelled = false;
-        if (clearSearching) {
-            searchControl.isSearching = false;
+    function findArticle(bm) {
+        if (!bm || !bm.tweetId) return null;
+        return feedArticles().find((post) => {
+            if (getPostTweetId(post) !== bm.tweetId) return false;
+            if (bm.authorHandler && getPostAuthorHandler(post) !== bm.authorHandler) return false;
+            if (!!isRepost(post) !== !!bm.isRepost) return false;
+            return true;
+        }) || null;
+    }
+
+    function visibleParsed() {
+        const vh = window.innerHeight || 800;
+        const list = [];
+        for (const post of feedArticles()) {
+            const rect = post.getBoundingClientRect();
+            if (rect.height < 5 || rect.bottom <= 0 || rect.top >= vh) continue;
+            const parsed = readArticle(post);
+            if (!parsed) continue;
+            parsed.top = rect.top;
+            list.push(parsed);
         }
-        noteProgrammaticScrollEnded();
-        releaseScrollAnchor();
-        flushDeferredTimelineMapUpdate('search-end');
+        list.sort((a, b) => a.top - b.top);
+        return list;
     }
 
-    // X schiebt die Scrollposition nach, wenn darüber Zellen kommen oder gehen.
-    // Zusammen mit unserem Sprung wird daraus ein Hin-und-her von etwa einer
-    // Scrollbalkenbreite. Während der Suche bleibt das Ankern aus.
-    function holdScrollAnchor() {
-        const root = document.documentElement;
-        scrollAnchorToken++;
-        if (!root || root.dataset.xtsAnchorHeld === '1') return;
-        root.dataset.xtsAnchorHeld = '1';
-        root.dataset.xtsAnchorPrev = root.style.overflowAnchor || '';
-        root.style.overflowAnchor = 'none';
+    function topReadingPost() {
+        const vh = window.innerHeight || 800;
+        let best = null;
+        let bestTop = Infinity;
+        let line = null;
+        for (const post of feedArticles()) {
+            const rect = post.getBoundingClientRect();
+            if (rect.height < 5 || rect.bottom <= 40 || rect.top >= vh) continue;
+            const top = Math.max(rect.top, 0);
+            if (top < bestTop) {
+                bestTop = top;
+                best = post;
+            }
+            if (!line && rect.top <= READING_LINE_PX && rect.bottom >= READING_LINE_PX) line = post;
+        }
+        const chosen = line || best;
+        return chosen ? readArticle(chosen) : null;
     }
 
-    let scrollAnchorToken = 0;
+    function visibleOriginalTimes() {
+        const times = [];
+        for (const post of visibleParsed()) {
+            if (post.isRepost) continue;
+            const ms = tweetIdMs(post.tweetId);
+            if (ms !== null) times.push(ms);
+        }
+        return times;
+    }
 
-    function releaseScrollAnchor() {
-        const root = document.documentElement;
-        if (!root || root.dataset.xtsAnchorHeld !== '1') return;
-        const token = scrollAnchorToken;
-        const apply = () => {
-            if (token !== scrollAnchorToken) return;
-            if (root.dataset.xtsAnchorHeld !== '1') return;
-            root.style.overflowAnchor = root.dataset.xtsAnchorPrev || '';
-            delete root.dataset.xtsAnchorHeld;
-            delete root.dataset.xtsAnchorPrev;
-        };
-        // Nach einer Schleife noch kurz aus lassen. Sonst nimmt X das Pendeln
-        // wieder auf, sobald das Ankern zurückkommt.
-        if (scrollState.scrollLoopStopped) {
-            setTimeout(apply, 1600);
+    // ---------- Scroll ----------
+
+    function isWindowScroller(node) {
+        return !node || node === document.scrollingElement || node === document.documentElement || node === document.body;
+    }
+
+    function feedScroller() {
+        if (activeScroller && activeScroller.isConnected) return activeScroller;
+        let node = document.querySelector('[data-testid="primaryColumn"]');
+        let guard = 0;
+        while (node && node !== document.body && guard < 14) {
+            let overflow = '';
+            try { overflow = getComputedStyle(node).overflowY; } catch (e) { overflow = ''; }
+            const scrolls = overflow === 'auto' || overflow === 'scroll' || overflow === 'overlay';
+            if (scrolls && node.scrollHeight > node.clientHeight + 80) return node;
+            node = node.parentElement;
+            guard += 1;
+        }
+        return document.scrollingElement || document.documentElement;
+    }
+
+    function scrollOffset() {
+        const scroller = feedScroller();
+        if (isWindowScroller(scroller)) return window.scrollY || document.documentElement.scrollTop || 0;
+        return scroller.scrollTop || 0;
+    }
+
+    function atTop() {
+        return scrollOffset() <= AT_TOP_PX;
+    }
+
+    function nearTop() {
+        return scrollOffset() <= NEAR_TOP_PX;
+    }
+
+    function scrollByDelta(dy) {
+        if (!dy) return;
+        programmaticUntil = Date.now() + 1500;
+        const scroller = feedScroller();
+        if (isWindowScroller(scroller)) window.scrollBy(0, dy);
+        else scroller.scrollTop += dy;
+    }
+
+    function nudgeToward(el) {
+        if (!el || !el.isConnected) return 'blocked';
+        const rect = el.getBoundingClientRect();
+        if (rect.height < 5) return 'blocked';
+        const delta = rect.top - READING_LINE_PX;
+        if (Math.abs(delta) <= ALIGN_TOLERANCE_PX) return 'aligned';
+        const vh = window.innerHeight || 800;
+        const cap = Math.max(FINE_STEP_PX, Math.round(vh * SEARCH_JUMP_VH));
+        const step = Math.max(-cap, Math.min(cap, delta));
+        const here = scrollOffset();
+        if (here > vh && here + step <= AT_TOP_PX) return 'blocked';
+        scrollByDelta(step);
+        return 'moved';
+    }
+
+    function holdAnchor() {
+        const root = document.scrollingElement || document.documentElement;
+        if (root) root.style.setProperty('overflow-anchor', 'none', 'important');
+    }
+
+    function releaseAnchor() {
+        const root = document.scrollingElement || document.documentElement;
+        if (!root) return;
+        setTimeout(() => root.style.removeProperty('overflow-anchor'), 1600);
+    }
+
+    function sleep(ms) {
+        return new Promise((resolve) => setTimeout(resolve, ms));
+    }
+
+    function visibleSignature() {
+        return visibleParsed().map((post) => post.tweetId + (post.isRepost ? 'r' : '')).join(',');
+    }
+
+    // baseline leer: ab jetzt auf eine Änderung warten.
+    // Mit baseline: die Änderung darf schon passiert sein, dann sofort weiter.
+    async function waitForFeedChange(ms, baseline) {
+        const start = baseline === undefined ? visibleSignature() : baseline;
+        const t0 = Date.now();
+        while (Date.now() - t0 < ms) {
+            if (visibleSignature() !== start) return true;
+            await sleep(80);
+        }
+        return false;
+    }
+
+    // ---------- Zustand ----------
+
+    let bookmark = null;
+    let phase = 'idle';
+    let generation = 0;
+    let seekCancel = false;
+    let programmaticUntil = 0;
+    let blockTopMarkUntil = 0;
+    let lastScrollY = 0;
+    let activeScroller = null;
+    let pillWatchUntil = 0;
+    let pillSeenAtWatchStart = false;
+    let pillClicks = 0;
+    let pillClickLabel = '';
+    let pillClickedAt = 0;
+    let followingTab = null;
+    let followingArmAt = 0;
+    let autoDownloadEnabled = false;
+    let downloadedPosts = new Set();
+    let highlighted = null;
+    let columnObserver = null;
+    let observedColumn = null;
+    let listenersBound = false;
+    let bootedAccount = null;
+    let hiddenAt = 0;
+    let mapAccount = null;
+    let orderedKeys = [];
+    const mapEntries = new Map();
+    let mapSaveTimer = null;
+
+    function onHome() {
+        return window.location.pathname.startsWith('/home');
+    }
+
+    // null heißt: Reiter noch unklar. Dann weiterlesen. Nur ein erkanntes „Für dich“ hält an.
+    function readingOn() {
+        return onHome() && followingTab !== false;
+    }
+
+    function cancelFlow() {
+        generation += 1;
+        seekCancel = true;
+        if (phase !== 'idle') phase = 'idle';
+    }
+
+    function samePost(a, b) {
+        return !!a && !!b &&
+            a.tweetId === b.tweetId &&
+            a.authorHandler === b.authorHandler &&
+            !!a.isRepost === !!b.isRepost;
+    }
+
+    // ---------- Landkarte, nur Gedächtnis und Export ----------
+
+    function mapKeyOf(post) {
+        return post.tweetId + '-' + !!post.isRepost;
+    }
+
+    function rememberMap(post) {
+        if (!post || !post.tweetId || followingTab === false) return;
+        const key = mapKeyOf(post);
+        const existing = mapEntries.get(key);
+        if (existing) {
+            existing.lastSeenAt = new Date().toISOString();
+            if (post.authorHandler) existing.authorHandler = post.authorHandler;
+            if (post.timestamp) existing.timestamp = post.timestamp;
+        } else {
+            mapEntries.set(key, {
+                key,
+                tweetId: post.tweetId,
+                isRepost: !!post.isRepost,
+                authorHandler: post.authorHandler || null,
+                timestamp: post.timestamp || null,
+                lastSeenAt: new Date().toISOString()
+            });
+        }
+        if (!orderedKeys.includes(key)) orderedKeys.unshift(key);
+        if (orderedKeys.length > MAP_MAX) {
+            const dropped = orderedKeys.splice(MAP_MAX);
+            for (const oldKey of dropped) mapEntries.delete(oldKey);
+        }
+        scheduleMapSave();
+    }
+
+    function ingestDomOrder() {
+        if (!readingOn()) return;
+        const parsed = feedArticles().map(readArticle).filter(Boolean);
+        parsed.sort((a, b) => a.element.getBoundingClientRect().top - b.element.getBoundingClientRect().top);
+        if (!parsed.length) return;
+        const keys = [];
+        for (const post of parsed) {
+            const key = mapKeyOf(post);
+            if (!mapEntries.has(key)) {
+                mapEntries.set(key, {
+                    key,
+                    tweetId: post.tweetId,
+                    isRepost: !!post.isRepost,
+                    authorHandler: post.authorHandler,
+                    timestamp: post.timestamp || null,
+                    lastSeenAt: new Date().toISOString()
+                });
+            } else {
+                mapEntries.get(key).lastSeenAt = new Date().toISOString();
+            }
+            if (!keys.includes(key)) keys.push(key);
+        }
+        if (!orderedKeys.length) {
+            orderedKeys = keys.slice(0, MAP_MAX);
+            scheduleMapSave();
             return;
         }
-        apply();
-    }
-
-    function isPostLupeProtectionActive() {
-        return suppressionState.blockNewerAdoptionUntil > Date.now() ||
-            (searchControl.lastManualSearchEndedAt > 0 &&
-                Date.now() - searchControl.lastManualSearchEndedAt < CONFIG.POST_LUPE_NEWER_BLOCK_MS);
-    }
-
-    // === Suppression / Restore Protection (Punkt 3) ===
-    const suppressionState = {
-        until: 0,
-        pastTweetId: null,
-        blockNewerAdoptionUntil: 0,
-    };
-
-    // === Core Position & Highlight ===
-    let lastReadPost = null;
-    let lastHighlightedPost = null;
-    let highlightRetryGeneration = 0;
-    let manualScrollGeneration = 0;
-
-    function invalidateHighlightRetries() {
-        highlightRetryGeneration++;
-    }
-
-    function noteProgrammaticScrollEnded() {
-        scrollState.programmaticScrollEndedAt = Date.now();
-        lastScrollY = window.scrollY;
-        scrollState.lastMapScrollY = window.scrollY;
-    }
-
-    function programmaticScrollEchoActive() {
-        if (searchControl.isAutoScrolling || searchControl.isSearching || searchControl.isFallbackSearching) {
-            return true;
-        }
-        const ended = scrollState.programmaticScrollEndedAt || 0;
-        if (!ended) return false;
-        return Date.now() - ended < CONFIG.DEBOUNCE_SCROLL_MS + 50;
-    }
-
-    // Manuelles Weiterrollen beendet die Sperre der gefundenen Lesestelle.
-    // Sonst schreibt ein Nachlauf die alte Stelle zurück und neue Stellen kommen erst Sekunden später.
-    function noteManualScrollMovedReading() {
-        manualScrollGeneration++;
-        invalidateHighlightRetries();
-        newPostsState.restoreGraceUntil = 0;
-        suppressionState.until = 0;
-        suppressionState.pastTweetId = null;
-    }
-
-    function isScrollAnchorStale(anchorTweetId, anchorAuthor = null, anchorRepost = null) {
-        if (!lastReadPost?.tweetId || !anchorTweetId) return false;
-        if (anchorTweetId !== lastReadPost.tweetId) return true;
-        if (anchorAuthor && lastReadPost.authorHandler && anchorAuthor !== lastReadPost.authorHandler) {
-            return true;
-        }
-        if (anchorRepost !== null && anchorRepost !== undefined && !!lastReadPost.isRepost !== !!anchorRepost) {
-            return true;
-        }
-        return false;
-    }
-
-    function syncHighlightIfDrifted() {
-        if (!lastReadPost?.tweetId || !lastReadPost.authorHandler) return;
-        const expected = findPostElementInDOM(lastReadPost.tweetId, lastReadPost.authorHandler, !!lastReadPost.isRepost);
-        if (!expected || lastHighlightedPost === expected) return;
-        updateHighlightedPost();
-    }
-
-    // === UI / Activation Control ===
-    let isScriptActivated = false;
-    let popup = null;
-
-    function dismissActionPopup() {
-        if (popup && popup.parentNode) {
-            popup.parentNode.removeChild(popup);
-        }
-        popup = null;
-    }
-
-    function showActionPopup(messageKey, params = {}) {
-        const lang = getUserLanguage();
-        const message = getTranslatedMessage(messageKey, lang, params);
-
-        if (!popup) {
-            popup = document.createElement('div');
-            Object.assign(popup.style, {
-                position: 'fixed',
-                top: '20px',
-                left: '50%',
-                transform: 'translateX(-50%)',
-                backgroundColor: 'rgba(0, 0, 0, 0.9)',
-                color: '#ffffff',
-                padding: '10px 20px',
-                borderRadius: '8px',
-                fontSize: '14px',
-                boxShadow: '0 0 10px rgba(246, 146, 25, 0.8)',
-                zIndex: '10000',
-                maxWidth: '500px',
-                whiteSpace: 'pre-wrap',
-                transition: 'opacity 0.3s ease',
-                opacity: '0'
-            });
-            if (document.body) {
-                document.body.appendChild(popup);
-                setTimeout(() => { if (popup) popup.style.opacity = '1'; }, 50);
+        const anchorIndex = keys.findIndex((key) => orderedKeys.includes(key));
+        if (anchorIndex < 0) {
+            const head = mapEntries.get(orderedKeys[0]);
+            const headId = head ? tweetIdMs(head.tweetId) : null;
+            const firstId = tweetIdMs(parsed[0].tweetId);
+            if (headId !== null && firstId !== null && firstId > headId) {
+                orderedKeys = keys.concat(orderedKeys);
+            } else {
+                orderedKeys = orderedKeys.concat(keys);
             }
+        } else {
+            const anchor = keys[anchorIndex];
+            const at = orderedKeys.indexOf(anchor);
+            const before = keys.slice(0, anchorIndex).filter((key) => !orderedKeys.includes(key));
+            const after = keys.slice(anchorIndex + 1).filter((key) => !orderedKeys.includes(key));
+            orderedKeys.splice(at, 0, ...before);
+            const at2 = orderedKeys.indexOf(anchor);
+            orderedKeys.splice(at2 + 1, 0, ...after);
         }
-
-        if (popup) {
-            popup.textContent = message;
+        const seen = new Set();
+        orderedKeys = orderedKeys.filter((key) => {
+            if (seen.has(key) || !mapEntries.has(key)) return false;
+            seen.add(key);
+            return true;
+        }).slice(0, MAP_MAX);
+        for (const key of Array.from(mapEntries.keys())) {
+            if (!seen.has(key)) mapEntries.delete(key);
         }
-        return popup;
+        scheduleMapSave();
     }
 
-    function updateActionPopup(messageKey, params = {}) {
-        return showActionPopup(messageKey, params);
+    function scheduleMapSave() {
+        if (mapSaveTimer) return;
+        mapSaveTimer = setTimeout(() => {
+            mapSaveTimer = null;
+            persistMap();
+        }, 1200);
     }
-    let pendingNewPosts = 0;
 
-    // === Data & Cache ===
-    const MAX_DOWNLOADED_POSTS = 2000;
+    function persistMap() {
+        if (!mapAccount || !isPlausibleUserHandle(mapAccount)) return;
+        const entries = {};
+        for (const key of orderedKeys) {
+            const entry = mapEntries.get(key);
+            if (entry) entries[key] = entry;
+        }
+        try {
+            GM_setValue(TIMELINE_MAP_KEY(mapAccount), JSON.stringify({
+                orderedKeys: orderedKeys.slice(),
+                entries,
+                savedAt: new Date().toISOString()
+            }));
+        } catch (e) {
+            log('Map', 'Speichern fehlgeschlagen', e);
+        }
+    }
+
+    function applyMapObject(raw) {
+        orderedKeys = [];
+        mapEntries.clear();
+        if (!raw || !Array.isArray(raw.orderedKeys) || !raw.entries) return;
+        for (const key of raw.orderedKeys) {
+            if (orderedKeys.length >= MAP_MAX) break;
+            const source = raw.entries[key];
+            if (!source || typeof source !== 'object') continue;
+            const tweetId = sanitizeImportedTweetId(source.tweetId);
+            if (!tweetId) continue;
+            const isRepostFlag = source.isRepost === true;
+            const expected = tweetId + '-' + isRepostFlag;
+            if (key !== expected || mapEntries.has(expected)) continue;
+            const clean = {
+                key: expected,
+                tweetId,
+                isRepost: isRepostFlag,
+                lastSeenAt: source.lastSeenAt || new Date().toISOString()
+            };
+            if (source.authorHandler) clean.authorHandler = source.authorHandler;
+            if (source.timestamp) clean.timestamp = source.timestamp;
+            mapEntries.set(expected, clean);
+            orderedKeys.push(expected);
+        }
+    }
+
+    function loadMap(account) {
+        mapAccount = account;
+        try {
+            const raw = GM_getValue(TIMELINE_MAP_KEY(account), null);
+            if (!raw) return;
+            applyMapObject(typeof raw === 'string' ? JSON.parse(raw) : raw);
+        } catch (e) {
+            log('Map', 'Laden fehlgeschlagen', e);
+        }
+    }
+
+    // ---------- Speichern ----------
 
     function capDownloadedPostList(list) {
-        const arr = Array.isArray(list) ? list : [];
         const kept = [];
+        const arr = Array.isArray(list) ? list : [];
         for (const item of arr) {
             if (typeof item !== 'string' || !item || item.length > 80) continue;
             kept.push(item);
@@ -1139,156 +1132,754 @@
         return kept.slice(-MAX_DOWNLOADED_POSTS);
     }
 
-    let downloadedPosts = new Set(capDownloadedPostList(GM_getValue('downloadedPosts', [])));
-    let postCache = new Map();
-
-    // Cache für History (wird bei Saves aktualisiert für schnellen Abgleich)
-    let postHistoryCache = [];
-
-    // Timeline-Landkarte: Feed-Reihenfolge (oben→unten), fortlaufend aktualisiert
-    let timelineMapOrderedKeys = [];
-    const timelineMapByKey = new Map();
-    const timelineMapIndexByKey = new Map();
-    let timelineMapAccount = null;
-    let timelineMapLastPersist = 0;
-    let timelineMapUpdateTimer = null;
-    let timelineMapPendingSource = 'unknown';
-    let mapMutationTimer = null;
-    const mapMutationArticles = new Set();
-    const mapMutationRemoved = [];
-
-    // Schnelles Gedächtnis: Alle bereits markierten Positionen (tweetId + Repost-Flag)
-    // Wird aus der History befüllt. Ein Post/RePost wird nur dann als neue Lesestelle übernommen,
-    // wenn er noch NICHT in diesem Set ist.
-    const knownMarkedKeys = new Set();
-
-    // Ende der gruppierten State-Definition (Punkt 4)
-
-    function updatePostCache(visiblePosts) {
-
-    if (!Array.isArray(visiblePosts)) {
-        log('Cache', 'visiblePosts ist kein Array (war:', visiblePosts, ') → überspringe');
-        return [];
-    }
-
-    visiblePosts.forEach(postData => {
-        if (postData && postData.element) {
-            const repostFlag = isRepost(postData.element);
-            postData.isRepost = repostFlag;
-
-            if (!postData.timestamp) postData.timestamp = getPostTimestamp(postData.element);
-            if (!postData.authorHandler) postData.authorHandler = getPostAuthorHandler(postData.element);
-        }
-    });
-
-    debugLog('Cache', `Post-Cache aktualisiert mit ${visiblePosts.length} Posts`);
-    return visiblePosts;
-}
-
     function saveDownloadedPosts() {
         const capped = capDownloadedPostList(Array.from(downloadedPosts));
         downloadedPosts = new Set(capped);
         GM_setValue('downloadedPosts', capped);
     }
 
-    const STORAGE_KEY = (account) => `lastReadPost_${account}`;
-    const AUTO_DOWNLOAD_KEY = 'autoDownloadEnabled';
-    let autoDownloadEnabled = GM_getValue(AUTO_DOWNLOAD_KEY, false);
-
-    async function saveLastReadPost(postData, options = {}) {
-    const { force = false } = options;
-    if (!postData || !postData.tweetId) {
-        log('Save', 'Ungültige Daten – Speichern abgebrochen', postData);
-        return;
+    function addRepostToLog(post, account) {
+        if (!post || !post.isRepost) return;
+        const reposter = post.element ? getReposterHandler(post.element) : null;
+        if (!reposter || !post.authorHandler) return;
+        const key = REPOST_LOG_KEY(account);
+        let entries = GM_getValue(key, []);
+        if (!Array.isArray(entries)) entries = [];
+        const now = new Date().toISOString();
+        const duplicate = entries.some((entry) =>
+            entry.reposter === reposter &&
+            entry.originalAuthor === post.authorHandler &&
+            Math.abs(new Date(entry.repostDate || 0).getTime() - Date.now()) < 24 * 60 * 60 * 1000
+        );
+        if (duplicate) return;
+        entries.push({
+            reposter,
+            originalAuthor: post.authorHandler,
+            repostDate: post.timestamp || now,
+            discoveredAt: now
+        });
+        if (entries.length > REPOST_LOG_MAX) entries = entries.slice(-REPOST_LOG_MAX);
+        GM_setValue(key, entries);
     }
 
-    const freshAccount = readUserHandleFromNav();
-    if (!isPlausibleUserHandle(freshAccount)) {
-        log('Save', 'Kein frischer Account — Speichern abgebrochen');
-        return;
-    }
-    if (isPlausibleUserHandle(postData.account) && postData.account !== freshAccount) {
-        log('Save', `Account @${postData.account} ≠ @${freshAccount} — fremde Position nicht überschrieben`);
-        return;
-    }
-    postData.account = freshAccount;
-
-    const storageKey = STORAGE_KEY(freshAccount);
-
-    const currentDataStr = GM_getValue(storageKey, null);
-    if (!force && currentDataStr) {
+    async function saveBookmark(record, force) {
+        const freshAccount = readUserHandleFromNav();
+        if (!isPlausibleUserHandle(freshAccount)) {
+            log('Save', 'Kein frischer Account — Speichern abgebrochen');
+            return false;
+        }
+        record.account = freshAccount;
+        mapAccount = freshAccount;
+        if (!force) {
+            try {
+                const currentRaw = GM_getValue(STORAGE_KEY(freshAccount), null);
+                if (currentRaw) {
+                    const current = JSON.parse(currentRaw);
+                    if (current && current.tweetId && !isCandidateNewer(record, current) && !samePost(record, current)) {
+                        return false;
+                    }
+                }
+            } catch (e) { /* überschreiben */ }
+        }
         try {
-            const current = JSON.parse(currentDataStr);
-            if (current && current.tweetId) {
-                // Verwende die gleiche typ-getrennte "isNewer" Logik wie beim Live-Update
-                if (!isCandidateNewer(postData, current)) {
-                    debugLog('Save', `Ältere/gleiche Position (${postData.tweetId}) – übersprungen`);
+            GM_setValue(STORAGE_KEY(freshAccount), JSON.stringify(record));
+            const historyKey = HISTORY_KEY(freshAccount);
+            let history = GM_getValue(historyKey, []);
+            if (!Array.isArray(history)) history = [];
+            history.push(Object.assign({ savedAt: new Date().toISOString() }, record));
+            if (history.length > HISTORY_MAX) history = history.slice(-HISTORY_MAX);
+            GM_setValue(historyKey, history);
+            rememberMap(record);
+            return true;
+        } catch (err) {
+            log('Save', 'Fehler beim Speichern', err);
+            showPopup('saveError', 6000);
+            return false;
+        }
+    }
+
+    async function adopt(post, force) {
+        if (!post || !post.tweetId || !post.authorHandler || !post.timestamp) return false;
+        const account = readUserHandleFromNav();
+        if (!isPlausibleUserHandle(account)) return false;
+        const record = {
+            tweetId: post.tweetId,
+            authorHandler: post.authorHandler,
+            timestamp: post.timestamp,
+            isRepost: !!post.isRepost,
+            readAt: post.isRepost ? (post.readAt || new Date().toISOString()) : post.timestamp,
+            account
+        };
+        if (!force && bookmark && samePost(record, bookmark)) {
+            if (post.element) highlight(post.element);
+            return true;
+        }
+        if (!force && bookmark && !isCandidateNewer(record, bookmark)) return false;
+        bookmark = record;
+        if (post.element) highlight(post.element);
+        addRepostToLog(post, account);
+        await saveBookmark(record, !!force);
+        log('Save', 'Lesestelle @' + record.authorHandler, record.tweetId, record.isRepost ? '(Repost)' : '');
+        return true;
+    }
+
+    function highlight(el) {
+        if (!el || !el.isConnected) return;
+        if (highlighted && highlighted !== el && highlighted.isConnected) {
+            highlighted.style.removeProperty('box-shadow');
+            highlighted.style.removeProperty('outline');
+        }
+        el.style.setProperty('box-shadow', 'none', 'important');
+        el.style.setProperty('outline', '1px solid rgba(246, 146, 25, 0.95)', 'important');
+        highlighted = el;
+    }
+
+    function showBookmark() {
+        if (!bookmark || followingTab === false) return;
+        const el = findArticle(bookmark);
+        if (el) highlight(el);
+    }
+
+    // ---------- Reiter ----------
+
+    function homeTabNodes() {
+        const nodes = [];
+        const seen = new Set();
+        const root = document.querySelector('[data-testid="primaryColumn"]') || document.body;
+        if (!root) return nodes;
+        const add = (el, label) => {
+            const kind = tabKind(label);
+            if (!kind || el.closest('article')) return;
+            const host = el.closest('[role="tab"]') || el;
+            if (seen.has(host)) return;
+            seen.add(host);
+            nodes.push({ host, kind, labelEl: el });
+        };
+        for (const tab of root.querySelectorAll('[role="tab"]')) {
+            add(tab, normalizeHomeTabLabel(tab.innerText || tab.textContent));
+        }
+        if (nodes.some((node) => node.kind === 'following') && nodes.some((node) => node.kind === 'for-you')) {
+            return nodes;
+        }
+        for (const span of root.querySelectorAll('span')) {
+            const raw = span.textContent || '';
+            if (raw.trim().length > 40) continue;
+            add(span, normalizeHomeTabLabel(raw));
+        }
+        return nodes;
+    }
+
+    function tabLooksSelected(host) {
+        let node = host;
+        for (let guard = 0; node && guard < 6; guard += 1) {
+            if (node.getAttribute &&
+                (node.getAttribute('aria-selected') === 'true' || node.getAttribute('aria-current') === 'page')) {
+                return true;
+            }
+            node = node.parentElement;
+        }
+        return false;
+    }
+
+    function labelIsMuted(node) {
+        try {
+            const color = getComputedStyle(node).color || '';
+            return /113,\s*118,\s*123|83,\s*100,\s*113|139,\s*152,\s*165|107,\s*125,\s*140/.test(color);
+        } catch (e) {
+            return false;
+        }
+    }
+
+    function readFollowingTabSelected() {
+        const nodes = homeTabNodes();
+        const following = nodes.filter((node) => node.kind === 'following');
+        const forYou = nodes.filter((node) => node.kind === 'for-you');
+        if (!following.length || !forYou.length) return null;
+        const selected = nodes.filter((node) => tabLooksSelected(node.host));
+        if (selected.length === 1) return selected[0].kind === 'following';
+        const followingMuted = labelIsMuted(following[0].labelEl);
+        const forYouMuted = labelIsMuted(forYou[0].labelEl);
+        if (followingMuted === forYouMuted) return null;
+        return !followingMuted;
+    }
+
+    function armFollowing(reason) {
+        const now = Date.now();
+        const fresh = followingTab !== true || now - followingArmAt > 1500;
+        if (!fresh) {
+            showBookmark();
+            tryPill();
+            return;
+        }
+        followingArmAt = now;
+        cancelFlow();
+        followingTab = true;
+        pillClicks = 0;
+        pillClickLabel = '';
+        pillClickedAt = 0;
+        pillSeenAtWatchStart = !!findPill();
+        pillWatchUntil = Date.now() + PILL_WATCH_MS;
+        log('Init', 'Folge ich aktiv (' + reason + ').');
+        showBookmark();
+        tryPill();
+    }
+
+    function syncTab(reason) {
+        if (!onHome()) {
+            followingTab = null;
+            return;
+        }
+        const selected = readFollowingTabSelected();
+        if (selected === null || selected === followingTab) return;
+        if (!selected) {
+            followingTab = false;
+            cancelFlow();
+            log('Init', 'Für dich — Lesestelle wartet auf Folge ich.');
+            return;
+        }
+        if (followingTab === false) armFollowing(reason);
+        else {
+            followingTab = true;
+            showBookmark();
+            tryPill();
+        }
+    }
+
+    function homeTabLabelFromClick(event) {
+        const el = event.target instanceof Element ? event.target : null;
+        if (!el || el.closest('article')) return '';
+        const tab = el.closest('[role="tab"]');
+        if (tab) return normalizeHomeTabLabel(tab.innerText || tab.textContent);
+        const span = el.closest('span');
+        if (!span) return '';
+        return normalizeHomeTabLabel(span.textContent);
+    }
+
+    function onTabClick(event) {
+        const label = homeTabLabelFromClick(event);
+        if (!label) return;
+        if (FOLLOWING_TAB_LABELS.has(label)) {
+            setTimeout(() => armFollowing('klick'), 50);
+            setTimeout(() => armFollowing('klick'), 400);
+            setTimeout(() => armFollowing('klick'), 1200);
+            return;
+        }
+        if (FOR_YOU_TAB_LABELS.has(label)) {
+            setTimeout(() => syncTab('reiter'), 50);
+            setTimeout(() => syncTab('reiter'), 400);
+        }
+    }
+
+    // ---------- Pille ----------
+
+    function pillHostIsShown(host) {
+        if (!host || !host.isConnected) return false;
+        let node = host;
+        while (node && node !== document.documentElement) {
+            if (node.getAttribute && node.getAttribute('aria-hidden') === 'true') return false;
+            try {
+                const style = getComputedStyle(node);
+                if (style.display === 'none' || style.visibility === 'hidden') return false;
+            } catch (e) { /* weiter */ }
+            node = node.parentElement;
+        }
+        return true;
+    }
+
+    function findPill() {
+        const pattern = /\b(new posts|neue posts(?:\s+sehen)?|neue posts sind verfügbar|neue Beiträge|nouveaux tweets|nuevos tweets|新しい投稿|Новые посты|novos posts|منشورات جديدة|nuovi post|새 게시물|new tweets|post anzeigen|posts anzeigen|show \d+ posts?)\b/i;
+        const exclude = /\b(teilen|share|posten|veröffentlichen|grok)\b/i;
+        const gap = /\b(versteckt\w*|hidden|show\s+more|mehr anzeigen)\b/i;
+        const matches = (text) => {
+            const normalized = (text || '').toLowerCase().replace(/\s+/g, ' ').trim();
+            if (!normalized || normalized.length > 80) return false;
+            return pattern.test(normalized) && !exclude.test(normalized) && !gap.test(normalized);
+        };
+        const smallTop = (host) => {
+            const rect = host.getBoundingClientRect();
+            return rect.top >= -80 && rect.top <= 420 &&
+                rect.width >= 40 && rect.width <= 520 &&
+                rect.height >= 12 && rect.height <= 96;
+        };
+        const isBlue = (value) => {
+            const compact = (value || '').replace(/\s+/g, '');
+            return compact === 'rgb(29,155,240)' || compact.indexOf('rgba(29,155,240,') === 0;
+        };
+        const hostIsBlue = (host) => {
+            if (!host) return false;
+            const styleAttr = host.getAttribute && host.getAttribute('style') || '';
+            if (styleAttr.indexOf('29, 155, 240') !== -1 || styleAttr.indexOf('29,155,240') !== -1) return true;
+            try {
+                const style = getComputedStyle(host);
+                if (isBlue(style.color) || isBlue(style.backgroundColor)) return true;
+            } catch (e) { /* weiter */ }
+            const labelled = host.querySelector && host.querySelector('[style*="29, 155, 240"], [style*="29,155,240"]');
+            return !!labelled;
+        };
+        const accept = (host, text) => {
+            if (!host || !pillHostIsShown(host) || !matches(text) || !smallTop(host)) return null;
+            return { host, text: (text || '').replace(/\s+/g, ' ').trim() };
+        };
+        for (const pillLabel of document.querySelectorAll('[data-testid="pillLabel"]')) {
+            const btn = pillLabel.closest('button, [role="button"]') || pillLabel.parentElement;
+            const combined = ((pillLabel.textContent || '') + ' ' + ((btn && btn.getAttribute && btn.getAttribute('aria-label')) || '')).trim();
+            const found = accept(btn, combined);
+            if (found) return found;
+        }
+        const column = document.querySelector("[data-testid='primaryColumn']") || document.querySelector('main');
+        if (!column) return null;
+        for (const span of column.querySelectorAll('span')) {
+            const text = span.textContent || '';
+            if (!matches(text)) continue;
+            let host = span;
+            let chosen = null;
+            for (let guard = 0; host && guard < 6; guard += 1) {
+                const found = accept(host, text);
+                if (found) chosen = found;
+                if (host.getAttribute && (host.getAttribute('role') === 'button' || host.tagName === 'BUTTON')) break;
+                host = host.parentElement;
+            }
+            if (chosen) return chosen;
+        }
+        return null;
+    }
+
+    function tryPill() {
+        if (!readingOn()) return;
+        if (phase !== 'idle') return;
+        const watch = Date.now() < pillWatchUntil;
+        const late = watch && !pillSeenAtWatchStart;
+        if (!atTop() && !late && !(watch && nearTop())) return;
+        const pill = findPill();
+        if (!pill) {
+            if (Date.now() - pillClickedAt >= PILL_RETRY_MS) {
+                pillClicks = 0;
+                pillClickLabel = '';
+            }
+            return;
+        }
+        if (pillClicks >= PILL_MAX_CLICKS && pill.text === pillClickLabel) return;
+        if (Date.now() - pillClickedAt < PILL_RETRY_MS) return;
+        void clickPill(pill);
+    }
+
+    async function clickPill(pill) {
+        if (phase !== 'idle' || !readingOn()) return;
+        const gen = ++generation;
+        phase = 'pill';
+        seekCancel = false;
+        if (pill.text !== pillClickLabel) {
+            pillClickLabel = pill.text;
+            pillClicks = 0;
+        }
+        pillClicks += 1;
+        pillClickedAt = Date.now();
+        blockTopMarkUntil = Date.now() + 4000;
+        const target = bookmark ? Object.assign({}, bookmark) : null;
+        log('NewPosts', 'Pille', pill.text);
+        try {
+            pill.host.click();
+        } catch (e) {
+            log('NewPosts', 'Klick fehlgeschlagen', e);
+        }
+        await sleep(400);
+        await waitForFeedChange(3000);
+        if (gen !== generation || !readingOn()) {
+            if (gen === generation) phase = 'idle';
+            return;
+        }
+        bookmark = target;
+        blockTopMarkUntil = Date.now() + 1800;
+        phase = 'idle';
+        if (target && target.tweetId) {
+            await seekBookmark('pill', { silent: true, generationHint: gen });
+        }
+    }
+
+    // ---------- Suche ----------
+
+    function nearestNearPost() {
+        if (!bookmark) return null;
+        let best = null;
+        let bestGap = Infinity;
+        const target = bookmarkTargetMs(bookmark);
+        for (const post of visibleParsed()) {
+            if (!postIsNear(post, bookmark)) continue;
+            if (post.tweetId === bookmark.tweetId && !!post.isRepost === !!bookmark.isRepost) return post;
+            const candidate = tweetIdMs(post.tweetId);
+            if (target === null || candidate === null) continue;
+            if (candidate > target) continue;
+            const gap = target - candidate;
+            if (gap < bestGap) {
+                bestGap = gap;
+                best = post;
+            }
+        }
+        return best;
+    }
+
+    async function seekBookmark(reason, options = {}) {
+        const silent = options.silent === true;
+        if (!bookmark || !bookmark.tweetId) {
+            if (!silent) showPopup('searchNoPosition', 5000);
+            return;
+        }
+        if (!onHome()) {
+            await goHomeThen(() => seekBookmark(reason, options));
+            return;
+        }
+        if (followingTab === false) {
+            showPopup('needFollowing', 5000);
+            return;
+        }
+        if (options.generationHint && options.generationHint !== generation) return;
+        if (!options.generationHint && (phase === 'seek' || phase === 'pill')) return;
+        const gen = options.generationHint || (++generation);
+        phase = 'seek';
+        seekCancel = false;
+        holdAnchor();
+        if (!silent) {
+            showPopup('searchPopup', 5000, {
+                authorHandler: bookmark.authorHandler,
+                tweetId: bookmark.tweetId
+            });
+        }
+        log('Search', 'Suche', reason, '@' + bookmark.authorHandler, bookmark.tweetId);
+        const onKey = (event) => {
+            if (event.code !== 'Space') return;
+            const tag = event.target && event.target.tagName;
+            if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+            seekCancel = true;
+            event.preventDefault();
+        };
+        window.addEventListener('keydown', onKey, true);
+        let emptyWaits = 0;
+        let stagnant = 0;
+        let bounces = 0;
+        let lastY = scrollOffset();
+        try {
+            for (let step = 0; step < SEARCH_MAX_STEPS; step += 1) {
+                if (gen !== generation || seekCancel || !readingOn()) break;
+                const exact = findArticle(bookmark);
+                if (exact) {
+                    highlight(exact);
+                    const status = nudgeToward(exact);
+                    if (status === 'aligned' || status === 'blocked') {
+                        finishFlow(gen);
+                        log('Search', status === 'aligned' ? 'Lesestelle steht' : 'Lesestelle markiert, kein Sprung an den Anfang');
+                        return;
+                    }
+                    await sleep(80);
+                    lastY = scrollOffset();
+                    continue;
+                }
+                const reached = windowReachedBookmark(visibleOriginalTimes(), bookmark);
+                if (reached) {
+                    const near = nearestNearPost();
+                    if (near && near.element) {
+                        highlight(near.element);
+                        showPopup('approximatePosition', 5000, { strategy: 'nah' });
+                        log('Search', 'Nahersatz markiert, Lesestelle bleibt gespeichert');
+                    } else if (!silent) {
+                        showPopup('tweetIdNotFound', 5000);
+                    }
+                    finishFlow(gen);
                     return;
                 }
+                const before = visibleSignature();
+                const here = scrollOffset();
+                const vh = window.innerHeight || 800;
+                const jump = Math.max(FINE_STEP_PX, Math.round(vh * SEARCH_JUMP_VH));
+                scrollByDelta(jump);
+                const changed = await waitForFeedChange(RELOAD_WAIT_MS, before);
+                const y2 = scrollOffset();
+                const after = visibleSignature();
+                if (!changed && after === before) {
+                    emptyWaits += 1;
+                    if (emptyWaits >= EMPTY_WAITS_MAX) break;
+                } else {
+                    emptyWaits = 0;
+                }
+                if (Math.abs(y2 - here) < 24) {
+                    stagnant += 1;
+                    if (stagnant >= 4) break;
+                } else {
+                    stagnant = 0;
+                }
+                if (y2 < lastY - 40) {
+                    bounces += 1;
+                    if (bounces >= 3) break;
+                } else if (y2 > lastY + 40) {
+                    bounces = 0;
+                }
+                lastY = y2;
+                ingestDomOrder();
             }
-        } catch (e) {
-            log('Save', 'Fehler beim Vergleich der alten Position:', e);
+            if (gen === generation) {
+                const exact = findArticle(bookmark);
+                if (exact) highlight(exact);
+                else if (!silent) showPopup('tweetIdNotFound', 5000);
+                finishFlow(gen);
+                log('Search', 'Suche beendet ohne Sprung an den Anfang');
+            }
+        } finally {
+            window.removeEventListener('keydown', onKey, true);
+            releaseAnchor();
+            if (gen === generation && phase === 'seek') finishFlow(gen);
         }
     }
 
-    const historyKey = `postHistory_${postData.account}`;
-
-    try {
-
-        GM_setValue(storageKey, JSON.stringify(postData));
-
-        let history = GM_getValue(historyKey, []);
-        history.push({
-            ...postData,
-            savedAt: new Date().toISOString()
-        });
-
-        if (history.length > MAX_POST_HISTORY) {
-            history = history.slice(-MAX_POST_HISTORY);
-        }
-
-        GM_setValue(historyKey, history);
-
-        postHistoryCache = history; // Cache aktualisieren für schnellen Timeline-Abgleich
-        rebuildKnownMarkedKeys();
-        timelineMapAccount = postData.account;
-        scheduleTimelineMapUpdate('save');
-
-        debugLog('Save', `Position + Historie gespeichert (${history.length}/${MAX_POST_HISTORY} Einträge)`);
-
-    } catch (err) {
-        log('Save', 'Fehler beim Speichern:', err);
-        showPopup('saveError', 6000);
+    function finishFlow(gen) {
+        if (gen !== generation) return;
+        phase = 'idle';
+        programmaticUntil = Date.now() + 800;
+        blockTopMarkUntil = Date.now() + 1800;
+        showBookmark();
     }
-}
 
-    async function redirectToHomeAndSearch(fromFile = false) {
-    if (window.location.href.includes('/home')) {
-        startRefinedSearchForLastReadPost(fromFile);
-        return;
-    }
-    showPopup('redirectToHome', 3000);
-
-    const homeButton = document.querySelector("a[data-testid='AppTabBar_Home_Link']");
-    if (homeButton) {
-        homeButton.click();
+    async function goHomeThen(next) {
+        showPopup('redirectToHome', 3000);
+        const homeButton = document.querySelector("a[data-testid='AppTabBar_Home_Link']");
+        if (homeButton) homeButton.click();
+        else window.location.href = 'https://x.com/home';
         setTimeout(() => {
-            if (window.location.href.includes('/home')) {
-                startRefinedSearchForLastReadPost(fromFile);
-            } else {
-                log('Init', 'Weiterleitung zur Startseite fehlgeschlagen.');
-                showPopup('scriptError', 5000);
-            }
+            if (onHome()) next();
         }, 1000);
-    } else {
-
-        log('Init', 'Home-Button nicht gefunden.');
-        window.location.href = 'https://x.com/home';
-        setTimeout(() => startRefinedSearchForLastReadPost(fromFile), 1000);
     }
-}
 
-    const IMPORT_FILE_MAX_BYTES = 2 * 1024 * 1024;
+    // ---------- Mitlesen ----------
+
+    function noteScroller(event) {
+        if (!onHome()) return;
+        let node = event && event.target;
+        if (node === document || node === document.documentElement || node === document.body) {
+            node = document.scrollingElement;
+        }
+        if (!node || node.nodeType !== 1) return;
+        if (node.closest && node.closest('article')) return;
+        if (node.scrollHeight > node.clientHeight + 40) activeScroller = node;
+    }
+
+    function onUserScroll(event) {
+        if (!onHome()) return;
+        noteScroller(event);
+        const y = scrollOffset();
+        if (!readingOn()) {
+            lastScrollY = y;
+            return;
+        }
+        if (Date.now() < programmaticUntil || phase !== 'idle') {
+            lastScrollY = y;
+            return;
+        }
+        const delta = y - lastScrollY;
+        lastScrollY = y;
+        const arrivedTop = atTop() || nearTop();
+        if (Math.abs(delta) < SCROLL_DEAD_PX) {
+            showBookmark();
+            if (arrivedTop) tryPill();
+            return;
+        }
+        if (Date.now() < blockTopMarkUntil && nearTop()) {
+            showBookmark();
+            if (arrivedTop) tryPill();
+            return;
+        }
+        if (delta < 0) {
+            const top = topReadingPost();
+            if (top && (!bookmark || isCandidateNewer(top, bookmark))) {
+                void adopt(top, false);
+                if (arrivedTop) tryPill();
+                return;
+            }
+        }
+        showBookmark();
+        if (arrivedTop) tryPill();
+    }
+
+    function onWheel() {
+        if (phase === 'idle') return;
+        cancelFlow();
+        programmaticUntil = 0;
+        blockTopMarkUntil = 0;
+    }
+
+    const debouncedScroll = debounce(onUserScroll, 150);
+
+    function onVisibility() {
+        if (document.visibilityState === 'hidden') {
+            hiddenAt = Date.now();
+            persistMap();
+            maybeAutoDownload();
+            return;
+        }
+        if (!onHome() || followingTab === false) return;
+        const slept = hiddenAt ? Date.now() - hiddenAt : 0;
+        pillClicks = 0;
+        pillClickLabel = '';
+        pillClickedAt = 0;
+        pillSeenAtWatchStart = !!findPill();
+        pillWatchUntil = Date.now() + PILL_WATCH_MS;
+        tryPill();
+        if (slept >= SLEEP_MS && bookmark && phase === 'idle' && !findArticle(bookmark)) {
+            void seekBookmark('wake', { silent: true });
+        }
+    }
+
+    function maybeAutoDownload() {
+        if (!autoDownloadEnabled || !bookmark || !onHome() || followingTab === false || phase !== 'idle') return;
+        const postKey = bookmark.tweetId + '-' + bookmark.authorHandler;
+        if (downloadedPosts.has(postKey)) return;
+        void downloadBookmark(false);
+    }
+
+    function rebindColumnObserver() {
+        const column = document.querySelector('[data-testid="primaryColumn"]');
+        if (!column || column === observedColumn) return;
+        if (columnObserver) columnObserver.disconnect();
+        observedColumn = column;
+        let last = 0;
+        columnObserver = new MutationObserver(() => {
+            const now = Date.now();
+            if (now - last < 400) return;
+            last = now;
+            if (!readingOn() || phase !== 'idle') return;
+            tryPill();
+            ingestDomOrder();
+        });
+        columnObserver.observe(column, { childList: true, subtree: true });
+    }
+
+    function tick() {
+        if (!onHome()) return;
+        syncTab('tick');
+        if (!readingOn()) return;
+        rebindColumnObserver();
+        if (phase === 'idle') {
+            tryPill();
+            ingestDomOrder();
+            showBookmark();
+        }
+    }
+
+    function watchTabs(left) {
+        syncTab('init');
+        if (followingTab !== null || left <= 0) return;
+        setTimeout(() => watchTabs(left - 1), 300);
+    }
+
+    async function loadStoredBookmark() {
+        const account = await getCurrentUserHandle();
+        if (!isPlausibleUserHandle(account)) return;
+        autoDownloadEnabled = GM_getValue(AUTO_DOWNLOAD_KEY, false) === true;
+        downloadedPosts = new Set(capDownloadedPostList(GM_getValue('downloadedPosts', [])));
+        updateAutoSaveButtonVisual();
+        let position = null;
+        try {
+            const raw = GM_getValue(STORAGE_KEY(account), null);
+            if (raw) position = JSON.parse(raw);
+        } catch (e) {
+            position = null;
+        }
+        const downloadedPosition = GM_getValue('downloadedReadingPosition', null);
+        const fresh = readUserHandleFromNav();
+        if (downloadedPosition && downloadedPosition.tweetId &&
+            downloadedPosition.account === account &&
+            isPlausibleUserHandle(fresh) && fresh === account) {
+            try {
+                if (!position || !position.tweetId || BigInt(downloadedPosition.tweetId) > BigInt(position.tweetId)) {
+                    position = downloadedPosition;
+                    GM_setValue(STORAGE_KEY(account), JSON.stringify(downloadedPosition));
+                }
+            } catch (e) { /* behalte die interne Stelle */ }
+        }
+        if (!position || !position.tweetId || !position.authorHandler || !position.timestamp) {
+            bookmark = null;
+            loadMap(account);
+            return;
+        }
+        if (!position.readAt) position.readAt = position.timestamp;
+        bookmark = position;
+        try {
+            const history = GM_getValue(HISTORY_KEY(account), []);
+            const cutoff = Date.now() - SEVEN_DAYS_MS;
+            const filtered = (Array.isArray(history) ? history : []).filter((item) => {
+                const rawTime = item && (item.readAt || item.savedAt || item.timestamp);
+                const ms = new Date(rawTime || 0).getTime();
+                return Number.isFinite(ms) && ms > cutoff;
+            });
+            GM_setValue(HISTORY_KEY(account), filtered);
+        } catch (e) { /* Historie bleibt */ }
+        loadMap(account);
+        log('Init', 'Lesestelle geladen @' + bookmark.authorHandler, bookmark.tweetId);
+    }
+
+    async function bootReading() {
+        if (!onHome()) return;
+        if (bootedAccount) {
+            syncTab('boot');
+            showBookmark();
+            watchTabs(8);
+            return;
+        }
+        await loadStoredBookmark();
+        const account = readUserHandleFromNav() || cachedUserHandle;
+        if (isPlausibleUserHandle(account)) bootedAccount = account;
+        log('Init', 'Lesestelle 2026.10.14f');
+        syncTab('boot');
+        if (readingOn()) {
+            pillSeenAtWatchStart = !!findPill();
+            pillWatchUntil = Date.now() + PILL_WATCH_MS;
+            tryPill();
+        }
+        showBookmark();
+        watchTabs(8);
+    }
+
+    function startReading() {
+        if (!listenersBound) {
+            listenersBound = true;
+            document.addEventListener('scroll', (event) => {
+                noteScroller(event);
+                debouncedScroll(event);
+            }, true);
+            document.addEventListener('click', onTabClick, true);
+            window.addEventListener('wheel', onWheel, { passive: true, capture: true });
+            document.addEventListener('visibilitychange', onVisibility);
+            window.addEventListener('blur', debounce(maybeAutoDownload, 1000));
+            window.addEventListener('beforeunload', () => {
+                persistMap();
+                maybeAutoDownload();
+            });
+            setInterval(tick, 3000);
+            createButtons();
+        }
+        void bootReading();
+    }
+
+    function onSpaRoute() {
+        if (onHome()) startReading();
+        else cancelFlow();
+    }
+
+    function installSpaRouting() {
+        const wrapHistory = (name) => {
+            const original = history[name];
+            if (typeof original !== 'function' || original.__xtsWrapped) return;
+            const wrapped = function () {
+                const result = original.apply(this, arguments);
+                onSpaRoute();
+                return result;
+            };
+            wrapped.__xtsWrapped = true;
+            history[name] = wrapped;
+        };
+        wrapHistory('pushState');
+        wrapHistory('replaceState');
+        window.addEventListener('popstate', onSpaRoute);
+    }
+
+    // ---------- Datei ----------
 
     function sanitizeImportedTweetId(value) {
         if (typeof value === 'number') {
@@ -1345,12 +1936,7 @@
         const authorHandler = sanitizeImportedHandle(raw.authorHandler);
         const timestamp = sanitizeImportedIso(raw.timestamp);
         if (!tweetId || !authorHandler || !timestamp) return null;
-        const post = {
-            tweetId,
-            authorHandler,
-            timestamp,
-            isRepost: raw.isRepost === true
-        };
+        const post = { tweetId, authorHandler, timestamp, isRepost: raw.isRepost === true };
         const readAt = sanitizeImportedIso(raw.readAt);
         if (readAt) post.readAt = readAt;
         const savedAt = sanitizeImportedIso(raw.savedAt);
@@ -1378,6244 +1964,206 @@
         return entry;
     }
 
-    function sanitizeImportedTimelineMap(raw) {
-        if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
-        if (!Array.isArray(raw.orderedKeys)) return null;
-        if (!raw.entries || typeof raw.entries !== 'object' || Array.isArray(raw.entries)) return null;
-        const entries = {};
-        const orderedKeys = [];
-        for (const key of raw.orderedKeys) {
-            if (orderedKeys.length >= CONFIG.MAX_TIMELINE_MAP) break;
-            if (typeof key !== 'string') continue;
-            const source = raw.entries[key];
-            if (!source || typeof source !== 'object' || Array.isArray(source)) continue;
-            const tweetId = sanitizeImportedTweetId(source.tweetId);
-            if (!tweetId) continue;
-            const isRepost = source.isRepost === true;
-            const expectedKey = `${tweetId}-${isRepost}`;
-            if (key !== expectedKey || entries[expectedKey]) continue;
-            const clean = { key: expectedKey, tweetId, isRepost };
-            const authorHandler = sanitizeImportedHandle(source.authorHandler);
-            if (authorHandler) clean.authorHandler = authorHandler;
-            const timestamp = sanitizeImportedIso(source.timestamp);
-            if (timestamp) clean.timestamp = timestamp;
-            clean.lastSeenAt = sanitizeImportedIso(source.lastSeenAt) || new Date().toISOString();
-            if (source.ghostTail === true) clean.ghostTail = true;
-            entries[expectedKey] = clean;
-            orderedKeys.push(expectedKey);
-        }
-        if (!orderedKeys.length) return null;
-        return {
-            orderedKeys,
-            entries,
-            savedAt: sanitizeImportedIso(raw.savedAt) || new Date().toISOString()
-        };
-    }
-
-    async function loadLastReadPostFromFile() {
-    try {
-        const input = document.createElement('input');
-        input.type = 'file';
-        input.accept = '.json';
-        input.style.display = 'none';
-        document.body.appendChild(input);
-
-        input.addEventListener('change', async (event) => {
-            const file = event.target.files[0];
-            if (!file) {
-                showPopup('fileSelectError', 5000);
-                document.body.removeChild(input);
-                return;
-            }
-            if (file.size > IMPORT_FILE_MAX_BYTES) {
-                log('Load', 'Import abgelehnt: Datei größer als 2 MB');
-                showPopup('fileReadError', 5000);
-                document.body.removeChild(input);
-                return;
-            }
-
-            const reader = new FileReader();
-            reader.onload = async (e) => {
-                try {
-                    const data = JSON.parse(e.target.result);
-                    const importedCurrent = sanitizeImportedPost(data && data.current);
-                    if (!importedCurrent) {
-                        showPopup('invalidPosition', 5000);
-                        document.body.removeChild(input);
-                        return;
-                    }
-
-                    const account = readUserHandleFromNav();
-                    if (!isPlausibleUserHandle(account)) {
-                        log('Load', 'Kein frischer Account — Import nicht gespeichert');
-                        showPopup('fileReadError', 5000);
-                        document.body.removeChild(input);
-                        return;
-                    }
-
-                    lastReadPost = importedCurrent;
-                    lastReadPost.account = account;
-                    if (!lastReadPost.readAt) {
-                        lastReadPost.readAt = lastReadPost.timestamp;
-                    }
-
-                    const historyKey = `postHistory_${account}`;
-                    if (Array.isArray(data.history)) {
-                        let importedHistory = [];
-                        for (const item of data.history) {
-                            const post = sanitizeImportedPost(item);
-                            if (!post) continue;
-                            post.account = account;
-                            importedHistory.push(post);
-                        }
-                        if (importedHistory.length > 50) {
-                            importedHistory = importedHistory.slice(-50);
-                        }
-                        GM_setValue(historyKey, importedHistory);
-                        postHistoryCache = importedHistory;
-                        rebuildKnownMarkedKeys();
-                        debugLog('Load', `Post-Historie aus Datei geladen: ${importedHistory.length} Einträge.`);
-                    }
-                    GM_setValue(STORAGE_KEY(account), JSON.stringify(lastReadPost));
-
-                    if (Array.isArray(data.repostLog)) {
-                        let importedRepostLog = [];
-                        for (const item of data.repostLog) {
-                            const entry = sanitizeImportedRepost(item);
-                            if (entry) importedRepostLog.push(entry);
-                        }
-                        if (importedRepostLog.length > MAX_REPOST_LOG) {
-                            importedRepostLog = importedRepostLog.slice(-MAX_REPOST_LOG);
-                        }
-                        GM_setValue(REPOST_LOG_KEY(account), importedRepostLog);
-                        debugLog('Repost', `Repost-Log aus Datei importiert: ${importedRepostLog.length} Einträge`);
-                    }
-
-                    const importedMap = sanitizeImportedTimelineMap(data.timelineMap);
-                    if (importedMap) {
-                        try {
-                            const mapKey = TIMELINE_MAP_KEY(account);
-                            GM_setValue(mapKey, JSON.stringify(importedMap));
-                            debugLog('Map', `Timeline-Landkarte aus Datei importiert: ${importedMap.orderedKeys.length} Einträge`);
-                            loadTimelineMapForAccount(account, true);
-                        } catch (e) {
-                            log('Map', 'Fehler beim Import der Landkarte aus Datei:', e);
-                        }
-                    }
-
-                    // Sicherstellen, dass die importierte Lesestelle als konkreter Eintrag in der (importierten) Landkarte steht.
-                    // Wichtig für cross-rechner: mit frisch geladener History können History-Anker für korrekte Platzierung genutzt werden.
-                    if (lastReadPost && lastReadPost.tweetId) {
-                        ensureBookmarkInMap(lastReadPost);
-                    }
-
-                    showPopup('fileLoadSuccess', 4000);
-
-                    updateHighlightedPost();
-
-                    if (!isScriptActivated) {
-                        isScriptActivated = true;
-                        observeForNewPosts();
-                    }
-
-                    redirectToHomeAndSearch(true);
-
-                    // Extra Sicherheit: Nach dem Laden aus Datei nochmal explizit versuchen, den Rahmen zu setzen
-                    setTimeout(() => {
-                        if (lastReadPost) {
-                            updateHighlightedPost();
-                        }
-                    }, 2500);
-
-                } catch (err) {
-                    log('Load', 'JSON Parse Fehler:', err);
-                    showPopup('fileReadError', 5000);
-                } finally {
-                    document.body.removeChild(input);
-                }
-            };
-
-            reader.readAsText(file);
-        });
-
-        input.click();
-
-    } catch (err) {
-        log('Load', 'Datei-Dialog Fehler:', err);
-        showPopup('fileDialogError', 5000);
-    }
-}
-
-    async function loadLastReadPost(callback) {
-    try {
-        const account = await getCurrentUserHandle();
-        if (!isPlausibleUserHandle(account)) {
-            debugLog('Load', 'Kein plausibler Account — Leseposition nicht geladen.');
-            callback(null);
-            return;
-        }
-        const freshAccount = readUserHandleFromNav();
-        const storageKey = STORAGE_KEY(account);
-        const historyKey = `postHistory_${account}`;
-
-        const storedPost = GM_getValue(storageKey, null);
-        const storedHistory = GM_getValue(historyKey, []);
-
-        let position = null;
-
-        if (storedPost) {
-            position = JSON.parse(storedPost);
-        }
-
-        const downloadedPosition = GM_getValue('downloadedReadingPosition', null);
-
-        if (downloadedPosition && downloadedPosition.tweetId &&
-            downloadedPosition.account === account &&
-            isPlausibleUserHandle(freshAccount) && freshAccount === account) {
-            if (!position || !position.tweetId) {
-                position = downloadedPosition;
-                GM_setValue(storageKey, JSON.stringify(downloadedPosition));
-                log('Load', 'Downgeloadete Position übernommen (keine interne vorhanden).');
-            } else {
-                try {
-                    const internalId = BigInt(position.tweetId);
-                    const downloadedId = BigInt(downloadedPosition.tweetId);
-                    if (downloadedId > internalId) {
-                        position = downloadedPosition;
-                        GM_setValue(storageKey, JSON.stringify(downloadedPosition));
-                        log('Load', 'Downgeloadete Position ist neuer → interne überschrieben.');
-                    } else {
-                        debugLog('Load', 'Interne Position ist neuer/gleich – downgeloadete ignoriert.');
-                    }
-                } catch (e) {
-                    log('Load', 'Fehler beim Vergleich der Tweet-IDs.');
-                }
-            }
-        } else if (downloadedPosition?.tweetId && downloadedPosition.account && downloadedPosition.account !== account) {
-            debugLog('Load', 'Downgeloadete Position eines anderen Accounts ignoriert.');
-        }
-
-        if (position && position.tweetId && position.authorHandler && position.timestamp) {
-
-            const sevenDaysAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
-            const filteredHistory = (Array.isArray(storedHistory) ? storedHistory : []).filter(h => {
-                const raw = h?.readAt || h?.savedAt || h?.timestamp;
-                const ms = new Date(raw || 0).getTime();
-                return Number.isFinite(ms) && ms > sevenDaysAgo;
-            });
-            GM_setValue(historyKey, filteredHistory);
-            postHistoryCache = filteredHistory; // Cache für Gedächtnis/Abgleich füllen
-            rebuildKnownMarkedKeys();
-            loadTimelineMapForAccount(account);
-            debugLog('Load', `Post-Historie: ${filteredHistory.length} Einträge (letzte 7 Tage).`);
-            callback(position);
-        } else {
-            debugLog('Load', `Keine gültige Leseposition für Account ${account}.`);
-            callback(null);
-        }
-    } catch (err) {
-        log('Load', 'Fehler beim Laden der Leseposition:', err);
-        callback(null);
-    }
-}
-
-    async function downloadLastReadPost(options = {}) {
-    const { force = false } = options;
-    if (!window.location.href.includes('/home')) {
-        debugLog('Load', 'Download übersprungen: Nicht auf Home-Seite.');
-        return;
-    }
-
-    try {
-        if (!lastReadPost || !lastReadPost.tweetId || !lastReadPost.authorHandler) {
+    async function downloadBookmark(force) {
+        if (!onHome()) return;
+        if (!bookmark || !bookmark.tweetId || !bookmark.authorHandler) {
             showPopup('noValidPosition', 5000);
             return;
         }
-
-        const postKey = `${lastReadPost.tweetId}-${lastReadPost.authorHandler}`;
+        const postKey = bookmark.tweetId + '-' + bookmark.authorHandler;
         if (!force && downloadedPosts.has(postKey)) {
             showPopup('alreadyDownloaded', 5000);
             return;
         }
-
-        const account = await getCurrentUserHandle();
-        const historyKey = `postHistory_${account}`;
-        const history = GM_getValue(historyKey, []);
-
-        const exportHistory = history.slice(-50);
-
-        // Repost-Log mit exportieren (User-Wunsch)
-        const repostLog = GM_getValue(REPOST_LOG_KEY(account), []);
-        const exportRepostLog = repostLog.slice(-300);  // sinnvolle Begrenzung (intern max 500)
-
-        const now = new Date();
-        const dateStr = now.toISOString().slice(0, 10);
-        const timeStr = now.toISOString().slice(11, 16).replace(':', '');
-
-        const postAuthor = lastReadPost.authorHandler || 'unknown';
-
-        const fileName = `${account}_${postAuthor}_${dateStr}_${timeStr}.json`;
-        // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-
-        // Timeline-Landkarte mit in die Lesestelle-Datei einbetten.
-        // Grund: Tampermonkey-interner Sync der großen `timelineMap_*`-Werte ist unzuverlässig.
-        // Die kombinierte Datei wird bei Tab-Leseverlust (blur / beforeunload + Auto-Download)
-        // heruntergeladen. Anschließend Ordner-Sync (z.B. Syncthing) → andere Maschine lädt
-        // per "Load last read position" die Lesestelle + Landkarte zusammen.
-        let exportedTimelineMap = null;
-        if (timelineMapAccount === account && timelineMapOrderedKeys.length > 0) {
-            const entries = {};
-            for (const key of timelineMapOrderedKeys) {
-                const entry = timelineMapByKey.get(key);
-                if (entry) {
-                    // inDom ist transient, nicht persistieren
-                    const { inDom, ...cleanEntry } = entry;
-                    entries[key] = cleanEntry;
-                }
-            }
-            exportedTimelineMap = {
-                orderedKeys: [...timelineMapOrderedKeys],
-                entries,
-                savedAt: new Date().toISOString()
-            };
-        }
-
-        const exportData = {
-            account: account,
-            current: { ...lastReadPost },
-            history: exportHistory,
-            repostLog: exportRepostLog,
-            timelineMap: exportedTimelineMap,
-            exportedAt: now.toISOString(),
-            version: "1.2"   // 1.2: timelineMap in Lesestelle-Download integriert (wegen fehlendem TM-Map-Sync)
-        };
-
-        const fileContent = JSON.stringify(exportData, null, 2);
-        const blob = new Blob([fileContent], { type: 'application/json' });
-        const url = URL.createObjectURL(blob);
-
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = fileName;
-        a.style.display = 'none';
-        document.body.appendChild(a);
-        a.click();
-
-        downloadedPosts.add(postKey);
-        saveDownloadedPosts();
-
-        showPopup('downloadSuccess', 8000, { fileName });
-
-        setTimeout(() => {
-            document.body.removeChild(a);
-            URL.revokeObjectURL(url);
-        }, 3000);
-
-    } catch (err) {
-        log('Load', 'Download-Fehler:', err);
-        showPopup('downloadFailed', 10000);
-    }
-}
-
-    async function loadNewestLastReadPost() {
-        return new Promise(resolve => {
-            loadLastReadPost(async (storedPost) => {
-                const account = await getCurrentUserHandle();
-                if (storedPost && storedPost.tweetId && storedPost.authorHandler) {
-                    lastReadPost = storedPost;
-                    if (!lastReadPost.readAt) {
-                        lastReadPost.readAt = lastReadPost.timestamp;
-                    }
-                    log('Init', `Leseposition für Account ${account} geladen:`, lastReadPost);
-
-                    // Nach Reload/Start: etwas längerer Grace, weil Fokus/Blur-Zyklen passieren können
-                    suppressionState.until = Date.now() + 4000;
-                } else {
-                    log('Load', `Keine Leseposition für Account ${account} gefunden.`);
-                    showPopup('noPositionFound', 5000);
-                }
-                resolve();
-            });
-        });
-    }
-
-    let lastScrollY = window.scrollY;
-    let upSettleTimer = null;
-    let syntheticNewPostsClick = false;
-    let newPostsPillClickedAt = 0;
-    let newPostsPillClickCount = 0;
-    let newPostsPillClickText = '';
-    let focusPillWatchUntil = 0;
-    let pillPresentAtWatchStart = false;
-    let newPostsObserverClickTimer = null;
-    // null: Home-Reiter noch nicht erkannt. true: „Folge ich“. false: „Für dich“.
-    // Beide Reiter bleiben auf x.com/home, die Adresse ändert sich nicht.
-    let followingTabActive = null;
-    let followingClickArmAt = 0;
-    let timelineMapObserver = null;
-    let homeTabClickBound = false;
-
-    function focusWatchAllowsOffTopClick() {
-        // Nach dem Zurückkommen zeigt X die Pille oft erst ein paar Sekunden später.
-        // War sie beim Wechsel noch nicht da, wird sie geladen — auch unterhalb vom
-        // Seitenanfang. Danach sucht der bestehende Pfad die Lesestelle.
-        return Date.now() < focusPillWatchUntil && !pillPresentAtWatchStart;
-    }
-
-    function armFocusPillWatch() {
-        if (!window.location.pathname.startsWith('/home')) return;
-        if (followingTabActive === false) return;
-        if (!isScriptActivated && lastReadPost?.tweetId) {
-            isScriptActivated = true;
-        }
-        if (!isScriptActivated) return;
-        if (searchControl.isSearching || searchControl.isFallbackSearching ||
-            searchControl.isAutoScrolling || searchControl.manualSearchActive ||
-            searchControl.newPostsRestoreActive) {
-            return;
-        }
-        const now = Date.now();
-        if (now >= focusPillWatchUntil) {
-            pillPresentAtWatchStart = !!getNewPostsIndicator();
-            // Neuer Blick auf den Tab: die Klick-Sperre der vorigen Pille gilt nicht mehr.
-            newPostsPillClickCount = 0;
-            newPostsPillClickText = '';
-            newPostsPillClickedAt = 0;
-            newPostsState.autoLoadPaused = false;
-        }
-        focusPillWatchUntil = now + CONFIG.FOCUS_PILL_WATCH_MS;
-        observeForNewPosts();
-        burstCheckNewPosts();
-    }
-
-    const FOLLOWING_TAB_LABELS = new Set([
-        'folge ich',
-        'following',
-        'siguiendo',
-        'abonnements',
-        'seguindo',
-        'seguiti',
-        'フォロー中',
-        'подписки',
-        '正在关注',
-        '팔로잉',
-        'volgend',
-        'följer',
-        'følger'
-    ]);
-    const FOR_YOU_TAB_LABELS = new Set([
-        'für dich',
-        'for you',
-        'para ti',
-        'pour vous',
-        'para você',
-        'per te',
-        'おすすめ',
-        'для вас',
-        '为你推荐',
-        '추천',
-        'voor jou',
-        'för dig',
-        'til dig'
-    ]);
-
-    function normalizeHomeTabLabel(text) {
-        return (text || '').replace(/\s+/g, ' ').trim().toLowerCase();
-    }
-
-    function homeFeedTabEntries() {
-        const entries = [];
-        const tabs = document.querySelectorAll('[role="tab"]');
-        for (const tab of tabs) {
-            if (tab.closest('article')) continue;
-            const label = normalizeHomeTabLabel(tab.innerText || tab.textContent);
-            const kind = FOLLOWING_TAB_LABELS.has(label) ? 'following'
-                : FOR_YOU_TAB_LABELS.has(label) ? 'for-you'
-                : '';
-            if (!kind) continue;
-            entries.push({
-                kind,
-                selected: tab.getAttribute('aria-selected') === 'true' ||
-                    tab.getAttribute('aria-current') === 'page'
-            });
-        }
-        return entries;
-    }
-
-    // null: Reiter noch nicht erkennbar. true: „Folge ich“. false: „Für dich“.
-    function readFollowingTabSelected() {
-        const entries = homeFeedTabEntries();
-        if (!entries.some((entry) => entry.kind === 'following')) return null;
-        if (!entries.some((entry) => entry.kind === 'for-you')) return null;
-        const selected = entries.find((entry) => entry.selected);
-        if (!selected) return null;
-        return selected.kind === 'following';
-    }
-
-    function pauseTimelineForOtherHomeTab() {
-        newPostsState.autoLoadPaused = true;
-        if (newPostsObserverClickTimer) {
-            clearTimeout(newPostsObserverClickTimer);
-            newPostsObserverClickTimer = null;
-        }
-        if (newPostsBurstTimer) {
-            clearTimeout(newPostsBurstTimer);
-            newPostsBurstTimer = null;
-        }
-        clearUpSettlePromote();
-        const busy = searchControl.isSearching || searchControl.newPostsRestoreActive ||
-            searchControl.isFallbackSearching || searchControl.isAutoScrolling ||
-            searchControl.manualSearchActive;
-        if (!busy) return;
-        searchControl.isSearchCancelled = true;
-        searchControl.manualSearchActive = false;
-        searchControl.isSearching = false;
-        searchControl.isFallbackSearching = false;
-        searchControl.isAutoScrolling = false;
-        searchControl.newPostsRestoreActive = false;
-        noteProgrammaticScrollEnded();
-        releaseScrollAnchor();
-        debugLog('Init', 'Suche angehalten — Reiter ist nicht „Folge ich“.');
-    }
-
-    function resumeTimelineOnFollowingTab(reason, armPill) {
-        if (!isScriptActivated) {
-            isScriptActivated = true;
-            log('Init', 'Skript aktiv, weil „Folge ich“ gewählt ist.');
-        } else if (armPill) {
-            log('Init', '„Folge ich“ angeklickt — Skript liest wieder mit (' + reason + ').');
-        }
-        bindHomePageListeners();
-        observeForNewPosts();
-        setupTimelineMapObserver();
-        if (!armPill) return;
-        newPostsPillClickCount = 0;
-        newPostsPillClickText = '';
-        newPostsPillClickedAt = 0;
-        newPostsState.autoLoadPaused = false;
-        newPostsState.wakeClickArmedAt = 0;
-        newPostsState.suppressTopMarkUntil = 0;
-        searchControl.isSearchCancelled = false;
-        searchControl.manualSearchActive = false;
-        searchControl.isSearching = false;
-        searchControl.isFallbackSearching = false;
-        searchControl.isAutoScrolling = false;
-        searchControl.newPostsRestoreActive = false;
-        // War die Pille schon da, nicht unterhalb vom Anfang laden.
-        // Fehlt sie noch, fängt die Beobachtung sie ab, auch etwas unter dem Anfang.
-        pillPresentAtWatchStart = !!getNewPostsIndicator();
-        focusPillWatchUntil = Date.now() + CONFIG.FOCUS_PILL_WATCH_MS;
-        noteProgrammaticScrollEnded();
-        burstCheckNewPosts();
-        tryAutoClickNewPosts();
-        updateHighlightedPost();
-        setTimeout(() => {
-            if (followingTabActive !== true) return;
-            updateHighlightedPost();
-        }, 800);
-    }
-
-    function syncFollowingTabActivation(reason) {
-        if (!window.location.pathname.startsWith('/home')) {
-            followingTabActive = null;
-            return;
-        }
-        const selected = readFollowingTabSelected();
-        if (selected === null) return;
-        if (selected === followingTabActive) return;
-        const previous = followingTabActive;
-        followingTabActive = selected;
-        if (!selected) {
-            log('Init', 'Reiter „Für dich“ — Neue Posts warten auf „Folge ich“.');
-            pauseTimelineForOtherHomeTab();
-            return;
-        }
-        resumeTimelineOnFollowingTab(reason, previous === false);
-    }
-
-    function activateBecauseFollowingClicked() {
-        if (!window.location.pathname.startsWith('/home')) return;
-        if (readFollowingTabSelected() === false) return;
-        const now = Date.now();
-        const fresh = followingTabActive !== true || now - followingClickArmAt > 1500;
-        followingTabActive = true;
-        if (!fresh) {
-            observeForNewPosts();
-            tryAutoClickNewPosts();
-            return;
-        }
-        followingClickArmAt = now;
-        resumeTimelineOnFollowingTab('klick', true);
-    }
-
-    function homeTabLabelFromClick(event) {
-        const el = event.target instanceof Element ? event.target : null;
-        if (!el || el.closest('article')) return '';
-        const tab = el.closest('[role="tab"]');
-        if (tab) return normalizeHomeTabLabel(tab.innerText || tab.textContent);
-        const span = el.closest('span');
-        if (!span) return '';
-        return normalizeHomeTabLabel(span.textContent);
-    }
-
-    function onHomeTabClick(event) {
-        const label = homeTabLabelFromClick(event);
-        if (!label) return;
-        if (FOLLOWING_TAB_LABELS.has(label)) {
-            setTimeout(activateBecauseFollowingClicked, 50);
-            setTimeout(activateBecauseFollowingClicked, 400);
-            setTimeout(activateBecauseFollowingClicked, 1200);
-            return;
-        }
-        if (FOR_YOU_TAB_LABELS.has(label)) {
-            setTimeout(() => syncFollowingTabActivation('reiter'), 50);
-            setTimeout(() => syncFollowingTabActivation('reiter'), 400);
-        }
-    }
-
-    function bindFollowingTabClick() {
-        if (homeTabClickBound) return;
-        homeTabClickBound = true;
-        document.addEventListener('click', onHomeTabClick, true);
-    }
-
-    function clearUpSettlePromote() {
-        if (upSettleTimer) {
-            clearTimeout(upSettleTimer);
-            upSettleTimer = null;
-        }
-    }
-
-    function clearFreshUpScroll() {
-        scrollState.hasScrolledUp = false;
-        scrollState.lastUpScrollAt = 0;
-        scrollState.upScrollPeakY = null;
-        scrollState.scrollUpMaxTweetId = null;
-        scrollState.lastScrollUpPromoteAt = 0;
-        if (scrollState.lastMapScrollDirection === 'up') {
-            scrollState.lastMapScrollDirection = 'neutral';
-        }
-        clearUpSettlePromote();
-    }
-
-    // Am Anfang der Timeline, solange neue Beiträge geladen werden oder die
-    // Pille da ist: den neuesten Post nicht zur Lesestelle machen.
-    function newPostsBlockTopMark() {
-        if (Date.now() < (newPostsState.suppressTopMarkUntil || 0)) return true;
-        if (searchControl.newPostsRestoreActive || searchControl.isSearching) return true;
-        return !!getNewPostsIndicator();
-    }
-
-    function repostStillAtUpPeak() {
-        if (!scrollState.lastUpScrollAt) return false;
-        if (scrollState.lastMapScrollDirection === 'down') return false;
-        if (searchControl.isAutoScrolling || searchControl.isSearching || searchControl.isFallbackSearching) {
-            return false;
-        }
-        const sinceUp = Date.now() - scrollState.lastUpScrollAt;
-        if (sinceUp < 0 || sinceUp > CONFIG.SCROLL_UP_REPOST_RECHECK_MS) return false;
-        const peak = scrollState.upScrollPeakY;
-        const dropped = peak == null ? Infinity : window.scrollY - peak;
-        return dropped < CONFIG.SCROLL_UP_SETTLE_PX;
-    }
-
-    // Nach dem Hochscrollen noch zweimal prüfen. X zeichnet „hat repostet“
-    // oft erst, wenn das Scrollen schon steht. Ohne weiteres Scroll-Event
-    // würde der Repost sonst erst beim nächsten Hin- und Her übernommen.
-    function armUpSettlePromote() {
-        clearUpSettlePromote();
-        const delays = [400, 1000];
-        const step = (index) => {
-            const wait = index === 0 ? delays[0] : delays[index] - delays[index - 1];
-            upSettleTimer = setTimeout(() => {
-                upSettleTimer = null;
-                if (!repostStillAtUpPeak()) return;
-                void tryPromoteNewerVisiblePostOnScrollUp('up');
-                if (index + 1 < delays.length) step(index + 1);
-            }, wait);
-        };
-        step(0);
-    }
-
-    let homeListenersBound = false;
-    let homeBootStarted = false;
-    let unloadUnbindArmed = false;
-    let checkNewPostsIntervalId = null;
-    let onHomeScrollProgrammatic = null;
-    let onHomeScrollDebounced = null;
-    let onHomePillClick = null;
-
-    function bindHomePageListeners() {
-        bindFollowingTabClick();
-        if (homeListenersBound || !onHomeScrollDebounced || !onHomePillClick || !onHomeScrollProgrammatic) return;
-        if (!window.location.pathname.startsWith('/home')) return;
-        if (!unloadUnbindArmed) {
-            unloadUnbindArmed = true;
-            window.addEventListener('unload', () => unbindHomePageListeners());
-        }
-        homeListenersBound = true;
-        window.addEventListener('scroll', onHomeScrollProgrammatic, { passive: true });
-        window.addEventListener('scroll', onHomeScrollDebounced, { passive: true });
-        document.addEventListener('click', onHomePillClick, true);
-        checkNewPostsIntervalId = setInterval(() => {
-            syncFollowingTabActivation('interval');
-            if (followingTabActive === false) return;
-            nudgeStalledNewPostsRestore();
-            tryAutoClickNewPosts();
-            tryClickShowHiddenPostsButton('interval');
-        }, CONFIG.NEW_POSTS_CHECK_INTERVAL_MS);
-    }
-
-    function unbindHomePageListeners() {
-        if (onHomeScrollProgrammatic) window.removeEventListener('scroll', onHomeScrollProgrammatic);
-        if (onHomeScrollDebounced) window.removeEventListener('scroll', onHomeScrollDebounced);
-        if (onHomePillClick) document.removeEventListener('click', onHomePillClick, true);
-        if (checkNewPostsIntervalId) {
-            clearInterval(checkNewPostsIntervalId);
-            checkNewPostsIntervalId = null;
-        }
-        homeListenersBound = false;
-    }
-
-    async function initializeScript() {
-    try {
-        await loadNewestLastReadPost();
-
-        onHomeScrollProgrammatic = () => {
-            if (searchControl.isAutoScrolling || searchControl.isSearching || searchControl.isFallbackSearching) {
-                lastScrollY = window.scrollY;
-                scrollState.lastMapScrollY = window.scrollY;
-            }
-        };
-        onHomeScrollDebounced = debounce(() => {
-            if (followingTabActive === false) {
-                lastScrollY = window.scrollY;
-                scrollState.lastMapScrollY = window.scrollY;
-                return;
-            }
-            if (!isScriptActivated) {
-                isScriptActivated = true;
-                observeForNewPosts();
-            }
-            if (programmaticScrollEchoActive()) {
-                lastScrollY = window.scrollY;
-                scrollState.lastMapScrollY = window.scrollY;
-                return;
-            }
-
-            const deltaY = window.scrollY - lastScrollY;
-            const blockNewestMark = isNearTimelineTop() && newPostsBlockTopMark();
-            if (Math.abs(deltaY) > 8) {
-                searchControl.lastManualSearchEndedAt = 0;
-                suppressionState.blockNewerAdoptionUntil = 0;
-                scrollState.programmaticScrollEndedAt = 0;
-                if (!blockNewestMark) noteManualScrollMovedReading();
-            }
-            let mapScrollDir = 'neutral';
-            const upStillFresh = scrollState.lastUpScrollAt > 0 &&
-                (Date.now() - scrollState.lastUpScrollAt) < CONFIG.SCROLL_UP_SETTLE_MS;
-            if (blockNewestMark) {
-                // Sprung nach oben durch neue Beiträge: kein Hochscrollen.
-            } else if (deltaY < -CONFIG.MAP_SCROLL_DIRECTION_THRESHOLD) {
-                scrollState.hasScrolledUp = true;
-                mapScrollDir = 'up';
-                scrollState.lastMapScrollDirection = 'up';
-                scrollState.lastUpScrollAt = Date.now();
-                scrollState.upScrollPeakY = window.scrollY;
-                if (!scrollState.scrollUpMaxTweetId && lastReadPost?.tweetId) {
-                    updateScrollUpMaxTweetId(lastReadPost.tweetId);
-                }
-                armUpSettlePromote();
-            } else if (deltaY < 0 && (scrollState.hasScrolledUp || upStillFresh)) {
-                scrollState.hasScrolledUp = true;
-                mapScrollDir = 'up';
-                scrollState.lastMapScrollDirection = 'up';
-                scrollState.lastUpScrollAt = Date.now();
-                if (scrollState.upScrollPeakY == null || window.scrollY < scrollState.upScrollPeakY) {
-                    scrollState.upScrollPeakY = window.scrollY;
-                }
-                armUpSettlePromote();
-            } else if (deltaY > CONFIG.MAP_SCROLL_DIRECTION_THRESHOLD) {
-                mapScrollDir = 'down';
-                scrollState.lastMapScrollDirection = 'down';
-                scrollState.hasScrolledUp = false;
-                scrollState.lastScrollUpPromoteAt = 0;
-                scrollState.lastUpScrollAt = 0;
-                scrollState.upScrollPeakY = null;
-                scrollState.scrollUpMaxTweetId = null;
-                clearUpSettlePromote();
-            }
-            lastScrollY = window.scrollY;
-            scrollState.lastMapScrollY = window.scrollY;
-
-            // Runterscrollen lässt die Lesestelle stehen. Sie darf nicht auf
-            // ältere Stellen springen, nur weil der Viewport weiter unten ist.
-            // Ein kurzes Nachgeben direkt nach dem Hochscrollen übernimmt den
-            // obersten Repost noch — der kommt oft erst in diesem Moment an.
-            if (deltaY > 0) {
-                const sinceUp = Date.now() - (scrollState.lastUpScrollAt || 0);
-                const peak = scrollState.upScrollPeakY;
-                const dropped = peak == null ? Infinity : window.scrollY - peak;
-                const settlingAfterUp = mapScrollDir !== 'down' &&
-                    sinceUp >= 0 &&
-                    sinceUp < CONFIG.SCROLL_UP_SETTLE_MS &&
-                    dropped < CONFIG.SCROLL_UP_SETTLE_PX;
-                if (mapScrollDir === 'down') {
-                    refreshMapForLesestelle('scroll-down');
-                } else if (settlingAfterUp && !blockNewestMark) {
-                    void tryPromoteNewerVisiblePostOnScrollUp('up');
-                }
-                syncHighlightIfDrifted();
-                if (!isNearTimelineTop()) {
-                    newPostsState.autoLoadPaused = false;
-                } else {
-                    tryAutoClickNewPosts();
-                }
-                return;
-            }
-
-            // Am Timeline-Anfang mit neuen Beiträgen bleibt die gespeicherte
-            // Lesestelle. Der Sprung nach oben ist kein Hochscrollen und
-            // markiert nicht den neuesten Beitrag.
-            const freshUp = !blockNewestMark && (mapScrollDir === 'up' || repostStillAtUpPeak());
-            const markPromise = (blockNewestMark || (isNearTimelineTop() && !freshUp))
-                ? Promise.resolve(false)
-                : markTopVisiblePost(true, false, mapScrollDir);
-            if (!isNearTimelineTop()) {
-                newPostsState.autoLoadPaused = false;
-            } else {
-                void Promise.resolve(markPromise).then(() => {
-                    if (isNearTimelineTop()) tryAutoClickNewPosts();
-                }).catch((err) => {
-                    debugLog('Save', 'Lesestellen-Update vor Neue-Beiträge fehlgeschlagen:', err);
-                    if (isNearTimelineTop()) tryAutoClickNewPosts();
-                });
-            }
-        }, 150);
-
-        setupTimelineMapObserver();
-        window.addEventListener('beforeunload', () => persistTimelineMap(true));
-
-        // Klick auf die Pille läuft durch denselben Pfad wie der Auto-Klick:
-        // Bookmark merken, laden, dann die gespeicherte Lesestelle suchen.
-        // Ein Klick auf die große Lückenfläche darf hier nicht geschluckt werden.
-        onHomePillClick = (event) => {
-            if (syntheticNewPostsClick || !isScriptActivated) return;
-            if (searchControl.manualSearchActive || searchControl.newPostsRestoreActive) return;
-            if (!lastReadPost?.tweetId) return;
-            const target = event.target;
-            if (!(target instanceof Node)) return;
-            const gap = getShowHiddenPostsButton();
-            if (gap && (target === gap || gap.contains(target))) return;
-            const indicator = getNewPostsIndicator();
-            if (!indicator || (target !== indicator && !indicator.contains(target))) return;
-            event.preventDefault();
-            event.stopPropagation();
-            void clickNewPostsIndicator({ fromUser: true });
-        };
-        bindHomePageListeners();
-        const watchHomeTabs = (left) => {
-            syncFollowingTabActivation('init');
-            if (followingTabActive !== null || left <= 0) return;
-            setTimeout(() => watchHomeTabs(left - 1), 400);
-        };
-        watchHomeTabs(8);
-
-        window.addEventListener('focus', () => {
-            if (document.visibilityState !== 'visible') return;
-            notePageVisible('focus');
-            armFocusPillWatch();
-        });
-
-        // visibilitychange: X zeichnet die Pille oft erst Sekunden nach dem Zurückkommen.
-        document.addEventListener('visibilitychange', () => {
-            if (document.visibilityState === 'hidden') {
-                notePageHidden();
-                return;
-            }
-            notePageVisible('visibility');
-            armFocusPillWatch();
-        });
-
-        document.addEventListener('resume', () => {
-            notePageVisible('resume');
-            armFocusPillWatch();
-        });
-        window.addEventListener('pageshow', () => {
-            if (document.visibilityState !== 'visible') return;
-            notePageVisible('pageshow');
-            armFocusPillWatch();
-        });
-
-        const debouncedDownload = debounce(() => {
-            if (autoDownloadEnabled && lastReadPost && isScriptActivated && !searchControl.isSearching && !searchControl.isFallbackSearching && window.location.href.includes('/home')) {
-                // Während des kurzen Grace nach Restore/New Posts keinen Auto-Download machen
-                if (Date.now() < suppressionState.until) {
-                    debugLog('Restore', 'Auto-Download auf Blur unterdrückt (Grace aktiv)');
-                    return;
-                }
-
-                const postKey = `${lastReadPost.tweetId}-${lastReadPost.authorHandler}`;
-                if (!downloadedPosts.has(postKey)) {
-                    downloadLastReadPost();
-                }
-            }
-        }, 1000);
-
-        window.addEventListener('blur', debouncedDownload);
-        window.addEventListener('beforeunload', () => {
-            if (autoDownloadEnabled && lastReadPost && isScriptActivated && !searchControl.isSearching && !searchControl.isFallbackSearching && window.location.href.includes('/home')) {
-                if (Date.now() < suppressionState.until) {
-                    return; // Grace aktiv
-                }
-                const postKey = `${lastReadPost.tweetId}-${lastReadPost.authorHandler}`;
-                if (!downloadedPosts.has(postKey)) {
-                    downloadLastReadPost();
-                }
-            }
-        });
-    } catch (err) {
-        log('Init', 'Fehler bei der Initialisierung:', err);
-        showPopup('scriptError', 5000);
-    }
-}
-
-    let newPostsBurstTimer = null;
-
-    function burstCheckNewPosts() {
-        if (newPostsBurstTimer) return;
-        if (followingTabActive === false) return;
-        const watching = () => Date.now() < focusPillWatchUntil;
-        if (!watching() && !isNearTimelineTop()) return;
-        let attempt = 0;
-        const step = () => {
-            newPostsBurstTimer = null;
-            if (!isScriptActivated || followingTabActive === false) return;
-            const stillWatching = watching();
-            if (searchControl.isSearching || searchControl.isFallbackSearching ||
-                searchControl.isAutoScrolling || searchControl.newPostsRestoreActive) {
-                if (!stillWatching) return;
-                newPostsBurstTimer = setTimeout(step, 700);
-                return;
-            }
-            // Pause heißt nur: noch keine Pille und die Lesestelle steht schon.
-            // Nach dem Fokus kommt die Pille oft erst ein paar Sekunden später.
-            if (!stillWatching && (!isNearTimelineTop() || isNewPostsAutoLoadPaused())) return;
-            tryAutoClickNewPosts();
-            attempt++;
-            if (attempt > (stillWatching ? 28 : 8)) return;
-            newPostsBurstTimer = setTimeout(step, stillWatching ? 700 : (280 + attempt * 110));
-        };
-        step();
-    }
-
-    function bootHomePage() {
-        if (homeBootStarted || !window.location.pathname.startsWith('/home')) return;
-        homeBootStarted = true;
-        log('Init', 'Initialisiere Skript auf /home... (Version 2026.10.14c)');
-
-        const run = () => {
-            if (!window.location.pathname.startsWith('/home')) return;
-            const start = async () => {
-                try {
-                    await initializeScript();
-                    createButtons();
-                } catch (err) {
-                    log('Init', 'Fehler bei der Initialisierung:', err);
-                    showPopup('scriptError', 5000);
-                }
-                if (!window.location.pathname.startsWith('/home')) unbindHomePageListeners();
-            };
-            if (document.body) {
-                void start();
-                return;
-            }
-            const observer = new MutationObserver(() => {
-                if (!document.body) return;
-                observer.disconnect();
-                void start();
-            });
-            observer.observe(document.documentElement, { childList: true, subtree: true });
-        };
-        run();
-    }
-
-    function onSpaRoute() {
-        if (window.location.pathname.startsWith('/home')) {
-            if (!homeBootStarted) bootHomePage();
-            else bindHomePageListeners();
-            return;
-        }
-        unbindHomePageListeners();
-    }
-
-    let spaHooksInstalled = false;
-    function installSpaRouting() {
-        if (spaHooksInstalled) return;
-        spaHooksInstalled = true;
-        const wrapHistory = (name) => {
-            const original = history[name];
-            if (typeof original !== 'function') return;
-            history[name] = function () {
-                const result = original.apply(this, arguments);
-                onSpaRoute();
-                return result;
-            };
-        };
-        wrapHistory('pushState');
-        wrapHistory('replaceState');
-        window.addEventListener('popstate', onSpaRoute);
-    }
-
-    function clearHighlightFromPost(postElement) {
-        if (!postElement) return;
-        postElement.style.removeProperty('box-shadow');
-        postElement.style.removeProperty('outline');
-        postElement.style.removeProperty('outline-style');
-        postElement.style.removeProperty('outline-color');
-    }
-
-    function applyHighlightToPost(postElement, options = {}) {
-        if (!postElement || !postElement.isConnected) return false;
-        const { confidence = 100, strategy = 'exact' } = options;
-
-        if (lastHighlightedPost && lastHighlightedPost !== postElement) {
-            clearHighlightFromPost(lastHighlightedPost);
-        }
-
-        const outlineColor = confidence < 40 || strategy === 'emergency'
-            ? 'rgba(255, 107, 107, 0.9)'
-            : 'rgba(246, 146, 25, 0.95)';
-
-        postElement.style.setProperty('box-shadow', 'none', 'important');
-        postElement.style.setProperty('outline', `1px solid ${outlineColor}`, 'important');
-        lastHighlightedPost = postElement;
-        return true;
-    }
-
-    function resolveFreshPostElement(postElement, tweetId = null, authorHandler = null, repostFlag = null) {
-        if (postElement && postElement.isConnected) return postElement;
-        const id = tweetId || (postElement ? getPostTweetId(postElement) : null);
-        const author = authorHandler || (postElement ? getPostAuthorHandler(postElement) : null);
-        const repost = repostFlag !== null && repostFlag !== undefined
-            ? repostFlag
-            : (postElement ? isRepost(postElement) : null);
-        return findPostElementInDOM(id, author, repost);
-    }
-
-    function isPostNearReadingLine(postElement) {
-        if (!postElement?.isConnected) return false;
-        const rect = postElement.getBoundingClientRect();
-        if (rect.height < 5) return false;
-        const vh = window.innerHeight || document.documentElement.clientHeight;
-        return rect.bottom > 40 && rect.top < Math.min(vh * 0.45, CONFIG.RESTORE_SCROLL_OFFSET + 160);
-    }
-
-    function scheduleHighlightRetries(tweetId, authorHandler, delays = [0, 300, 900, 2000], repostFlag = null) {
-        const gen = ++highlightRetryGeneration;
-        const scrollGen = manualScrollGeneration;
-        delays.forEach(delay => {
-            setTimeout(() => {
-                if (gen !== highlightRetryGeneration || scrollGen !== manualScrollGeneration) return;
-                if (isScrollAnchorStale(tweetId, authorHandler, repostFlag)) {
-                    syncHighlightIfDrifted();
-                    debugLog('Highlight', `Retry nach ${delay}ms verworfen — Lesestelle hat sich geändert`);
-                    return;
-                }
-                const el = findPostElementInDOM(tweetId, authorHandler, repostFlag);
-                if (!el || !isPostNearReadingLine(el)) {
-                    debugLog('Highlight', `Retry nach ${delay}ms verworfen — Beitrag nicht mehr an der Leselinie`);
-                    return;
-                }
-                applyHighlightToPost(el);
-                debugLog('Highlight', `Rahmen gesetzt (Retry nach ${delay}ms)`);
-            }, delay);
-        });
-    }
-
-    function updateHighlightedPost(preferredElement = null) {
-        const freshPreferred = preferredElement
-            ? resolveFreshPostElement(
-                preferredElement,
-                getPostTweetId(preferredElement),
-                getPostAuthorHandler(preferredElement)
-            )
-            : null;
-        if (freshPreferred && applyHighlightToPost(freshPreferred)) {
-            debugLog('Highlight', 'Rand (1px) auf bevorzugtes Element gesetzt');
-            return;
-        }
-
-        if (!lastReadPost || !lastReadPost.tweetId || !lastReadPost.authorHandler) {
-            debugLog('Highlight', 'Keine gültige Leseposition für Rahmen.');
-            return;
-        }
-        const lastReadElement = findPostElementInDOM(lastReadPost.tweetId, lastReadPost.authorHandler, !!lastReadPost.isRepost);
-        if (lastReadElement) {
-            applyHighlightToPost(lastReadElement);
-            debugLog('Highlight', 'Rand (1px) auf Leseposition gesetzt');
-        } else if (lastHighlightedPost && lastHighlightedPost.isConnected) {
-            debugLog('Highlight', 'Leseposition nicht per ID im DOM, behalte aktuellen Rahmen');
-        } else {
-            debugLog('Highlight', 'Leseposition nicht im DOM, Rahmen nicht gesetzt');
-        }
-    }
-
-    async function adoptFallbackPost(postElement) {
-        if (!postElement) return;
-
-        const account = await getCurrentUserHandle();
-        const tweetId = getPostTweetId(postElement);
-        const authorHandler = getPostAuthorHandler(postElement);
-        const timestamp = getPostTimestamp(postElement);
-        const repostFlag = isRepost(postElement);
-
-        if (!tweetId || !authorHandler || !timestamp) {
-            log('Fallback', 'Konnte Fallback-Post nicht übernehmen – unvollständige Daten');
-            applyHighlightToPost(postElement);
-            return;
-        }
-
-        lastReadPost = {
-            account,
-            tweetId,
-            authorHandler,
-            timestamp,
-            isRepost: repostFlag,
-            readAt: repostFlag ? new Date().toISOString() : undefined,
-            adoptedFromFallback: true,
-            context: captureReadingContext(postElement)
-        };
-        if (repostFlag && !lastReadPost.readAt) {
-            lastReadPost.readAt = lastReadPost.timestamp;
-        }
-
-        const freshElement = resolveFreshPostElement(postElement, tweetId, authorHandler, repostFlag);
-        if (freshElement) {
-            applyHighlightToPost(freshElement);
-        }
-
-        await saveLastReadPost(lastReadPost, { force: true });
-        activateRestoreSuppression(tweetId);
-        scheduleHighlightRetries(tweetId, authorHandler, [0, 300, 900, 2000], repostFlag);
-        log('Fallback', `Lesestelle übernommen: @${authorHandler} ${tweetId}`);
-    }
-
-    function activateRestoreSuppression(tweetId) {
-        // Kurzer harter Grace + ID für frühe Aufhebung beim Weiterscrollen
-        suppressionState.until = Date.now() + CONFIG.RESTORE_GRACE_MS;
-        suppressionState.pastTweetId = tweetId || null;
-        suppressionState.blockNewerAdoptionUntil = Date.now() + CONFIG.POST_LUPE_NEWER_BLOCK_MS;
-        scrollState.hasScrolledUp = false; // Nach Restore/ manueller Suche kein "Hochscrollen" mehr annehmen
-        debugLog('Restore', `Grace ${CONFIG.RESTORE_GRACE_MS}ms aktiviert für ${tweetId}`);
-    }
-
-    function isLesestelleMutationBlocked() {
-        return searchControl.newPostsRestoreActive ||
-            searchControl.isSearching ||
-            searchControl.isFallbackSearching ||
-            searchControl.manualSearchActive;
-    }
-
-    async function markTopVisiblePost(save = true, allowOlderRegression = false, mapDirection = null) {
-    let savedNow = false;
-    try {
-
-    if (!window.location.href.includes('/home') || isLesestelleMutationBlocked()) {
-        return false;
-    }
-    if (followingTabActive === false) return false;
-
-    if (!allowOlderRegression &&
-        searchControl.lastManualSearchEndedAt > 0 &&
-        Date.now() - searchControl.lastManualSearchEndedAt < CONFIG.POST_LUPE_NEWER_BLOCK_MS) {
-        debugLog('Save', 'Auto-Save unterdrückt (nach Lupe-Suche / Scrollbalken-Nachlauf)');
-        return false;
-    }
-
-    const dir = mapDirection || scrollState.lastMapScrollDirection || 'neutral';
-    refreshMapForLesestelle('mark');
-
-    if (!allowOlderRegression && dir === 'down') {
-        syncHighlightIfDrifted();
-        debugLog('Save', 'Runterscrollen: Lesestelle bleibt, ältere Stelle wird nicht übernommen');
-        return false;
-    }
-
-    if (!allowOlderRegression && (dir === 'up' || scrollState.hasScrolledUp)) {
-        const promoted = await tryPromoteNewerVisiblePostOnScrollUp(dir);
-        if (promoted) return false;
-    }
-
-    // Gedächtnis-Abgleich — beim Hochscrollen pausieren (konkurriert mit tryPromote)
-    if (!shouldSkipCompetingLesestelleSync(dir)) {
-        reconcileLesestelleWithHistory();
-    } else {
-        debugLog('Save', 'Reconcile übersprungen: Hochscrollen/Cooldown aktiv');
-        syncHighlightIfDrifted();
-    }
-
-    // Punkt 3 vereinfacht: kurzer Grace + sofortige Aufhebung sobald User zu neuerem Post scrollt
-    if (save && !allowOlderRegression && suppressionState.until > 0) {
-        const now = Date.now();
-        let suppress = false;
-
-        if (now < suppressionState.until) {
-            // Harter kurzer Grace-Timer läuft noch
-            suppress = true;
-        } else if (suppressionState.pastTweetId) {
-            // Grace abgelaufen — oberster Post (Landkarte) vs. Lupe-Ziel prüfen
-            const readingPost = getTopVisiblePost();
-            if (readingPost) {
-                const currentId = getPostTweetId(readingPost);
-                if (currentId && BigInt(currentId) <= BigInt(suppressionState.pastTweetId)) {
-                    suppress = true;
-                } else {
-                    suppress = isPostLupeProtectionActive();
-                }
-            } else {
-                suppress = true;
-            }
-        }
-
-        if (suppress) {
-            save = false;
-            debugLog('Restore', 'Auto-Save unterdrückt (kurzer Grace aktiv)');
-        }
-    }
-
-    // Timer abgelaufen → komplett aufräumen
-    if (suppressionState.until > 0 && Date.now() >= suppressionState.until) {
-        suppressionState.until = 0;
-        suppressionState.pastTweetId = null;
-        debugLog('Restore', 'Grace abgelaufen — normale Auto-Speicherung wieder aktiv');
-    }
-
-    if (save && !allowOlderRegression && scrollState.programmaticScrollEndedAt > 0 &&
-        Date.now() - scrollState.programmaticScrollEndedAt < 2500) {
-        save = false;
-        debugLog('Restore', 'Auto-Save unterdrückt (nach programmatischem Scroll)');
-    }
-
-    const anchorPost = getLesestelleAnchorPost();
-    if (!anchorPost) return;
-
-    const postTweetId = getPostTweetId(anchorPost);
-    const postTimestamp = getPostTimestamp(anchorPost);
-    const postAuthorHandler = getPostAuthorHandler(anchorPost);
-    const repostFlag = isRepost(anchorPost);
-
-    // === History-Gedächtnis ===
-    // Bekannte Posts: standardmäßig nicht erneut setzen — AUSNAHME: Post steht in der
-    // Landkarte ÜBER der aktuellen Lesestelle → darf wieder Lesestelle werden (User-Wunsch).
-    const positionKey = `${postTweetId}-${repostFlag}`;
-    const anchorAsCandidate = {
-        tweetId: postTweetId,
-        authorHandler: postAuthorHandler,
-        timestamp: postTimestamp,
-        isRepost: repostFlag
-    };
-    const knownButAboveOnMap = !!(lastReadPost?.tweetId && knownMarkedKeys.has(positionKey) &&
-        isAboveLesestelleOnMap(anchorAsCandidate, lastReadPost) &&
-        isCandidateNewer(anchorAsCandidate, lastReadPost));
-
-    if (knownMarkedKeys.has(positionKey) && !allowOlderRegression && !knownButAboveOnMap) {
-        if (lastReadPost?.tweetId && postTweetId && postAuthorHandler && postTimestamp) {
-            try {
-                const higherId = BigInt(postTweetId) > BigInt(lastReadPost.tweetId);
-                const repostScrollUp = shouldAllowOlderRepostOnScrollUp(
-                    anchorPost, postTweetId, postTimestamp, repostFlag, dir
-                );
-                const sessionBlocked = isScrollUpSessionActive() ||
-                    newPostsState.restoreGraceUntil > Date.now() ||
-                    searchControl.newPostsRestoreActive;
-                // Hochscrollen: bekannte normale Posts nicht per GM-Sync adoptieren
-                // (Promotion blockiert sie bereits — GM-Sync umging das nach Session-Timeout).
-                if ((sessionBlocked || (isScrollUpActive(dir) && !repostFlag)) && !repostScrollUp) {
-                    debugLog('Save', `GM-Sync übersprungen — Hochscroll/Restore-Session (${positionKey})`);
-                    syncHighlightIfDrifted();
-                    return;
-                }
-                if (sessionBlocked && isBlockedByScrollUpMaxTweetId({
-                    tweetId: postTweetId,
-                    authorHandler: postAuthorHandler
-                }, lastReadPost.tweetId)) {
-                    syncHighlightIfDrifted();
-                    return;
-                }
-                const gmSyncAllowed = (repostScrollUp || higherId) &&
-                    (!shouldSkipCompetingLesestelleSync(dir) || isAnchorTopVisiblePost(anchorPost));
-                if (gmSyncAllowed) {
-                    if (isPostLupeProtectionActive()) {
-                        debugLog('Restore', 'GM-Sync übersprungen — Post-Lupe-Schutz aktiv');
-                        return;
-                    }
-                    const account = await getCurrentUserHandle();
-                    if (isLesestelleMutationBlocked()) {
-                        debugLog('Save', 'GM-Sync übersprungen — Suche oder Neue Beiträge laufen');
-                        return;
-                    }
-                    lastReadPost = {
-                        tweetId: postTweetId,
-                        timestamp: postTimestamp,
-                        authorHandler: postAuthorHandler,
-                        isRepost: repostFlag,
-                        account,
-                        readAt: new Date().toISOString(),
-                        context: captureReadingContext(anchorPost)
-                    };
-                    noteUserAdvancedReadingPosition(lastReadPost);
-                    await saveLastReadPost(lastReadPost, { force: true });
-                    updateHighlightedPost();
-                    debugLog('Save', `GM-Sync: bekannter Post ${positionKey} aktualisiert` +
-                        (repostScrollUp ? ' (Repost beim Hochscrollen)' : ' (neuere ID)'));
-                    return;
-                }
-            } catch (e) {
-                debugLog('Save', 'GM-Sync ID-Vergleich fehlgeschlagen:', e);
-            }
-        }
-        debugLog('Save', `Bereits in History bekannt (${positionKey}) – Lesestelle wird nicht neu gesetzt (Gedächtnis)`);
-        syncHighlightIfDrifted();
-        return;
-    }
-
-    // Repost-Tracking: interne Liste anlegen
-    // (defensiv gewrappt – schützt vor historischen Stale-Variablen wie dem früheren
-    //  "skipLesestelleUpdate" ReferenceError, der in älteren geladenen Versionen nach
-    //  der Punkt-3-Cleanup-Phase auftrat; siehe log.txt 30.05.2026)
-    try {
-        if (repostFlag && postAuthorHandler) {
-            const reposter = getReposterHandler(anchorPost);
+        try {
             const account = await getCurrentUserHandle();
-
-            debugLog('Repost', 'markTopVisiblePost repostFlag=true, author=', postAuthorHandler, 'reposter=', reposter);
-
-            if (reposter) {
-                addRepostToLog({
-                    reposter,
-                    originalAuthor: postAuthorHandler,
-                    repostDate: postTimestamp,
-                    discoveredAt: new Date().toISOString(),
-                    account
-                });
-            } else {
-                debugLog('Repost', 'detected but getReposterHandler returned null');
-                debugLog('Repost', 'Repost erkannt, aber Reposter-Handler nicht extrahiert');
-            }
-        } else if (repostFlag) {
-            debugLog('Repost', 'repostFlag=true but no postAuthorHandler');
-        }
-    } catch (repostErr) {
-        debugLog('Repost', 'Unerwarteter Fehler im Repost-Tracking-Block (nicht kritisch):', repostErr);
-    }
-
-    if (postTweetId && postAuthorHandler && postTimestamp && save && isScriptActivated) {
-
-        // Gedächtnis-Schutz (ID-basiert) als zusätzliche Absicherung
-        if (save && lastReadPost && lastReadPost.tweetId && !allowOlderRegression) {
-            const candId = BigInt(postTweetId);
-            const lastId = BigInt(lastReadPost.tweetId);
-            if (candId < lastId) {
-                if (shouldAllowOlderRepostOnScrollUp(anchorPost, postTweetId, postTimestamp, repostFlag, dir)) {
-                    debugLog('Save', `Gedächtnis-Schutz: ältere Repost-ID ${postTweetId} beim Hochscrollen erlaubt`);
-                } else {
-                    debugLog('Save', `Gedächtnis-Schutz: ältere ID ${postTweetId} wird nicht automatisch übernommen (aktuelle Lesestelle: ${lastReadPost.tweetId})`);
-                    save = false;
+            if (!isPlausibleUserHandle(account)) return;
+            const history = GM_getValue(HISTORY_KEY(account), []);
+            const exportHistory = (Array.isArray(history) ? history : []).slice(-50);
+            const repostLog = GM_getValue(REPOST_LOG_KEY(account), []);
+            const exportRepostLog = (Array.isArray(repostLog) ? repostLog : []).slice(-300);
+            let exportedTimelineMap = null;
+            if (orderedKeys.length) {
+                const entries = {};
+                for (const key of orderedKeys) {
+                    if (mapEntries.get(key)) entries[key] = mapEntries.get(key);
                 }
-            }
-        }
-
-        const account = await getCurrentUserHandle();
-        const nowIso = new Date().toISOString();
-        const newPost = {
-            tweetId: postTweetId,
-            timestamp: postTimestamp,
-            authorHandler: postAuthorHandler,
-            isRepost: repostFlag,
-            account,
-            readAt: nowIso,
-            context: captureReadingContext(anchorPost)
-        };
-
-        let shouldUpdate = true;
-
-        if (allowOlderRegression) {
-            shouldUpdate = true;
-        } else if (lastReadPost && lastReadPost.tweetId) {
-            try {
-                const newPostData = {
-                    tweetId: postTweetId,
-                    timestamp: postTimestamp,
-                    isRepost: repostFlag,
-                    readAt: nowIso
-                };
-
-                // Verwende die zentrale, typ-getrennte Logik
-                shouldUpdate = isCandidateNewer(newPostData, lastReadPost);
-
-                // Zusätzlicher konservativer Zeit-Guard NUR innerhalb desselben Typs
-                // (1 Stunde Rückschritt innerhalb von Reposts bzw. innerhalb von normalen Posts)
-                if (shouldUpdate) {
-                    const newTime = repostFlag ? Date.now() : new Date(postTimestamp).getTime();
-                    const currTime = new Date(getComparisonTimestamp(lastReadPost)).getTime();
-                    if (!isNaN(currTime) && newTime < currTime - 3600000) {
-                        // Nur blocken, wenn gleicher Typ (die isCandidateNewer hat schon Kreuz-Typ abgelehnt)
-                        const currIsRep = !!lastReadPost.isRepost;
-                        if (repostFlag === currIsRep) {
-                            shouldUpdate = false;
-                        }
-                    }
-                }
-            } catch (e) {
-                log('Save', 'Fehler bei isCandidateNewer:', e);
-            }
-        }
-
-        if (shouldUpdate) {
-            if (isLesestelleMutationBlocked()) {
-                debugLog('Save', 'Lesestelle nicht übernommen — Suche oder Neue Beiträge laufen');
-                return savedNow;
-            }
-            lastReadPost = newPost;
-            noteUserAdvancedReadingPosition(newPost);
-            invalidateHighlightRetries();
-            applyHighlightToPost(anchorPost);
-            await saveLastReadPost(lastReadPost, { force: allowOlderRegression });
-            log('Save', 'Neue Leseposition gespeichert: @' + postAuthorHandler, postTweetId, repostFlag ? '(Repost)' : '');
-
-            // Nach jedem erfolgreichen Speichern das Hochscroll-Flag zurücksetzen.
-            scrollState.hasScrolledUp = false;
-            savedNow = true;
-        }
-    }
-
-    if (lastReadPost && lastReadPost.tweetId && lastReadPost.authorHandler) {
-        const savedElement = Array.from(document.querySelectorAll("article[data-testid='tweet']")).find(post => {
-            const tweetId = getPostTweetId(post);
-            const author = getPostAuthorHandler(post);
-            return tweetId === lastReadPost.tweetId &&
-                author === lastReadPost.authorHandler &&
-                !!isRepost(post) === !!lastReadPost.isRepost;
-        });
-
-        if (savedElement) {
-            applyHighlightToPost(savedElement);
-        }
-    }
-    return savedNow;
-    } catch (err) {
-        log('Highlight', 'Unerwarteter Fehler in markTopVisiblePost:', err);
-        // Wichtig: isSearching wird hier NICHT angefasst – das übernimmt der Caller oder startRefinedSearch...
-    }
-}
-
-    function waitForNewPosts(callback, options = {}) {
-    const timelineContainer = document.querySelector("div[data-testid='primaryColumn']") || document.body;
-    const initialPostCount = options.baselinePostCount ?? document.querySelectorAll('article').length;
-    const initialCellCount = options.baselineCellCount ?? document.querySelectorAll("div[data-testid='cellInnerDiv']").length;
-    const initialScrollHeight = options.baselineScrollHeight ??
-        (document.body.scrollHeight || document.documentElement.scrollHeight);
-    const settleMs = options.settleMs ?? 1600;
-    const fallbackMs = options.fallbackMs ?? 3200;
-
-    let loadAttempts = 0;
-    const maxLoadAttempts = 12;
-    let callbackTriggered = false;
-    let wasHiddenDuringWait = pageIsBackgrounded();
-    let observer = null;
-    let timeoutCheck = null;
-    let fallbackTimer = null;
-    let onVisibilityEvent = null;
-
-    const cleanupWait = () => {
-        if (observer) observer.disconnect();
-        if (timeoutCheck) clearInterval(timeoutCheck);
-        if (fallbackTimer) clearTimeout(fallbackTimer);
-        if (onVisibilityEvent) document.removeEventListener('visibilitychange', onVisibilityEvent);
-        if (activeNewPostsWait === waitApi) activeNewPostsWait = null;
-    };
-
-    const hasNewDomContent = () => {
-        const currentPostCount = document.querySelectorAll('article').length;
-        const currentCellCount = document.querySelectorAll("div[data-testid='cellInnerDiv']").length;
-        const currentScrollHeight = document.body.scrollHeight || document.documentElement.scrollHeight;
-        return currentPostCount > initialPostCount
-            || currentCellCount > initialCellCount
-            || currentScrollHeight > initialScrollHeight + 30;
-    };
-
-    const triggerCallback = (reason) => {
-        if (callbackTriggered || searchControl.isSearchCancelled) return;
-        if (pageIsBackgrounded()) {
-            wasHiddenDuringWait = true;
-            debugLog('NewPosts', `Restore-Trigger „${reason}“ im Hintergrund zurückgestellt.`);
-            armFallback(CONFIG.WAKE_RESTORE_GRACE_MS, 'hidden-hold');
-            return;
-        }
-        callbackTriggered = true;
-        cleanupWait();
-        debugLog('NewPosts', `Restore-Trigger: ${reason}`);
-        setTimeout(() => {
-            callback();
-        }, settleMs);
-    };
-
-    const armFallback = (ms, reason) => {
-        if (fallbackTimer) clearTimeout(fallbackTimer);
-        fallbackTimer = setTimeout(() => {
-            if (callbackTriggered || searchControl.isSearchCancelled) return;
-            if (pageIsBackgrounded()) {
-                wasHiddenDuringWait = true;
-                armFallback(CONFIG.WAKE_RESTORE_GRACE_MS, 'hidden-retry');
-                return;
-            }
-            log('NewPosts', `Fallback-Restore (${reason}).`);
-            triggerCallback(reason);
-        }, ms);
-    };
-
-    const onVisibility = (forceAwake) => {
-        if (!forceAwake && pageIsBackgrounded()) {
-            wasHiddenDuringWait = true;
-            return;
-        }
-        if (!wasHiddenDuringWait || callbackTriggered) return;
-        loadAttempts = 0;
-        log('NewPosts', 'Tab wieder sichtbar — warte auf die nachgeladenen Posts, dann Lesestelle.');
-        armFallback(CONFIG.WAKE_RESTORE_GRACE_MS, 'wake');
-        setTimeout(() => {
-            if (callbackTriggered || pageIsBackgrounded()) return;
-            if (hasNewDomContent()) triggerCallback('wake-dom');
-        }, 700);
-    };
-
-    const waitApi = {
-        isDone: () => callbackTriggered,
-        force: (reason) => triggerCallback(reason || 'wake-force'),
-        extendForWake: () => {
-            if (callbackTriggered) return;
-            wasHiddenDuringWait = true;
-            newPostsState.restoreStartedAt = Date.now();
-            onVisibility(true);
-        },
-    };
-    activeNewPostsWait = waitApi;
-
-    observer = new MutationObserver(() => {
-        if (pageIsBackgrounded()) {
-            wasHiddenDuringWait = true;
-            return;
-        }
-        if (!hasNewDomContent()) return;
-        log('NewPosts', 'Neue Beiträge oder Zellen im DOM erkannt, starte Suche.');
-        triggerCallback('mutation');
-    });
-    observer.observe(timelineContainer, {
-        childList: true,
-        subtree: true,
-        attributes: false
-    });
-
-    timeoutCheck = setInterval(() => {
-        if (callbackTriggered || searchControl.isSearchCancelled) {
-            clearInterval(timeoutCheck);
-            return;
-        }
-        if (pageIsBackgrounded()) {
-            wasHiddenDuringWait = true;
-            return;
-        }
-        loadAttempts++;
-        if (hasNewDomContent()) {
-            log('NewPosts', 'Neue Beiträge über Polling erkannt, starte Suche.');
-            triggerCallback('poll');
-        } else if (loadAttempts >= maxLoadAttempts) {
-            log('NewPosts', 'Keine DOM-Änderung erkannt – Restore mit aktuellem Feed.');
-            triggerCallback('timeout');
-        }
-    }, 1000);
-
-    armFallback(fallbackMs, 'fallback');
-    onVisibilityEvent = () => onVisibility(false);
-    document.addEventListener('visibilitychange', onVisibilityEvent);
-
-    window.addEventListener('unload', () => {
-        cleanupWait();
-        searchControl.isSearching = false;
-        searchControl.isFallbackSearching = false;
-    }, { once: true });
-}
-
-    function getTopVisiblePost() {
-  const posts = document.querySelectorAll("article[data-testid='tweet']");
-  let topPost = null;
-  let minTop = Infinity;
-  const vh = window.innerHeight || document.documentElement.clientHeight;
-  const minTopForSaving = CONFIG.READING_POSITION_TOP_OFFSET;  // neue Lesestelle erst ab hier speichern (siehe CONFIG)
-
-  for (let i = 0; i < posts.length; i++) {
-    const post = posts[i];
-    const rect = post.getBoundingClientRect();
-    if (rect.height < 5) continue; // leere/virtualisierte Platzhalter überspringen
-    let effectiveTop = rect.top;
-
-    // Spezialbehandlung für Antworten (Replies):
-    // Der <article> umfasst den "Antwort an @..."-Header, der extra Höhe oben hinzufügt.
-    // Wenn der User den eigentlichen Text der Antwort auf der gewünschten Leseposition (~5px) hat,
-    // liegt rect.top des Articles oft < minTopForSaving, sodass normale Posts darunter als "top" gewählt werden.
-    // Wir messen stattdessen ab dem Ende des Reply-Kontexts, damit der Content der Antwort
-    // dieselbe visuelle Schwelle wie normale Posts erreicht, bevor er als neue Lesestelle gilt.
-    // Das verhindert, dass neuere Antwort-Posts (höhere IDs) übersprungen werden, obwohl sie
-    // visuell die aktuelle Leseposition sind (wie im html.txt-Beispiel mit 2061757693484810313).
-    const replyCtx = post.querySelector('div[dir="ltr"], [id*="ch9gg"]');
-    if (replyCtx) {
-      const txt = (replyCtx.textContent || '').trim();
-      if (/Antwort an|Replying to|En respuesta a|En réponse à|返信先|В ответ|답글|الرد على/i.test(txt)) {
-        const ctxRect = replyCtx.getBoundingClientRect();
-        effectiveTop = Math.max(effectiveTop, ctxRect.bottom || rect.top);
-      }
-    }
-
-    if (effectiveTop >= minTopForSaving && effectiveTop < vh && effectiveTop < minTop) {
-      minTop = effectiveTop;
-      topPost = post;
-    }
-  }
-  return topPost;
-}
-
-    function findNewestVisiblePostNewerThanBookmark(bookmark) {
-        if (!bookmark?.tweetId) return null;
-
-        let bookmarkId;
-        try {
-            bookmarkId = BigInt(bookmark.tweetId);
-        } catch (e) {
-            return null;
-        }
-
-        const vh = window.innerHeight || document.documentElement.clientHeight;
-        let best = null;
-        let bestId = bookmarkId;
-
-        for (const post of document.querySelectorAll("article[data-testid='tweet']")) {
-            const rect = post.getBoundingClientRect();
-            if (rect.height < 5 || rect.bottom <= 0 || rect.top >= vh) continue;
-
-            const parsed = parseLoadedPost(post);
-            if (!parsed?.tweetId) continue;
-            try {
-                if (parsed.bigId > bestId) {
-                    bestId = parsed.bigId;
-                    best = parsed;
-                }
-            } catch (e) {
-                continue;
-            }
-        }
-
-        return best;
-    }
-
-    function isScrollUpActive(mapDirection = null) {
-        const dir = mapDirection || scrollState.lastMapScrollDirection || 'neutral';
-        return dir === 'up' || !!scrollState.hasScrolledUp;
-    }
-
-    function isScrollUpCooldownActive() {
-        return scrollState.lastScrollUpPromoteAt > 0 &&
-            Date.now() - scrollState.lastScrollUpPromoteAt < CONFIG.SCROLL_UP_PROMOTE_COOLDOWN_MS;
-    }
-
-    function isScrollUpSessionActive() {
-        return scrollState.lastScrollUpPromoteAt > 0 &&
-            Date.now() - scrollState.lastScrollUpPromoteAt < CONFIG.SCROLL_UP_SESSION_MS;
-    }
-
-    /** Hochscroll-Phase: konkurrierende GM-Sync/Reconcile-Pfade pausieren. */
-    function shouldSkipCompetingLesestelleSync(mapDirection = null) {
-        return isScrollUpActive(mapDirection) || isScrollUpCooldownActive() || isScrollUpSessionActive();
-    }
-
-    function updateScrollUpMaxTweetId(tweetId) {
-        if (!tweetId) return;
-        try {
-            const id = BigInt(tweetId);
-            const cur = scrollState.scrollUpMaxTweetId ? BigInt(scrollState.scrollUpMaxTweetId) : BigInt(0);
-            if (id > cur) {
-                scrollState.scrollUpMaxTweetId = String(tweetId);
-            }
-        } catch (e) {
-            debugLog('Save', 'scrollUpMaxTweetId Update fehlgeschlagen:', e);
-        }
-    }
-
-    /**
-     * Snap-back-Schutz: nur wenn Lesestelle UNTER Session-Max gefallen ist (z. B. Repost)
-     * und ein konkurrierender Pfad wieder ÜBER Max springen will (z. B. GM-Sync → ChristophCanne).
-     * Promotion (oberster sichtbarer Post) bleibt ungeblockt.
-     */
-    function isBlockedByScrollUpMaxTweetId(candidate, referenceTweetId = null) {
-        if (!isScrollUpSessionActive() || !scrollState.scrollUpMaxTweetId || !candidate?.tweetId) {
-            return false;
-        }
-        const refId = referenceTweetId || lastReadPost?.tweetId;
-        if (!refId) return false;
-        try {
-            const candId = BigInt(candidate.tweetId);
-            const maxId = BigInt(scrollState.scrollUpMaxTweetId);
-            const refIdBig = BigInt(refId);
-            if (refIdBig < maxId && candId > maxId) {
-                debugLog('Save',
-                    `Hochscroll blockiert: @${candidate.authorHandler} ${candidate.tweetId}` +
-                    ` > Session-Max ${scrollState.scrollUpMaxTweetId}` +
-                    ` (Lesestelle ${refId} darunter)`);
-                return true;
-            }
-        } catch (e) {
-            debugLog('Save', 'Session-Max ID-Vergleich fehlgeschlagen:', e);
-        }
-        return false;
-    }
-
-    function isScrollUpPromotionCandidate(candidate, bookmark) {
-        if (!candidate?.tweetId || !bookmark?.tweetId) return false;
-        if (postRefKey(candidate) === postRefKey(bookmark)) return false;
-
-        const candidateKey = postRefKey(candidate);
-        const aboveOnMap = isAboveLesestelleOnMap(candidate, bookmark);
-
-        // History/Landkarte: bekannte normale Posts nur überspringen, wenn sie
-        // NICHT über der Lesestelle in der Landkarte stehen. Stehen sie darüber
-        // (kleinerer Map-Index), dürfen sie wieder Lesestelle werden.
-        if (!candidate.isRepost && candidateKey && knownMarkedKeys.has(candidateKey) && !aboveOnMap) {
-            debugLog('Save',
-                `Hochscroll-Promotion übersprungen: @${candidate.authorHandler} ${candidate.tweetId}` +
-                ' bereits in History/Landkarte (nicht über Lesestelle auf Map)');
-            return false;
-        }
-        if (!candidate.isRepost && candidateKey && knownMarkedKeys.has(candidateKey) && aboveOnMap) {
-            debugLog('Save',
-                `Hochscroll-Promotion erlaubt (Map über Lesestelle): @${candidate.authorHandler} ${candidate.tweetId}`);
-        }
-
-        // Session-Max: keine normalen Posts über dem Hochscroll-Höchststand (auch
-        // außerhalb isNearTimelineTop — marcfriedrich wurde dort noch promoted).
-        // Ausnahme: klar über der Lesestelle in der Landkarte → trotzdem promoten.
-        if (isScrollUpSessionActive() && !candidate.isRepost && !aboveOnMap) {
-            try {
-                const maxRef = scrollState.scrollUpMaxTweetId;
-                if (maxRef && BigInt(candidate.tweetId) > BigInt(maxRef)) {
-                    debugLog('Save',
-                        'Hochscroll-Promotion übersprungen: @' +
-                        candidate.authorHandler, candidate.tweetId,
-                        '(über Session-Max', maxRef + ')');
-                    return false;
-                }
-            } catch (e) {
-                return false;
-            }
-        }
-
-        if (aboveOnMap) return true;
-
-        try {
-            if (BigInt(candidate.tweetId) > BigInt(bookmark.tweetId)) return true;
-        } catch (e) {
-            return false;
-        }
-
-        return !!candidate.isRepost && isCandidateNewer(candidate, bookmark);
-    }
-
-    /** Nur der oberste sichtbare Post — kein Sprung zur höchsten Tweet-ID im Viewport. */
-    function findScrollUpPromotionCandidate(bookmark) {
-        if (!bookmark?.tweetId) return null;
-
-        const topEl = getTopVisiblePost();
-        if (!topEl) return null;
-        const topParsed = parseLoadedPost(topEl);
-        if (!topParsed?.tweetId || !topParsed.authorHandler || !topParsed.timestamp) return null;
-        if (!isScrollUpPromotionCandidate(topParsed, bookmark)) return null;
-
-        return topParsed;
-    }
-
-    function isAnchorTopVisiblePost(anchorPost) {
-        const topEl = getTopVisiblePost();
-        return !!(topEl && anchorPost && topEl === anchorPost);
-    }
-
-    function shouldAllowOlderRepostOnScrollUp(anchorPost, postTweetId, postTimestamp, repostFlag, mapDirection) {
-        if (!isScrollUpActive(mapDirection) || !repostFlag || !lastReadPost?.tweetId) return false;
-
-        const topEl = getTopVisiblePost();
-        if (!topEl || topEl !== anchorPost) return false;
-
-        return isCandidateNewer({
-            tweetId: postTweetId,
-            timestamp: postTimestamp,
-            isRepost: true,
-            readAt: new Date().toISOString()
-        }, lastReadPost);
-    }
-
-    /**
-     * Beim Hochscrollen: sichtbaren Post oberhalb der Lesestelle sofort markieren.
-     * Höhere Tweet-ID oder oberster Repost (ältere ID, frischer Feed-Eintrag).
-     */
-    async function tryPromoteNewerVisiblePostOnScrollUp(mapDirection) {
-        if (isLesestelleMutationBlocked()) return false;
-        if (newPostsState.restoreGraceUntil > Date.now()) return false;
-        if (isNearTimelineTop() && newPostsBlockTopMark()) return false;
-        if (!isScrollUpActive(mapDirection)) return false;
-        if (!lastReadPost?.tweetId) return false;
-
-        const newer = findScrollUpPromotionCandidate(lastReadPost);
-        if (!newer?.tweetId || !newer.authorHandler || !newer.timestamp) return false;
-
-        const account = await getCurrentUserHandle();
-        const nowIso = new Date().toISOString();
-        const newPost = {
-            tweetId: newer.tweetId,
-            timestamp: newer.timestamp,
-            authorHandler: newer.authorHandler,
-            isRepost: newer.isRepost,
-            account,
-            readAt: nowIso,
-            context: captureReadingContext(newer.element)
-        };
-
-        if (isLesestelleMutationBlocked() || newPostsState.restoreGraceUntil > Date.now() ||
-            (isNearTimelineTop() && newPostsBlockTopMark())) {
-            debugLog('Save', 'Hochscroll-Promotion abgebrochen — New-Posts/Restore aktiv');
-            return false;
-        }
-
-        invalidateHighlightRetries();
-        lastReadPost = newPost;
-        noteUserAdvancedReadingPosition(newPost);
-        updateScrollUpMaxTweetId(newPost.tweetId);
-        applyHighlightToPost(newer.element);
-        await saveLastReadPost(lastReadPost, { force: true });
-        updateHighlightedPost(newer.element);
-        log('Save', 'Hochscrollen: Post über Lesestelle markiert: @' + newer.authorHandler, newer.tweetId,
-            newer.isRepost ? '(Repost)' : '');
-        scrollState.hasScrolledUp = false;
-        scrollState.lastScrollUpPromoteAt = Date.now();
-        return true;
-    }
-
-    /**
-     * Post an der Lesestellen-Linie (RESTORE_SCROLL_OFFSET, default 175px).
-     * Wichtig: getTopVisiblePost() liefert den obersten Post (ab ~5px) — nach Lupe/Restore
-     * stehen dort oft neuere Posts ÜBER der echten Lesestelle und triggern falsche Saves.
-     */
-    function getPostAtReadingOffset(maxDeviation = 120) {
-        const posts = document.querySelectorAll("article[data-testid='tweet']");
-        const vh = window.innerHeight || document.documentElement.clientHeight;
-        const target = CONFIG.RESTORE_SCROLL_OFFSET;
-        let best = null;
-        let bestDev = Infinity;
-
-        for (const post of posts) {
-            const rect = post.getBoundingClientRect();
-            if (rect.height < 5) continue;
-            if (rect.bottom <= 0 || rect.top >= vh) continue;
-
-            const dev = Math.abs(rect.top - target);
-            if (dev < bestDev) {
-                bestDev = dev;
-                best = post;
-            }
-        }
-
-        return best && bestDev <= maxDeviation ? best : null;
-    }
-
-    function getLesestelleAnchorPost() {
-        if (shouldSkipCompetingLesestelleSync()) {
-            return getTopVisiblePost();
-        }
-        return getTopPostFromUpdatedMap();
-    }
-
-    function getPostTweetId(post) {
-        const linkElement = post.querySelector("a[role='link'][href*='/status/']");
-        if (!linkElement) return null;
-        const href = linkElement.getAttribute('href');
-        const match = href.match(/\/status\/(\d+)/);
-        return match ? match[1] : null;
-    }
-
-    function findPostElementInDOM(tweetId, authorHandler = null, repostFlag = null) {
-        if (!tweetId) return null;
-        return Array.from(document.querySelectorAll("article[data-testid='tweet']")).find(post => {
-            const id = getPostTweetId(post);
-            if (id !== tweetId) return false;
-            if (authorHandler && getPostAuthorHandler(post) !== authorHandler) return false;
-            if (repostFlag !== null && repostFlag !== undefined && !!isRepost(post) !== !!repostFlag) return false;
-            return true;
-        }) || null;
-    }
-
-    function getPostTimestamp(post) {
-
-        if (!post) return null;
-
-    const repostFlag = isRepost(post);
-
-    let timeElement = repostFlag
-        ? (post.querySelector('time[datetime]') || post.querySelector('article article time[datetime]'))
-        : post.querySelector('time[datetime]');
-
-    return timeElement ? timeElement.getAttribute('datetime') : null;
-}
-
-    /**
-     * Liefert den effektiven Zeitstempel für eine Leseposition:
-     * - Für normale Posts: der X-Timestamp des Posts (nahe am Lesezeitpunkt)
-     * - Für Reposts: der lokale Lesezeitpunkt (readAt), da der X-Timestamp dem Original-Post gehört
-     * Ermöglicht korrekte Altersprüfungen und Vergleiche auch bei Reposts.
-     */
-    function getEffectiveReadTimestamp(postData) {
-        if (!postData) return null;
-        return postData.readAt || postData.timestamp || null;
-    }
-
-    /**
-     * Gibt den für "neuer als"-Vergleiche relevanten Zeitstempel zurück,
-     * strikt getrennt nach Typ (Repost vs. normaler Post).
-     * Repost-Positionen verwenden readAt (Wann im Feed gesehen).
-     * Normale Posts verwenden ihren Erstellungs-timestamp.
-     */
-    function getComparisonTimestamp(postData) {
-        if (!postData) return null;
-        return postData.isRepost
-            ? (postData.readAt || postData.timestamp)
-            : postData.timestamp;
-    }
-
-    /**
-     * Zentrale Entscheidung: Ist der Kandidat neuer als die aktuelle Leseposition?
-     *
-     * Regel (User-Wunsch):
-     * - Repost-Timestamps (readAt) werden NUR mit anderen Repost-Timestamps verglichen.
-     * - Normale Post-Timestamps werden NUR mit anderen normalen Post-Timestamps verglichen.
-     * - Über die Typ-Grenze hinweg zählt nur eine strikt höhere Tweet-ID
-     *   (echter neuer Content im Feed). Dadurch wird verhindert, dass
-     *   ein Repost-readAt (aktuelle Wandzeit) normale neuere Posts blockiert.
-     */
-    function isCandidateNewer(candidate, current) {
-        if (!current || !current.tweetId) return true;
-        if (!candidate || !candidate.tweetId) return false;
-
-        const candIsRep = !!candidate.isRepost;
-        const currIsRep = !!current.isRepost;
-
-        const candText = typeof candidate.tweetId === 'string' ? candidate.tweetId : '';
-        const currText = typeof current.tweetId === 'string' ? current.tweetId : '';
-        if (!/^\d{1,25}$/.test(candText) || !/^\d{1,25}$/.test(currText)) return false;
-
-        let candId;
-        let currId;
-        try {
-            candId = BigInt(candText);
-            currId = BigInt(currText);
-        } catch (e) {
-            return false;
-        }
-
-        // Höhere ID = real neuerer Content → immer erlauben (überschreibt Typ-Mischung)
-        if (candId > currId) {
-            return true;
-        }
-
-        // Gleicher Typ → mit dem typspezifischen Timestamp vergleichen
-        if (candIsRep === currIsRep) {
-            const candT = getComparisonTimestamp(candidate);
-            const currT = getComparisonTimestamp(current);
-            if (candT && currT) {
-                return new Date(candT).getTime() > new Date(currT).getTime();
-            }
-            return false;
-        }
-
-        // Verschiedene Typen und keine höhere ID:
-        // Repost-Kandidat (auch mit älterer Tweet-ID) darf die Lesestelle werden,
-        // wenn er aktuell als oberster sichtbarer Beitrag im Viewport steht.
-        // (Ein frischer Repost eines alten Tweets repräsentiert "aktuellen Lesefortschritt".)
-        // Höher-ID-Content (normal oder Repost) kann später trotzdem vorrücken (siehe candId > currId).
-        if (candIsRep && !currIsRep) {
-            return true;
-        }
-
-        // Normale Posts mit <= ID nach einem Repost: nicht vorrücken (verhindert falsche Rücksprünge)
-        return false;
-    }
-
-    function getPostAuthorHandler(post) {
-
-        const repostFlag = isRepost(post);
-    let handlerElement;
-    if (repostFlag) {
-        // Strategie 1: Original-Post im eingebetteten <article> suchen (sehr zuverlässig)
-        const innerArticle = post.querySelector('article');
-        if (innerArticle) {
-            handlerElement = innerArticle.querySelector("a[role='link'][href^='/']:not([href*='/status/'])");
-        }
-
-        // Strategie 2: Ersten Profil-Link nehmen, der NICHT im socialContext (Reposter) liegt
-        if (!handlerElement) {
-            const socialContext = post.querySelector('span[data-testid="socialContext"]');
-            const allLinks = Array.from(post.querySelectorAll("a[role='link'][href^='/']:not([href*='/status/'])"));
-            const contentLinks = allLinks.filter(link =>
-                !socialContext || !socialContext.contains(link)
-            );
-            handlerElement = contentLinks[0] || null;
-        }
-
-        // Strategie 3: Letzter Fallback (alte Heuristik)
-        if (!handlerElement) {
-            const allLinks = post.querySelectorAll("a[role='link'][href^='/']:not([href*='/status/'])");
-            handlerElement = allLinks[1] || allLinks[0];
-        }
-    } else {
-
-        handlerElement = post.querySelector("a[role='link'][href*='/']:not([href*='/status/'])");
-    }
-    if (!handlerElement) {
-        return null;
-    }
-    const href = handlerElement.getAttribute('href') || '';
-    const text = handlerElement.textContent || '';
-    let handle = null;
-    if (href) {
-        const match = href.match(/^\/([^/]+)/);
-        if (match && match[1] && !['i', 'home', 'explore', 'messages', 'notifications'].includes(match[1])) {
-            handle = match[1];
-        }
-    }
-    if (!handle && text.startsWith('@') && text.length > 1) {
-        handle = text.slice(1);
-    }
-
-    const isValid = handle && /^[a-zA-Z0-9_\p{L}]{1,15}$/u.test(handle);
-    return isValid ? handle : null;
-}
-
-    function getVisiblePosts() {
-
-        const posts = Array.from(document.querySelectorAll("article[data-testid='tweet']"));
-    return posts.filter(post => {
-        const rect = post.getBoundingClientRect();
-        return rect.top < window.innerHeight && rect.bottom > 0;
-    }).map(post => ({
-        element: post,
-        tweetId: getPostTweetId(post),
-        timestamp: getPostTimestamp(post),
-        authorHandler: getPostAuthorHandler(post),
-        isRepost: isRepost(post)
-    }));
-}
-
-    function getNewestHistoryEntry() {
-        if (!postHistoryCache.length) return null;
-        return postHistoryCache.reduce((best, entry) => {
-            if (!entry?.tweetId) return best;
-            if (!best) return entry;
-            return isCandidateNewer(entry, best) ? entry : best;
-        }, null);
-    }
-
-    function rebuildKnownMarkedKeys() {
-        knownMarkedKeys.clear();
-        postHistoryCache.forEach(entry => {
-            if (entry && entry.tweetId) {
-                const key = `${entry.tweetId}-${!!entry.isRepost}`;
-                knownMarkedKeys.add(key);
-            }
-        });
-    }
-
-    /**
-     * Neue Gedächtnis-Funktion (User-Vorschlag):
-     * Gleicht die aktuell sichtbare Timeline mit der gespeicherten History (letzte MAX_POST_HISTORY Positionen)
-     * ab, um die "wirklich" weiteste erreichte Lesestelle zu finden.
-     * Verhindert, dass beim Hochscrollen alte Reposts die neueren Fortschritte überschreiben.
-     */
-    function reconcileLesestelleWithHistory() {
-        if (isLesestelleMutationBlocked()) return;
-        if (shouldSkipCompetingLesestelleSync()) return;
-        if (!lastReadPost || !lastReadPost.tweetId || postHistoryCache.length === 0) {
-            return;
-        }
-
-        try {
-            const visible = getVisiblePosts();
-            if (visible.length === 0) return;
-
-            // === Option 2 Fix: Starke Präferenz für den exakten aktuellen lastReadPost ===
-            // Solange die exakte gespeicherte Lesestelle (Tweet-ID + isRepost) noch sichtbar ist,
-            // erlauben wir KEINE Korrektur zu einem anderen History-Eintrag.
-            // Das verhindert das nervige Springen des Rahmens zwischen zwei sehr ähnlichen Reposts.
-            const currentKey = `${lastReadPost.tweetId}-${!!lastReadPost.isRepost}`;
-            const exactPositionStillVisible = visible.some(p => {
-                return `${p.tweetId}-${!!p.isRepost}` === currentKey;
-            });
-
-            if (exactPositionStillVisible) {
-                debugLog('Save', 'Reconcile übersprungen: Exakte aktuelle Lesestelle ist noch sichtbar (Option 2 Präferenz)');
-                syncHighlightIfDrifted();
-                return; // Nicht korrigieren, solange die echte aktuelle Position noch im Viewport ist
-            }
-
-            // Oben in der Timeline: neuester History-Eintrag hat Vorrang (verhindert GM-Drift)
-            if (isNearTimelineTop()) {
-                const newestHist = getNewestHistoryEntry();
-                if (newestHist?.tweetId) {
-                    const newestKey = `${newestHist.tweetId}-${!!newestHist.isRepost}`;
-                    const newestVisible = visible.some(p =>
-                        `${p.tweetId}-${!!p.isRepost}` === newestKey
-                    );
-                    if (newestVisible && isCandidateNewer(newestHist, lastReadPost)) {
-                        lastReadPost = { ...newestHist };
-                        noteUserAdvancedReadingPosition(lastReadPost);
-                        updateHighlightedPost();
-                        void saveLastReadPost(lastReadPost, { force: true });
-                        debugLog('Save', 'Gedächtnis-Abgleich: Neuester History-Eintrag oben im Feed (GM-Sync)');
-                        return;
-                    }
-                }
-            }
-
-            // History als schnelle Lookup-Map aufbauen (getrennt nach Typ für bessere Treffer)
-            const historyMap = new Map();
-            postHistoryCache.forEach(entry => {
-                if (entry && entry.tweetId) {
-                    const key = `${entry.tweetId}-${!!entry.isRepost}`;
-                    historyMap.set(key, entry);
-                }
-            });
-
-            let bestFromHistoryAndVisible = null;
-
-            // Durch sichtbare Posts gehen und schauen, welche schon mal in History markiert wurden
-            for (const vis of visible) {
-                const key = `${vis.tweetId}-${!!vis.isRepost}`;
-                const histEntry = historyMap.get(key);
-                if (histEntry) {
-                    // Kandidat: in History + aktuell sichtbar
-                    if (!bestFromHistoryAndVisible || isCandidateNewer(histEntry, bestFromHistoryAndVisible)) {
-                        bestFromHistoryAndVisible = histEntry;
-                    }
-                }
-            }
-
-            if (bestFromHistoryAndVisible) {
-                // Wenn dieser aus History stammende sichtbare Post "weiter" ist als unser aktuelles lastReadPost,
-                // dann setzen wir ihn als autoritative Lesestelle (starkes Gedächtnis).
-                if (isCandidateNewer(bestFromHistoryAndVisible, lastReadPost)) {
-                    lastReadPost = { ...bestFromHistoryAndVisible };
-                    noteUserAdvancedReadingPosition(lastReadPost);
-                    updateHighlightedPost();
-                    debugLog('Save', 'Gedächtnis-Abgleich: Lesestelle aus History + sichtbarer Timeline korrigiert');
-                }
-            }
-        } catch (e) {
-            debugLog('Save', 'Fehler beim History-Timeline Abgleich:', e);
-        }
-    }
-
-    // ============================================================
-    // Timeline-Landkarte — Feed-Reihenfolge-Gedächtnis
-    // ============================================================
-
-    const TIMELINE_MAP_KEY = (account) => `timelineMap_${account}`;
-
-    function rebuildTimelineMapIndex() {
-        timelineMapIndexByKey.clear();
-        for (let i = 0; i < timelineMapOrderedKeys.length; i++) {
-            timelineMapIndexByKey.set(timelineMapOrderedKeys[i], i);
-        }
-    }
-
-    function mapIndexOf(key) {
-        if (!key) return -1;
-        const idx = timelineMapIndexByKey.get(key);
-        return idx === undefined ? -1 : idx;
-    }
-
-    function loadTimelineMapForAccount(account, force = false) {
-        if (!force && timelineMapAccount === account && timelineMapOrderedKeys.length > 0) {
-            debugLog('Map', `Live-Landkarte beibehalten (${timelineMapOrderedKeys.length} Einträge)`);
-            return;
-        }
-
-        timelineMapAccount = account;
-        timelineMapOrderedKeys = [];
-        timelineMapByKey.clear();
-        timelineMapIndexByKey.clear();
-        timelineMapLastPersist = 0;
-
-        const stored = GM_getValue(TIMELINE_MAP_KEY(account), null);
-        if (!stored) return;
-
-        try {
-            const data = typeof stored === 'string' ? JSON.parse(stored) : stored;
-            const sevenDaysAgo = Date.now() - CONFIG.SEVEN_DAYS_IN_MS;
-            const entries = data.entries || {};
-            const ordered = Array.isArray(data.orderedKeys) ? data.orderedKeys : [];
-            const filteredOrder = [];
-
-            for (const key of ordered) {
-                const entry = entries[key];
-                if (!entry?.tweetId) continue;
-                const seenAt = new Date(entry.lastSeenAt || 0).getTime();
-                if (seenAt <= sevenDaysAgo) continue;
-                filteredOrder.push(key);
-                timelineMapByKey.set(key, { ...entry, inDom: false });
-            }
-
-            timelineMapOrderedKeys = filteredOrder.slice(0, CONFIG.MAX_TIMELINE_MAP);
-            const orderSet = new Set(timelineMapOrderedKeys);
-            for (const key of [...timelineMapByKey.keys()]) {
-                if (!orderSet.has(key)) timelineMapByKey.delete(key);
-            }
-            rebuildTimelineMapIndex();
-
-            debugLog('Map', `Landkarte geladen: ${timelineMapOrderedKeys.length} Einträge`);
-        } catch (e) {
-            log('Map', 'Fehler beim Laden der Landkarte:', e);
-        }
-    }
-
-    function persistTimelineMap(force = false) {
-        if (!timelineMapAccount) return;
-        const now = Date.now();
-        if (!force && now - timelineMapLastPersist < CONFIG.TIMELINE_MAP_PERSIST_MS) return;
-
-        const entries = {};
-        for (const key of timelineMapOrderedKeys) {
-            const entry = timelineMapByKey.get(key);
-            if (entry) entries[key] = entry;
-        }
-
-        GM_setValue(TIMELINE_MAP_KEY(timelineMapAccount), JSON.stringify({
-            orderedKeys: timelineMapOrderedKeys,
-            entries,
-            savedAt: new Date().toISOString()
-        }));
-        timelineMapLastPersist = now;
-    }
-
-    function trimTimelineMap() {
-        const sevenDaysAgo = Date.now() - CONFIG.SEVEN_DAYS_IN_MS;
-        const kept = [];
-
-        for (const key of timelineMapOrderedKeys) {
-            const entry = timelineMapByKey.get(key);
-            if (!entry) continue;
-            const seenAt = new Date(entry.lastSeenAt || 0).getTime();
-            if (seenAt <= sevenDaysAgo) {
-                timelineMapByKey.delete(key);
-                continue;
-            }
-            kept.push(key);
-        }
-
-        if (kept.length > CONFIG.MAX_TIMELINE_MAP) {
-            // Index 0 ist der neueste Beitrag. Die ältesten am Ende entfernen.
-            const removed = kept.splice(CONFIG.MAX_TIMELINE_MAP);
-            for (const key of removed) timelineMapByKey.delete(key);
-        }
-
-        timelineMapOrderedKeys = kept;
-        rebuildTimelineMapIndex();
-    }
-
-    let timelineMapDirtyWhileDeferred = false;
-
-    function tweetArticlesFrom(nodes) {
-        const list = [];
-        const seen = new Set();
-        const consider = (el) => {
-            if (!el || el.nodeType !== 1 || seen.has(el)) return;
-            if (!el.matches("article[data-testid='tweet']")) return;
-            seen.add(el);
-            list.push(el);
-        };
-        for (const node of nodes) {
-            if (!node || node.nodeType !== 1) continue;
-            consider(node);
-            if (node.querySelectorAll) {
-                node.querySelectorAll("article[data-testid='tweet']").forEach(consider);
-            }
-        }
-        list.sort((a, b) => {
-            if (a === b) return 0;
-            const pos = a.compareDocumentPosition(b);
-            if (pos & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
-            if (pos & Node.DOCUMENT_POSITION_PRECEDING) return 1;
-            return 0;
-        });
-        return list;
-    }
-
-    function parsedArticleKey(article) {
-        const parsed = parseLoadedPost(article);
-        if (!parsed?.tweetId) return null;
-        const key = postRefKey(parsed);
-        if (!key) return null;
-        return { key, parsed };
-    }
-
-    function noteArticleKey(article, key, parsed) {
-        const prev = article.getAttribute('data-xts-map-key');
-        if (prev && prev !== key) {
-            const old = timelineMapByKey.get(prev);
-            if (old) old.inDom = false;
-        }
-        if (article.isConnected) article.setAttribute('data-xts-map-key', key);
-        const nowIso = new Date().toISOString();
-        const existing = timelineMapByKey.get(key);
-        if (existing) {
-            existing.lastSeenAt = nowIso;
-            existing.inDom = !!article.isConnected;
-            existing.isRepost = !!parsed.isRepost;
-            if (parsed.authorHandler) existing.authorHandler = parsed.authorHandler;
-            if (parsed.timestamp) existing.timestamp = parsed.timestamp;
-            if (article.isConnected) existing.ghostTail = false;
-            return;
-        }
-        timelineMapByKey.set(key, {
-            key,
-            tweetId: parsed.tweetId,
-            authorHandler: parsed.authorHandler,
-            isRepost: !!parsed.isRepost,
-            timestamp: parsed.timestamp,
-            lastSeenAt: nowIso,
-            inDom: !!article.isConnected
-        });
-    }
-
-    function nearestMappedKey(article, stepProp) {
-        let cell = article.closest?.("[data-testid='cellInnerDiv']") || article;
-        let node = cell[stepProp];
-        for (let guard = 0; node && guard < 80; guard++) {
-            const art = node.matches?.("article[data-testid='tweet']")
-                ? node
-                : node.querySelector?.("article[data-testid='tweet']");
-            if (art) {
-                const found = parsedArticleKey(art);
-                if (found && mapIndexOf(found.key) >= 0) return found.key;
-            }
-            node = node[stepProp];
-        }
-        return null;
-    }
-
-    function chunkBelongsBeforeMap(items) {
-        const head = timelineMapByKey.get(timelineMapOrderedKeys[0]);
-        if (!head?.tweetId) return true;
-        let headId;
-        try {
-            headId = BigInt(head.tweetId);
-        } catch (e) {
-            return true;
-        }
-        for (const item of items) {
-            try {
-                if (BigInt(item.parsed.tweetId) > headId) return true;
-            } catch (e) { /* nächster */ }
-        }
-        return false;
-    }
-
-    function visibleArticleElements() {
-        const out = [];
-        const vh = window.innerHeight || 800;
-        const posts = document.querySelectorAll("article[data-testid='tweet']");
-        for (const post of posts) {
-            const rect = post.getBoundingClientRect();
-            if (rect.bottom > 0 && rect.top < vh) out.push(post);
-        }
-        return out;
-    }
-
-    /**
-     * Neue Posts an den DOM-Nachbarn einhängen. Kein indexOf über die ganze Landkarte,
-     * keine Reihenfolge über die Tweet-ID (die dreht Reposts um).
-     */
-    function ingestArticles(nodes, source) {
-        const ordered = tweetArticlesFrom(nodes);
-        if (!ordered.length) return 0;
-
-        const fresh = [];
-        for (const article of ordered) {
-            const found = parsedArticleKey(article);
-            if (!found) continue;
-            noteArticleKey(article, found.key, found.parsed);
-            if (mapIndexOf(found.key) < 0) fresh.push({ article, ...found });
-        }
-        if (!fresh.length) {
-            persistTimelineMap();
-            return 0;
-        }
-
-        const firstEl = fresh[0].article;
-        const lastEl = fresh[fresh.length - 1].article;
-        const prevIdx = mapIndexOf(nearestMappedKey(firstEl, 'previousElementSibling'));
-        const nextIdx = mapIndexOf(nearestMappedKey(lastEl, 'nextElementSibling'));
-        let insertAt = timelineMapOrderedKeys.length;
-        if (prevIdx >= 0) insertAt = prevIdx + 1;
-        else if (nextIdx >= 0) insertAt = nextIdx;
-        else if (!timelineMapOrderedKeys.length || chunkBelongsBeforeMap(fresh) || isNearTimelineTop()) insertAt = 0;
-
-        let at = insertAt;
-        for (const item of fresh) {
-            timelineMapOrderedKeys.splice(at, 0, item.key);
-            at++;
-        }
-        trimTimelineMap();
-        persistTimelineMap();
-        debugLog('Map', `Ingest (${source}): +${fresh.length}, gesamt ${timelineMapOrderedKeys.length}`);
-        return fresh.length;
-    }
-
-    function markDetachedArticles(nodes) {
-        for (const article of tweetArticlesFrom(nodes)) {
-            if (article.isConnected) continue;
-            const stored = article.getAttribute('data-xts-map-key');
-            const found = stored ? null : parsedArticleKey(article);
-            const key = stored || found?.key;
-            const entry = key ? timelineMapByKey.get(key) : null;
-            if (entry) entry.inDom = false;
-        }
-    }
-
-    function scheduleTimelineMapUpdate(source = 'unknown') {
-        if (shouldDeferTimelineMapUpdate()) {
-            timelineMapDirtyWhileDeferred = true;
-            timelineMapPendingSource = source;
-            return;
-        }
-        timelineMapPendingSource = source;
-        if (timelineMapUpdateTimer) return;
-        timelineMapUpdateTimer = setTimeout(() => {
-            timelineMapUpdateTimer = null;
-            if (shouldDeferTimelineMapUpdate()) {
-                timelineMapDirtyWhileDeferred = true;
-                return;
-            }
-            refreshMapForLesestelle(timelineMapPendingSource);
-        }, CONFIG.TIMELINE_MAP_DEBOUNCE_MS);
-    }
-
-    function shouldDeferTimelineMapUpdate() {
-        if (searchControl.newPostsRestoreActive) return true;
-        if (searchControl.isFallbackSearching) return true;
-        // Lupe: erst nach eingefrorenem Snapshot pausieren (search-init + Snapshot bleiben möglich)
-        if (searchControl.isSearching && scrollState.mapSnapshotOrderedKeys?.length) return true;
-        return false;
-    }
-
-    function flushDeferredTimelineMapUpdate(source = 'deferred-flush') {
-        if (!timelineMapDirtyWhileDeferred) return;
-        timelineMapDirtyWhileDeferred = false;
-        if (timelineMapUpdateTimer) {
-            clearTimeout(timelineMapUpdateTimer);
-            timelineMapUpdateTimer = null;
-        }
-        if (mapMutationTimer) {
-            clearTimeout(mapMutationTimer);
-            mapMutationTimer = null;
-        }
-        mapMutationArticles.clear();
-        mapMutationRemoved.splice(0, mapMutationRemoved.length);
-        updateTimelineMap(timelineMapPendingSource || source, true);
-    }
-
-    function updateTimelineMap(source = 'unknown', force = false) {
-        if (!force && shouldDeferTimelineMapUpdate()) {
-            timelineMapDirtyWhileDeferred = true;
-            timelineMapPendingSource = source;
-            return;
-        }
-        if (followingTabActive === false) return;
-        if (!window.location.href.includes('/home')) return;
-
-        for (const entry of timelineMapByKey.values()) entry.inDom = false;
-        const root = document.querySelector("div[data-testid='primaryColumn']") || document;
-        ingestArticles(root.querySelectorAll("article[data-testid='tweet']"), source);
-    }
-
-    function flushMapMutations() {
-        mapMutationTimer = null;
-        if (followingTabActive === false) {
-            mapMutationArticles.clear();
-            mapMutationRemoved.splice(0, mapMutationRemoved.length);
-            return;
-        }
-        const articles = [...mapMutationArticles];
-        const removed = mapMutationRemoved.splice(0, mapMutationRemoved.length);
-        mapMutationArticles.clear();
-        if (shouldDeferTimelineMapUpdate()) {
-            timelineMapDirtyWhileDeferred = true;
-            timelineMapPendingSource = 'mutation';
-            return;
-        }
-        markDetachedArticles(removed);
-        if (articles.length) ingestArticles(articles, 'mutation');
-    }
-
-    function queueMapMutation(articles, removed) {
-        for (const article of articles) mapMutationArticles.add(article);
-        if (removed.length) mapMutationRemoved.push(...removed);
-        if (mapMutationTimer) return;
-        mapMutationTimer = setTimeout(flushMapMutations, CONFIG.TIMELINE_MAP_DEBOUNCE_MS);
-    }
-
-    function setupTimelineMapObserver() {
-        const container = document.querySelector("div[data-testid='primaryColumn']");
-        if (!container) {
-            setTimeout(setupTimelineMapObserver, 500);
-            return;
-        }
-        if (timelineMapObserver) {
-            timelineMapObserver.disconnect();
-            timelineMapObserver = null;
-        }
-
-        const observer = new MutationObserver((mutations) => {
-            if (followingTabActive === false) return;
-            const articles = [];
-            const removed = [];
-            for (const mutation of mutations) {
-                if (mutation.type !== 'childList') continue;
-                const host = mutation.target?.closest?.("article[data-testid='tweet']");
-                if (host) articles.push(host);
-                for (const node of mutation.addedNodes) {
-                    if (node.nodeType !== 1) continue;
-                    if (node.matches?.("article[data-testid='tweet']")) articles.push(node);
-                    else node.querySelectorAll?.("article[data-testid='tweet']").forEach(article => articles.push(article));
-                }
-                for (const node of mutation.removedNodes) {
-                    if (node.nodeType !== 1) continue;
-                    if (node.matches?.('article')) removed.push(node);
-                    else node.querySelectorAll?.('article').forEach(article => removed.push(article));
-                }
-            }
-            if (!articles.length && !removed.length) return;
-            queueMapMutation(articles, removed);
-        });
-        timelineMapObserver = observer;
-        observer.observe(container, { childList: true, subtree: true });
-        if (followingTabActive !== false) {
-            ingestArticles(container.querySelectorAll("article[data-testid='tweet']"), 'init');
-        }
-    }
-
-    function isPostNewerThanBookmark(post, bookmark) {
-        if (!post?.tweetId || !bookmark?.tweetId) return false;
-        try {
-            return BigInt(post.tweetId) > BigInt(bookmark.tweetId);
-        } catch (e) {
-            return false;
-        }
-    }
-
-    function findNextOlderPostInMap(bookmark, all) {
-        if (!bookmark?.tweetId || !all?.length || timelineMapOrderedKeys.length === 0) return null;
-
-        const domByKey = new Map();
-        for (const parsed of all) {
-            const key = postRefKey(parsed);
-            if (key) domByKey.set(key, parsed);
-        }
-
-        let startIdx = findBookmarkIndexInMap(bookmark);
-        if (startIdx < 0) return null;
-
-        let bookmarkId = null;
-        try {
-            bookmarkId = BigInt(bookmark.tweetId);
-        } catch (e) {
-            bookmarkId = null;
-        }
-
-        // Map-Index 0 = neuesten Feed-Position; höhere Indizes = ältere Posts
-        for (let i = startIdx + 1; i < timelineMapOrderedKeys.length; i++) {
-            const key = timelineMapOrderedKeys[i];
-            const parsed = domByKey.get(key);
-            if (!parsed) continue;
-
-            if (bookmarkId !== null && !bookmark.isRepost) {
-                try {
-                    const successorId = parsed.bigId ?? BigInt(parsed.tweetId);
-                    if (successorId >= bookmarkId) {
-                        debugLog('Resolve', `Map-Nachfolger @${parsed.authorHandler} ${parsed.tweetId} ist nicht älter — übersprungen`);
-                        continue;
-                    }
-                } catch (e) {
-                    continue;
-                }
-            }
-            if (!postIsNearBookmark(parsed, bookmark)) {
-                debugLog('Resolve', `Map-Nachfolger zu weit von der Lesestelle — @${parsed.authorHandler} ${parsed.tweetId}`);
-                continue;
-            }
-
-            const entry = timelineMapByKey.get(key);
-            return {
-                post: parsed,
-                confidence: 92,
-                strategy: 'older',
-                reason: `map-successor (@${entry?.authorHandler || parsed.authorHandler} ${parsed.tweetId})`
-            };
-        }
-
-        return null;
-    }
-
-    function findBookmarkIndexInMap(bookmark) {
-        if (!bookmark?.tweetId || !timelineMapOrderedKeys.length) return -1;
-
-        const bookmarkKey = postRefKey(bookmark);
-        if (!bookmarkKey) return -1;
-
-        const direct = mapIndexOf(bookmarkKey);
-        if (direct >= 0) return direct;
-
-        try {
-            const bookmarkId = BigInt(bookmark.tweetId);
-            for (let i = 0; i < timelineMapOrderedKeys.length; i++) {
-                const entry = timelineMapByKey.get(timelineMapOrderedKeys[i]);
-                if (!entry?.tweetId) continue;
-                try {
-                    if (BigInt(entry.tweetId) === bookmarkId && !!entry.isRepost === !!bookmark.isRepost) {
-                        return i;
-                    }
-                } catch (e) {
-                    continue;
-                }
-            }
-        } catch (e) {
-            return -1;
-        }
-
-        return -1;
-    }
-
-    function refreshMapForLesestelle(source = 'mark') {
-        if (shouldDeferTimelineMapUpdate()) {
-            timelineMapDirtyWhileDeferred = true;
-            timelineMapPendingSource = source;
-            return;
-        }
-        const visible = visibleArticleElements();
-        if (visible.length) ingestArticles(visible, source);
-    }
-
-    /**
-     * Oberster Post laut aktualisierter Landkarte:
-     * unter sichtbaren Posts der mit dem niedrigsten Map-Index (neuesten Feed-Position).
-     */
-    function getTopPostFromUpdatedMap() {
-        if (!timelineMapOrderedKeys.length) {
-            return getTopVisiblePost();
-        }
-
-        const visible = getVisiblePosts();
-        let bestEl = null;
-        let bestMapIdx = Infinity;
-
-        for (const vis of visible) {
-            if (!vis?.tweetId) continue;
-            const idx = findBookmarkIndexInMap(vis);
-            if (idx >= 0 && idx < bestMapIdx) {
-                bestMapIdx = idx;
-                bestEl = vis.element;
-            }
-        }
-
-        if (bestEl) return bestEl;
-
-        for (const key of timelineMapOrderedKeys) {
-            const entry = timelineMapByKey.get(key);
-            if (!entry?.inDom) continue;
-            const el = findPostElementInDOM(entry.tweetId, entry.authorHandler, !!entry.isRepost);
-            if (el) return el;
-        }
-
-        return getTopVisiblePost();
-    }
-
-    function findInsertIndexFromHistory(bookmark) {
-        if (!postHistoryCache?.length) return -1;
-
-        const bKey = postRefKey(bookmark);
-        let histIdx = -1;
-        for (let i = 0; i < postHistoryCache.length; i++) {
-            if (postRefKey(postHistoryCache[i]) === bKey) {
-                histIdx = i;
-                break;
-            }
-        }
-        if (histIdx < 0) {
-            try {
-                const bId = BigInt(bookmark.tweetId);
-                for (let i = 0; i < postHistoryCache.length; i++) {
-                    const h = postHistoryCache[i];
-                    if (!h?.tweetId) continue;
-                    try {
-                        if (BigInt(h.tweetId) === bId && !!h.isRepost === !!bookmark.isRepost) {
-                            histIdx = i;
-                            break;
-                        }
-                    } catch (e) {
-                        continue;
-                    }
-                }
-            } catch (e) {
-                return -1;
-            }
-        }
-        if (histIdx < 0) return -1;
-
-        // History: früher gelesen = niedrigerer Index = neuer im Feed = niedrigerer Map-Index
-        let newerMapIdx = -1;
-        for (let i = histIdx - 1; i >= 0; i--) {
-            const idx = findBookmarkIndexInMap(postHistoryCache[i]);
-            if (idx >= 0) {
-                newerMapIdx = idx;
-                break;
-            }
-        }
-
-        let olderMapIdx = -1;
-        for (let i = histIdx + 1; i < postHistoryCache.length; i++) {
-            const idx = findBookmarkIndexInMap(postHistoryCache[i]);
-            if (idx >= 0) {
-                olderMapIdx = idx;
-                break;
-            }
-        }
-
-        if (newerMapIdx >= 0 && olderMapIdx >= 0) {
-            return newerMapIdx + 1 <= olderMapIdx ? newerMapIdx + 1 : olderMapIdx;
-        }
-        if (newerMapIdx >= 0) return newerMapIdx + 1;
-        if (olderMapIdx >= 0) return olderMapIdx;
-        return -1;
-    }
-
-    function ensureBookmarkInMap(bookmark) {
-        if (!bookmark?.tweetId) return -1;
-
-        const key = postRefKey(bookmark);
-        if (!key) return -1;
-
-        const existingIdx = findBookmarkIndexInMap(bookmark);
-        if (existingIdx >= 0) {
-            const entry = timelineMapByKey.get(key);
-            if (entry) {
-                entry.authorHandler = bookmark.authorHandler || entry.authorHandler;
-                entry.timestamp = bookmark.timestamp || entry.timestamp;
-            }
-            const atTail = existingIdx === timelineMapOrderedKeys.length - 1;
-            const historyIdx = findInsertIndexFromHistory(bookmark);
-            if (atTail && historyIdx >= 0 && historyIdx < existingIdx - 1) {
-                timelineMapOrderedKeys.splice(existingIdx, 1);
-                const at = Math.min(historyIdx, timelineMapOrderedKeys.length);
-                timelineMapOrderedKeys.splice(at, 0, key);
-                if (entry) entry.ghostTail = false;
-                trimTimelineMap();
-                persistTimelineMap(true);
-                return mapIndexOf(key);
-            }
-            return existingIdx;
-        }
-
-        const nowIso = new Date().toISOString();
-        const historyIdx = findInsertIndexFromHistory(bookmark);
-        const ghostTail = historyIdx < 0;
-        timelineMapByKey.set(key, {
-            key,
-            tweetId: bookmark.tweetId,
-            authorHandler: bookmark.authorHandler,
-            isRepost: !!bookmark.isRepost,
-            timestamp: bookmark.timestamp,
-            lastSeenAt: nowIso,
-            inDom: false,
-            ghostTail
-        });
-
-        let insertIdx = historyIdx;
-        if (insertIdx < 0) {
-            insertIdx = timelineMapOrderedKeys.length;
-            debugLog('Map', `Lesestelle ohne History-Anker ans Ende gesetzt (idx ${insertIdx})`);
-        } else {
-            debugLog('Map', `Lesestelle via History-Anker eingefügt (idx ${insertIdx}, ghost)`);
-        }
-
-        timelineMapOrderedKeys.splice(insertIdx, 0, key);
-        trimTimelineMap();
-        persistTimelineMap(true);
-        return mapIndexOf(key);
-    }
-
-    function getVisibleMapIndexRange() {
-        const visible = getVisiblePosts();
-        if (!visible.length || !timelineMapOrderedKeys.length) {
-            return { min: -1, max: -1 };
-        }
-
-        let min = Infinity;
-        let max = -1;
-        for (const vis of visible) {
-            const idx = findBookmarkIndexInMap(vis);
-            if (idx >= 0) {
-                min = Math.min(min, idx);
-                max = Math.max(max, idx);
-            }
-        }
-
-        if (min === Infinity) return { min: -1, max: -1 };
-        return { min, max };
-    }
-
-    function getLoadedDomMapIndexRange() {
-        let newest = -1;
-        let oldest = -1;
-
-        for (let i = 0; i < timelineMapOrderedKeys.length; i++) {
-            const entry = timelineMapByKey.get(timelineMapOrderedKeys[i]);
-            if (!entry?.inDom) continue;
-            if (newest < 0) newest = i;
-            oldest = i;
-        }
-
-        return { newest, oldest, min: newest, max: oldest };
-    }
-
-    function getDomIndexRangeInSnapshotOrder(orderedKeys) {
-        if (!orderedKeys?.length) return { newest: -1, oldest: -1, min: -1, max: -1 };
-
-        const keyToIdx = new Map(orderedKeys.map((key, idx) => [key, idx]));
-        let newest = -1;
-        let oldest = -1;
-
-        for (const parsed of getAllLoadedPostsParsed()) {
-            const key = postRefKey(parsed);
-            if (!key || !keyToIdx.has(key)) continue;
-            const idx = keyToIdx.get(key);
-            if (newest < 0 || idx < newest) newest = idx;
-            if (oldest < 0 || idx > oldest) oldest = idx;
-        }
-
-        return { newest, oldest, min: newest, max: oldest };
-    }
-
-    function isBookmarkWithinLoadedMapRange(bookmark) {
-        const idx = findBookmarkIndexInMap(bookmark);
-        if (idx < 0) return false;
-        const { newest, oldest } = getLoadedDomMapIndexRange();
-        if (newest < 0) return false;
-        return idx >= newest && idx <= oldest;
-    }
-
-    function captureMapSnapshotForSearch(bookmark = lastReadPost) {
-        scrollState.mapSnapshotOrderedKeys = [...timelineMapOrderedKeys];
-        scrollState.mapSnapshotAtSearchStart = new Set(scrollState.mapSnapshotOrderedKeys);
-        scrollState.mapSnapshotTweetIdToIdx = new Map();
-        for (let i = 0; i < scrollState.mapSnapshotOrderedKeys.length; i++) {
-            const entry = timelineMapByKey.get(scrollState.mapSnapshotOrderedKeys[i]);
-            if (!entry?.tweetId) continue;
-            scrollState.mapSnapshotTweetIdToIdx.set(`${entry.tweetId}-${!!entry.isRepost}`, i);
-        }
-        const snapKey = bookmark ? postRefKey(bookmark) : null;
-        scrollState.mapSnapshotBookmarkKey = snapKey;
-        scrollState.mapSnapshotBookmarkIdx = snapKey
-            ? scrollState.mapSnapshotOrderedKeys.indexOf(snapKey)
-            : -1;
-        scrollState.searchCoarseDirection = null;
-        scrollState.isSlowScrollMode = false;
-        scrollState.slowScrollLockedDirection = null;
-        scrollState.slowScrollFineAttempts = 0;
-        scrollState.searchIndexHitNudged = false;
-        scrollState.windowTooYoungLogged = false;
-        scrollState.lastSearchScrollDirection = null;
-        debugLog('Search', `Landkarten-Snapshot: ${scrollState.mapSnapshotAtSearchStart.size} Einträge, Ziel-idx ${scrollState.mapSnapshotBookmarkIdx} (eingefroren)`);
-    }
-
-    function clearMapSnapshotForSearch() {
-        scrollState.mapSnapshotAtSearchStart = null;
-        scrollState.mapSnapshotOrderedKeys = null;
-        scrollState.mapSnapshotTweetIdToIdx = null;
-        scrollState.mapSnapshotBookmarkKey = null;
-        scrollState.mapSnapshotBookmarkIdx = -1;
-        scrollState.searchCoarseDirection = null;
-        scrollState.slowScrollLockedDirection = null;
-        scrollState.slowScrollFineAttempts = 0;
-        scrollState.searchIndexHitNudged = false;
-        scrollState.windowTooYoungLogged = false;
-        scrollState.lastSearchScrollDirection = null;
-    }
-
-    function isSearchFineZoneDistance(mapDistance) {
-        if (mapDistance === null || mapDistance > CONFIG.SEARCH_FINE_ZONE_HYSTERESIS) return false;
-
-        // Wichtig für "Load from file" auf anderem Rechner (und allgemein):
-        // Nur in den Fein-Modus (winzige Schritte) wechseln, wenn wir bereits Posts im Ziel-Bereich
-        // der Landkarte geladen haben. Sonst sind winzige 120px-Schritte wirkungslos (laden keine neuen
-        // Artikel) und die Suche bricht zu früh ab.
-        const frozenIdx = getFrozenSearchBookmarkIdx();
-        if (frozenIdx < 0) return true;
-
-        const useSnapshot = searchControl.isSearching && scrollState.mapSnapshotOrderedKeys?.length;
-        const loaded = useSnapshot
-            ? getDomIndexRangeInSnapshotOrder(scrollState.mapSnapshotOrderedKeys)
-            : getLoadedDomMapIndexRange();
-
-        if (loaded && loaded.oldest >= 0) {
-            // Wir müssen mindestens bis kurz vor das Ziel vorgedrungen sein (oder es überholt haben).
-            // Sonst weiter mit normalen/größeren Schritten scrollen, um mehr Feed zu laden.
-            if (loaded.oldest < frozenIdx - 1) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    async function landExactSearchHit(searchBookmark, postElement, diagCode, onCleanup) {
-        debugLog('Search', `Exakter Treffer (${diagCode}):`, searchBookmark);
-        lastReadPost.found = true;
-        updateHighlightedPost();
-        // Bis das Ausrichten läuft, darf die Neue-Beiträge-Pille nicht an den Anfang ziehen.
-        searchControl.isAutoScrolling = true;
-        setTimeout(() => scrollToPostWithHighlight(postElement), 250);
-        activateRestoreSuppression(searchBookmark.tweetId);
-        markTopVisiblePost(false);
-        diagEndFlow('ok', diagCode, 'Ziel exakt gefunden', { target: diagBookmark(searchBookmark) });
-        clearMapSnapshotForSearch();
-        endManualSearchSession();
-        dismissActionPopup();
-        if (typeof onCleanup === 'function') onCleanup();
-    }
-
-    async function finishSearchWhenFineExhausted(searchBookmark, onCleanup) {
-        // Die alte Lesestelle liegt noch unter dem Fenster. Nicht „nicht gefunden“ sagen.
-        if (bookmarkStillBelowWindow(searchBookmark)) {
-            noteWindowStillTooYoung();
-            scrollState.searchDirection = 'down';
-            scrollState.slowScrollLockedDirection = null;
-            scrollState.slowScrollFineAttempts = 0;
-            scrollState.isSlowScrollMode = false;
-            return false;
-        }
-
-        let resolved = resolveReadingPosition(searchBookmark);
-        if (!resolved?.post?.element || !resolved.post.element.isConnected || resolvedPostIsTooYoung(resolved, searchBookmark)) {
-            resolved = nearestVisibleReadingPost(searchBookmark);
-        }
-        if (resolved?.post?.element && !resolvedPostIsTooYoung(resolved, searchBookmark)) {
-            const landed = await applyResolvedReadingPosition(resolved, {
-                adopt: true,
-                expectedBookmark: searchBookmark,
-                verifySource: 'search-fine-exhausted',
-            });
-            if (!landed) {
-                await markNearestVisibleReadingPost(searchBookmark);
-            } else {
-                const popupKey = getResolvePopupKey(resolved);
-                if (popupKey) {
-                    showPopup(popupKey, 6000, {
-                        strategy: getResolveStrategyLabel(resolved.strategy, getUserLanguage())
-                    });
-                }
-            }
-            diagEndFlow('ok', 'SEARCH_FINE_RESOLVE', `Resolve ${resolved.strategy} nach Feinbereich`, {
-                target: diagBookmark(searchBookmark),
-            });
-            clearMapSnapshotForSearch();
-            endManualSearchSession();
-            dismissActionPopup();
-            if (typeof onCleanup === 'function') onCleanup();
-            return true;
-        }
-
-        const closest = closestVisibleReadingPost(searchBookmark);
-        if (closest?.post?.element) {
-            await applyResolvedReadingPosition(closest, {
-                adopt: true,
-                expectedBookmark: searchBookmark,
-                verifySource: 'visible-closest',
-            });
-            showPopup('approximatePosition', 6000, {
-                strategy: getResolveStrategyLabel(closest.strategy, getUserLanguage())
-            });
-            clearMapSnapshotForSearch();
-            endManualSearchSession();
-            dismissActionPopup();
-            if (typeof onCleanup === 'function') onCleanup();
-            return true;
-        }
-
-        debugLog('Search', 'Feinbereich ohne sichtbaren Ersatzpost');
-        showPopup('tweetIdNotFound', 6000, {
-            authorHandler: searchBookmark.authorHandler,
-            tweetId: searchBookmark.tweetId,
-        });
-        diagEndFlow('warn', 'SEARCH_FINE_EXHAUSTED', 'Feinbereich ohne exakten Treffer', {
-            target: diagBookmark(searchBookmark),
-            resolveStrategy: null,
-            resolveConfidence: null,
-        });
-        clearMapSnapshotForSearch();
-        endManualSearchSession();
-        dismissActionPopup();
-        if (typeof onCleanup === 'function') onCleanup();
-        return true;
-    }
-
-    function getFrozenSearchBookmarkIdx() {
-        return scrollState.mapSnapshotBookmarkIdx >= 0 ? scrollState.mapSnapshotBookmarkIdx : -1;
-    }
-
-    function getSearchViewportIndexRange() {
-        const ordered = scrollState.mapSnapshotOrderedKeys;
-        if (!ordered?.length) {
-            return getVisibleMapIndexRange();
-        }
-
-        const keyToIdx = new Map(ordered.map((key, idx) => [key, idx]));
-        const tweetIdToIdx = scrollState.mapSnapshotTweetIdToIdx;
-        const visible = getVisiblePosts();
-        const indices = [];
-
-        for (const vis of visible) {
-            if (!vis?.tweetId) continue;
-            let idx = -1;
-            const key = postRefKey(vis);
-            if (key && keyToIdx.has(key)) {
-                idx = keyToIdx.get(key);
-            } else if (tweetIdToIdx?.size) {
-                idx = tweetIdToIdx.get(`${vis.tweetId}-${!!vis.isRepost}`) ?? -1;
-            }
-            if (idx >= 0) indices.push(idx);
-        }
-
-        if (!indices.length) return { min: -1, max: -1, hits: 0 };
-
-        if (indices.length >= 3) {
-            indices.sort((a, b) => a - b);
-            const median = indices[Math.floor(indices.length / 2)];
-            const cluster = indices.filter(i => Math.abs(i - median) <= 40);
-            if (cluster.length >= 2) {
-                return {
-                    min: Math.min(...cluster),
-                    max: Math.max(...cluster),
-                    hits: cluster.length
+                exportedTimelineMap = {
+                    orderedKeys: orderedKeys.slice(),
+                    entries,
+                    savedAt: new Date().toISOString()
                 };
             }
-        }
-
-        return {
-            min: Math.min(...indices),
-            max: Math.max(...indices),
-            hits: indices.length
-        };
-    }
-
-    function resolveSearchDirection(bookmark, bookmarkIdx, viewportMin, viewportMax) {
-        // Richtung nur aus der Landkarte, sobald Ziel und Viewport einen Index haben.
-        // Tweet-IDs drehen Reposts um und dürfen die Richtung dann nicht mehr kippen.
-        if (bookmarkIdx >= 0 && viewportMin >= 0) {
-            if (bookmarkIdx < viewportMin) {
-                return { direction: 'up', distance: viewportMin - bookmarkIdx };
-            }
-            if (bookmarkIdx > viewportMax) {
-                return { direction: 'down', distance: bookmarkIdx - viewportMax };
-            }
-            const direction = bookmarkIdx <= (viewportMin + viewportMax) / 2 ? 'up' : 'down';
-            return { direction, distance: 0 };
-        }
-        return { direction: inferSearchDirectionFromTweetId(bookmark), distance: 99 };
-    }
-
-    function inferSearchDirectionFromTweetId(bookmark) {
-        if (!bookmark?.tweetId) return 'down';
-
-        const visible = getVisiblePosts();
-        if (!visible.length) return 'down';
-
-        let visMin = null;
-        let visMax = null;
-        for (const vis of visible) {
-            if (!vis?.tweetId) continue;
-            try {
-                const id = BigInt(vis.tweetId);
-                if (visMin === null || id < visMin) visMin = id;
-                if (visMax === null || id > visMax) visMax = id;
-            } catch (e) {
-                continue;
-            }
-        }
-
-        try {
-            const targetId = BigInt(bookmark.tweetId);
-            if (visMax !== null && targetId > visMax) return 'up';
-            if (visMin !== null && targetId < visMin) return 'down';
-        } catch (e) {
-            return 'down';
-        }
-
-        return 'down';
-    }
-
-    function getHistoricalMapOverlapInDom() {
-        const snapshot = scrollState.mapSnapshotAtSearchStart;
-        if (!snapshot?.size) return { count: 0, keys: [] };
-
-        const hits = [];
-        const seen = new Set();
-        for (const parsed of getAllLoadedPostsParsed()) {
-            const key = postRefKey(parsed);
-            if (!key || !snapshot.has(key) || seen.has(key)) continue;
-            seen.add(key);
-            hits.push(key);
-        }
-        return { count: hits.length, keys: hits };
-    }
-
-    /**
-     * Nach vielen neuen Posts (z. B. über Nacht) sind zunächst nur unbekannte Beiträge im DOM.
-     * In diesem Zustand dürfen normale Such-Limits nicht zum Notfall-Landing führen —
-     * erst wenn historische Landkarten-Posts sichtbar werden, greifen wieder die üblichen Limits.
-     */
-    function isAwaitingHistoricalMapAnchors(bookmark = lastReadPost) {
-        if (!searchControl.isSearching || !bookmark?.tweetId) return false;
-
-        const snapshot = scrollState.mapSnapshotAtSearchStart;
-        if (!snapshot?.size || snapshot.size < 2) return false;
-
-        const bookmarkIdx = scrollState.mapSnapshotBookmarkIdx >= 0
-            ? scrollState.mapSnapshotBookmarkIdx
-            : findBookmarkIndexInMap(bookmark);
-        if (bookmarkIdx < 0) return false;
-
-        const { oldest } = scrollState.mapSnapshotOrderedKeys?.length
-            ? getDomIndexRangeInSnapshotOrder(scrollState.mapSnapshotOrderedKeys)
-            : getLoadedDomMapIndexRange();
-        if (oldest < 0 || bookmarkIdx <= oldest) return false;
-
-        const overlap = getHistoricalMapOverlapInDom();
-        if (overlap.count > 0) {
-            debugLog('Search', `Historische Landkarten-Posts im DOM (${overlap.count}) — normale Such-Limits aktiv`);
-            return false;
-        }
-
-        debugLog('Search', `Noch keine historischen Landkarten-Posts (Ziel-idx ${bookmarkIdx}, geladen bis idx ${oldest})`);
-        return true;
-    }
-
-    function updateSearchDirectionFromMap(bookmark) {
-        const useSnapshot = searchControl.isSearching && scrollState.mapSnapshotOrderedKeys?.length;
-        let bookmarkIdx = useSnapshot ? getFrozenSearchBookmarkIdx() : findBookmarkIndexInMap(bookmark);
-
-        if (bookmarkIdx < 0) {
-            if (!useSnapshot) {
-                ensureBookmarkInMap(bookmark);
-                bookmarkIdx = findBookmarkIndexInMap(bookmark);
-            }
-        }
-
-        const viewport = useSnapshot ? getSearchViewportIndexRange() : getVisibleMapIndexRange();
-        const { min, max } = viewport;
-        const resolved = resolveSearchDirection(bookmark, bookmarkIdx, min, max);
-        const { direction: newDirection, distance } = resolved;
-
-        if (min < 0) {
-            scrollState.searchDirection = newDirection;
-            scrollState.isSlowScrollMode = false;
-            scrollState.searchCoarseDirection = distance > 12 ? newDirection : null;
-            debugLog('Search', `Kein Viewport-Anker im Snapshot — Richtung: ${newDirection}`);
-            return null;
-        }
-
-        const coarseThreshold = 12;
-        if (distance > coarseThreshold) {
-            scrollState.slowScrollLockedDirection = null;
-            scrollState.slowScrollFineAttempts = 0;
-            scrollState.searchCoarseDirection = newDirection;
-            scrollState.searchDirection = newDirection;
-            scrollState.isSlowScrollMode = false;
-            const label = useSnapshot ? 'Snapshot-Viewport' : 'Viewport';
-            debugLog('Search', `${label}: Ziel idx ${bookmarkIdx} außerhalb (${min}–${max}, Abstand ${distance}) → grob ${newDirection}`);
-        } else if (distance > 0) {
-            const nearTopTarget = bookmarkIdx >= 0 && bookmarkIdx < CONFIG.SEARCH_TOP_RETRY_MAX_IDX;
-            const inFineHysteresis = distance <= CONFIG.SEARCH_FINE_ZONE_HYSTERESIS &&
-                (nearTopTarget ||
-                    scrollState.slowScrollLockedDirection !== null ||
-                    scrollState.slowScrollFineAttempts > 0);
-            if (inFineHysteresis) {
-                scrollState.isSlowScrollMode = true;
-                if (scrollState.slowScrollLockedDirection === null) {
-                    scrollState.slowScrollLockedDirection = newDirection;
-                }
-                scrollState.searchDirection = scrollState.slowScrollLockedDirection;
-                scrollState.searchCoarseDirection = null;
-                debugLog('Search', `Feinbereich-Hysterese (Ziel idx ${bookmarkIdx}, ${min}–${max}, Abstand ${distance}) → ${scrollState.searchDirection}`);
-            } else {
-                scrollState.slowScrollLockedDirection = null;
-                scrollState.slowScrollFineAttempts = 0;
-                scrollState.searchDirection = newDirection;
-                scrollState.isSlowScrollMode = false;
-                scrollState.searchCoarseDirection = null;
-                debugLog('Search', `Annäherung: Ziel idx ${bookmarkIdx} nahe Viewport (${min}–${max}, Abstand ${distance}) → ${newDirection}`);
-            }
-        } else {
-            scrollState.searchCoarseDirection = null;
-            scrollState.isSlowScrollMode = true;
-            if (scrollState.slowScrollLockedDirection === null) {
-                const distToTop = bookmarkIdx - min;
-                const distToBottom = max - bookmarkIdx;
-                scrollState.slowScrollLockedDirection = distToTop <= distToBottom ? 'up' : 'down';
-            }
-            scrollState.searchDirection = scrollState.slowScrollLockedDirection;
-            debugLog('Search', `Slow-Scroll fein (Ziel idx ${bookmarkIdx} in Viewport-Spanne ${min}–${max}, Richtung ${scrollState.searchDirection})`);
-        }
-
-        return null;
-    }
-
-    function getMapDistanceToTarget(bookmark) {
-        const useSnapshot = searchControl.isSearching && scrollState.mapSnapshotOrderedKeys?.length;
-        const idx = useSnapshot ? getFrozenSearchBookmarkIdx() : findBookmarkIndexInMap(bookmark);
-        if (idx < 0) return null;
-
-        const viewport = useSnapshot ? getSearchViewportIndexRange() : getVisibleMapIndexRange();
-        const { min, max } = viewport;
-        if (min >= 0) {
-            if (idx < min) return min - idx;
-            if (idx > max) return idx - max;
-            return 0;
-        }
-
-        if (!useSnapshot) {
-            const { newest, oldest } = getLoadedDomMapIndexRange();
-            if (newest < 0) return null;
-            if (idx < newest) return newest - idx;
-            if (idx > oldest) return idx - oldest;
-        }
-
-        return null;
-    }
-
-    // ============================================================
-    // Reading Position Resolve Engine
-    // exact → older (Landkarte) → emergency (Landkarte)
-    // classifyFeedState für Popups/Diagnose
-    // ============================================================
-
-    function compactPostRef(parsed) {
-        if (!parsed) return null;
-        return {
-            tweetId: parsed.tweetId,
-            authorHandler: parsed.authorHandler,
-            isRepost: parsed.isRepost,
-            timestamp: parsed.timestamp
-        };
-    }
-
-    function postRefKey(ref) {
-        if (!ref?.tweetId) return null;
-        return `${ref.tweetId}-${!!ref.isRepost}`;
-    }
-
-    /**
-     * true, wenn Kandidat in der Landkarte ÜBER der Lesestelle steht
-     * (kleinerer Map-Index = weiter oben im Feed).
-     * Ohne Map-Einträge: Fallback auf höhere Tweet-ID.
-     * User-Wunsch: solche Posts dürfen (wieder) Lesestelle werden,
-     * auch wenn sie schon in History/Landkarte bekannt sind.
-     */
-    function isAboveLesestelleOnMap(candidate, bookmark) {
-        if (!candidate?.tweetId || !bookmark?.tweetId) return false;
-        if (postRefKey(candidate) === postRefKey(bookmark)) return false;
-
-        const candIdx = findBookmarkIndexInMap(candidate);
-        const bookIdx = findBookmarkIndexInMap(bookmark);
-
-        if (candIdx >= 0 && bookIdx >= 0) {
-            return candIdx < bookIdx;
-        }
-
-        try {
-            return BigInt(candidate.tweetId) > BigInt(bookmark.tweetId);
-        } catch (e) {
-            return false;
-        }
-    }
-
-    function captureReadingContext(anchorElement) {
-        const empty = { neighborsBefore: [], neighborsAfter: [], visibleAtSave: [] };
-        if (!anchorElement) return empty;
-
-        const all = getAllLoadedPostsParsed();
-        if (!all.length) return empty;
-
-        const anchorParsed = parseLoadedPost(anchorElement);
-        if (!anchorParsed) return empty;
-
-        const docSorted = [...all].sort((a, b) => {
-            const aY = a.element.getBoundingClientRect().top + window.scrollY;
-            const bY = b.element.getBoundingClientRect().top + window.scrollY;
-            return aY - bY;
-        });
-
-        const anchorKey = `${anchorParsed.tweetId}-${anchorParsed.isRepost}`;
-        const anchorIdx = docSorted.findIndex(p => `${p.tweetId}-${p.isRepost}` === anchorKey);
-        const n = CONFIG.CONTEXT_NEIGHBOR_COUNT;
-
-        let neighborsBefore = [];
-        let neighborsAfter = [];
-        if (anchorIdx >= 0) {
-            neighborsBefore = docSorted
-                .slice(Math.max(0, anchorIdx - n), anchorIdx)
-                .map(compactPostRef)
-                .filter(Boolean);
-            neighborsAfter = docSorted
-                .slice(anchorIdx + 1, anchorIdx + 1 + n)
-                .map(compactPostRef)
-                .filter(Boolean);
-        }
-
-        const visibleAtSave = getVisiblePosts()
-            .map(v => compactPostRef(parseLoadedPost(v.element)))
-            .filter(Boolean);
-
-        return { neighborsBefore, neighborsAfter, visibleAtSave };
-    }
-
-    function classifyFeedState(bookmark = lastReadPost) {
-        const all = getAllLoadedPostsParsed();
-
-        if (pendingNewPosts >= CONFIG.MASS_INFLUX_PENDING_THRESHOLD) {
-            return 'MASS_INFLUX';
-        }
-
-        if (bookmark?.tweetId && all.length >= 40) {
-            try {
-                const bookmarkId = BigInt(bookmark.tweetId);
-                const ids = all.map(p => p.bigId);
-                const newest = ids.reduce((max, id) => (id > max ? id : max), ids[0]);
-                const oldest = ids.reduce((min, id) => (id < min ? id : min), ids[0]);
-                const loadedSpan = newest - oldest;
-                const gapFromBookmark = newest - bookmarkId;
-                if (loadedSpan > 0n && gapFromBookmark * 5n > loadedSpan * 3n && all.length >= 80) {
-                    return 'MASS_INFLUX';
-                }
-            } catch (e) {
-                debugLog('Resolve', 'classifyFeedState ID-Vergleich fehlgeschlagen:', e);
-            }
-        }
-
-        if (postHistoryCache.length >= 5) {
-            const recent = postHistoryCache.slice(-20);
-            const domKeys = new Set(all.map(p => `${p.tweetId}-${p.isRepost}`));
-            const found = recent.filter(e => domKeys.has(`${e.tweetId}-${!!e.isRepost}`)).length;
-            if (recent.length > 0 && found / recent.length < 0.35) {
-                return 'DEGRADED';
-            }
-        }
-
-        const ctx = bookmark?.context;
-        if (ctx && bookmark?.tweetId) {
-            const anchorPresent = all.some(p =>
-                p.tweetId === bookmark.tweetId &&
-                p.authorHandler === bookmark.authorHandler &&
-                p.isRepost === !!bookmark.isRepost
-            );
-            if (!anchorPresent) {
-                const refs = [...(ctx.neighborsBefore || []), ...(ctx.neighborsAfter || [])];
-                const domKeys = new Set(all.map(p => `${p.tweetId}-${p.isRepost}`));
-                const surviving = refs.filter(r => domKeys.has(postRefKey(r))).length;
-                if (surviving >= 2) {
-                    return 'REORDER';
-                }
-            }
-        }
-
-        return 'NORMAL';
-    }
-
-    function matchByContext(bookmark, all, feedState = 'NORMAL') {
-        const ctx = bookmark?.context;
-        if (!ctx || all.length === 0) return null;
-
-        const contextRefs = [];
-        const seen = new Set();
-        for (const ref of [
-            ...(ctx.neighborsBefore || []),
-            ...(ctx.neighborsAfter || []),
-            ...(ctx.visibleAtSave || [])
-        ]) {
-            const key = postRefKey(ref);
-            if (!key || seen.has(key)) continue;
-            seen.add(key);
-            contextRefs.push(ref);
-        }
-        if (contextRefs.length === 0) return null;
-
-        const docSorted = [...all].sort((a, b) => {
-            const aY = a.element.getBoundingClientRect().top + window.scrollY;
-            const bY = b.element.getBoundingClientRect().top + window.scrollY;
-            return aY - bY;
-        });
-
-        const refPositions = new Map();
-        docSorted.forEach((p, idx) => {
-            refPositions.set(`${p.tweetId}-${p.isRepost}`, idx);
-        });
-
-        const beforePositions = (ctx.neighborsBefore || [])
-            .map(postRefKey)
-            .filter(k => refPositions.has(k))
-            .map(k => refPositions.get(k));
-        const afterPositions = (ctx.neighborsAfter || [])
-            .map(postRefKey)
-            .filter(k => refPositions.has(k))
-            .map(k => refPositions.get(k));
-
-        const overshootPenalty = feedState === 'MASS_INFLUX' ? 8 : 15;
-        let bookmarkId = null;
-        try {
-            bookmarkId = BigInt(bookmark.tweetId);
-        } catch (e) {
-            bookmarkId = null;
-        }
-
-        let best = null;
-        let bestScore = 0;
-
-        for (let i = 0; i < docSorted.length; i++) {
-            const candidate = docSorted[i];
-            let score = 0;
-
-            for (const ref of contextRefs) {
-                const key = postRefKey(ref);
-                const refIdx = refPositions.get(key);
-                if (refIdx === undefined) continue;
-                const distance = Math.abs(refIdx - i);
-                if (distance <= 2) score += 25;
-                else if (distance <= 5) score += 12;
-                else score += 4;
-            }
-
-            if ((ctx.visibleAtSave || []).some(v => postRefKey(v) === `${candidate.tweetId}-${candidate.isRepost}`)) {
-                score += 15;
-            }
-
-            if (beforePositions.length > 0) {
-                const maxBefore = Math.max(...beforePositions);
-                if (i >= maxBefore && i <= maxBefore + 2) score += 20;
-            }
-            if (afterPositions.length > 0) {
-                const minAfter = Math.min(...afterPositions);
-                if (i <= minAfter && i >= minAfter - 2) score += 20;
-            }
-
-            if (bookmarkId !== null && candidate.bigId > bookmarkId) {
-                score -= overshootPenalty;
-            }
-
-            if (score > bestScore) {
-                bestScore = score;
-                best = candidate;
-            }
-        }
-
-        if (!best || bestScore < CONFIG.CONTEXT_MATCH_MIN_SCORE) return null;
-
-        const maxPossible = contextRefs.length * 25 + 55;
-        const confidence = Math.max(45, Math.min(85, Math.round((bestScore / Math.max(maxPossible, 1)) * 100)));
-
-        return {
-            post: best,
-            confidence,
-            strategy: 'context',
-            reason: `neighbor-overlap (${bestScore} pts, ${feedState})`
-        };
-    }
-
-    function parseLoadedPost(postElement) {
-        if (!postElement) return null;
-        const tweetId = getPostTweetId(postElement);
-        const authorHandler = getPostAuthorHandler(postElement);
-        const timestamp = getPostTimestamp(postElement);
-        const repostFlag = isRepost(postElement);
-        if (!tweetId || !authorHandler || !timestamp) return null;
-        const postTime = new Date(timestamp).getTime();
-        if (isNaN(postTime)) return null;
-        try {
-            return {
-                element: postElement,
-                tweetId,
-                authorHandler,
-                timestamp,
-                isRepost: repostFlag,
-                bigId: BigInt(tweetId),
-                postTime
-            };
-        } catch (e) {
-            return null;
-        }
-    }
-
-    function getAllLoadedPostsParsed() {
-        return Array.from(document.querySelectorAll("article[data-testid='tweet']"))
-            .map(parseLoadedPost)
-            .filter(Boolean);
-    }
-
-    function findNextOlderPostInDom(bookmark, all) {
-        ensureBookmarkInMap(bookmark);
-        const fromMap = findNextOlderPostInMap(bookmark, all);
-        if (fromMap) {
-            diagPush('MAP_OLDER_HIT', 'info', fromMap.reason, {
-                bookmark: diagBookmark(bookmark),
-                mapSize: timelineMapOrderedKeys.length,
-            });
-            return fromMap;
-        }
-
-        return null;
-    }
-
-    function emergencyLandReadingPosition(bookmark = lastReadPost) {
-        const all = getAllLoadedPostsParsed();
-        if (!all.length) return null;
-
-        const domByKey = new Map();
-        for (const parsed of all) {
-            const key = postRefKey(parsed);
-            if (key) domByKey.set(key, parsed);
-        }
-
-        if (bookmark?.tweetId && timelineMapOrderedKeys.length) {
-            const bookmarkIdx = ensureBookmarkInMap(bookmark);
-            if (bookmarkIdx >= 0) {
-                for (let offset = 0; offset < timelineMapOrderedKeys.length; offset++) {
-                    const candidates = offset === 0
-                        ? [bookmarkIdx]
-                        : (bookmark.isRepost
-                            ? [bookmarkIdx + offset, bookmarkIdx - offset]
-                            : [bookmarkIdx - offset, bookmarkIdx + offset]);
-                    for (const i of candidates) {
-                        if (i < 0 || i >= timelineMapOrderedKeys.length) continue;
-                        const parsed = domByKey.get(timelineMapOrderedKeys[i]);
-                        if (!parsed) continue;
-                        if (offset !== 0 && !postIsNearBookmark(parsed, bookmark)) continue;
-                        return {
-                            post: parsed,
-                            confidence: offset === 0 ? 95 : Math.max(15, 55 - offset * 4),
-                            strategy: offset === 0 ? 'exact' : 'older',
-                            reason: offset === 0 ? 'map-exact-emergency' : `map-nearest (offset ${offset})`
-                        };
-                    }
-                }
-            }
-        }
-
-        const visibleParsed = getVisiblePosts()
-            .map(v => parseLoadedPost(v.element))
-            .filter(Boolean);
-
-        if (visibleParsed.length > 0) {
-            const pick = visibleParsed[Math.floor(visibleParsed.length / 2)];
-            if (postIsNearBookmark(pick, bookmark)) {
-                return {
-                    post: pick,
-                    confidence: 15,
-                    strategy: 'emergency',
-                    reason: 'viewport-middle'
-                };
-            }
-        }
-
-        const sorted = [...all].sort((a, b) => {
-            const aTop = a.element.getBoundingClientRect().top;
-            const bTop = b.element.getBoundingClientRect().top;
-            return Math.abs(aTop - CONFIG.RESTORE_SCROLL_OFFSET) - Math.abs(bTop - CONFIG.RESTORE_SCROLL_OFFSET);
-        });
-        if (!postIsNearBookmark(sorted[0], bookmark)) return null;
-        return {
-            post: sorted[0],
-            confidence: 10,
-            strategy: 'emergency',
-            reason: 'nearest-to-restore-offset'
-        };
-    }
-
-    function snapshotLoadedPostKeys() {
-        const keys = new Set();
-        for (const parsed of getAllLoadedPostsParsed()) {
-            const key = postRefKey(parsed);
-            if (key) keys.add(key);
-        }
-        return keys;
-    }
-
-    function collectNewPostsSinceBaseline(bookmark, baselineKeys) {
-        if (!bookmark?.tweetId || !baselineKeys?.size) return [];
-
-        let bookmarkId = null;
-        try {
-            bookmarkId = BigInt(bookmark.tweetId);
-        } catch (e) {
-            return [];
-        }
-
-        const candidates = [];
-        const seen = new Set();
-        for (const parsed of getAllLoadedPostsParsed()) {
-            const key = postRefKey(parsed);
-            if (!key || seen.has(key)) continue;
-            const isNewByKey = !baselineKeys.has(key);
-            let isNewById = false;
-            try {
-                isNewById = (parsed.bigId ?? BigInt(parsed.tweetId)) > bookmarkId;
-            } catch (e) {
-                continue;
-            }
-            // Nur wirklich neue Beiträge (höhere ID + nicht in Baseline).
-            // Ältere Posts, die beim Scrollen nachgeladen werden, sind kein „Neue Beiträge“-Injekt.
-            if (isNewByKey && isNewById) {
-                seen.add(key);
-                candidates.push(parsed);
-            }
-        }
-        return candidates;
-    }
-
-    function pickOldestNewPost(candidates) {
-        if (!candidates?.length) return null;
-        return candidates.reduce((oldest, post) => {
-            try {
-                const id = post.bigId ?? BigInt(post.tweetId);
-                const oldId = oldest.bigId ?? BigInt(oldest.tweetId);
-                return id < oldId ? post : oldest;
-            } catch (e) {
-                return oldest;
-            }
-        });
-    }
-
-    function mergeNewPostCandidates(existing, incoming) {
-        const merged = [...existing];
-        const seen = new Set(existing.map(p => postRefKey(p)).filter(Boolean));
-        for (const post of incoming) {
-            const key = postRefKey(post);
-            if (!key || seen.has(key)) continue;
-            seen.add(key);
-            merged.push(post);
-        }
-        return merged;
-    }
-
-    /**
-     * Nach „Neue Beiträge“: nach unten scrollen bis Lesestelle gefunden
-     * oder keine weiteren Posts mehr geladen werden → sonst ältester neuer Post.
-     */
-    async function restoreReadingPositionAfterNewPosts(bookmark, baselineKeys) {
-        if (!bookmark?.tweetId) return null;
-
-        try {
-            BigInt(bookmark.tweetId);
-        } catch (e) {
-            return null;
-        }
-
-        const maxSteps = CONFIG.NEW_POSTS_SCROLL_SEARCH_MAX_ATTEMPTS;
-        debugLog('Restore', `New-Posts: Scroll nach unten (max ${maxSteps}) — Ziel @${bookmark.authorHandler}`);
-        diagPush('NEWPOSTS_SCROLL_SEARCH', 'info', 'New-Posts Scroll-Restore gestartet', {
-            frozen: diagBookmark(bookmark),
-            baselinePosts: baselineKeys?.size ?? 0,
-            maxSteps,
-        });
-
-        await new Promise(r => setTimeout(r, 450));
-
-        let newPostCandidates = collectNewPostsSinceBaseline(bookmark, baselineKeys);
-        let lastArticleCount = document.querySelectorAll('article').length;
-        let lastScrollHeight = document.body.scrollHeight || document.documentElement.scrollHeight;
-        let lastSig = visibleTweetSignature();
-        let stagnantLoads = 0;
-        let stagnantScroll = 0;
-
-        searchControl.isAutoScrolling = true;
-        scrollState.searchBounceCount = 0;
-        scrollState.settleOscillated = false;
-        scrollState.scrollLoopStopped = false;
-        scrollState.recentStepDeltas = [];
-        scrollState.unloadedJumpCount = 0;
-        scrollState.unloadedWaitLogged = false;
-        holdScrollAnchor();
-        try {
-            for (let step = 0; step <= maxSteps; step++) {
-                const exact = findBookmarkExactInDom(bookmark);
-                if (exact) {
-                    debugLog('Restore', `Lesestelle gefunden (Schritt ${step}): @${bookmark.authorHandler}`);
-                    return {
-                        post: exact,
-                        confidence: 100,
-                        strategy: 'exact',
-                        reason: step === 0 ? 'new-posts-immediate' : `new-posts-scroll (step ${step})`,
-                        adopt: false,
-                        feedState: classifyFeedState(bookmark),
-                    };
-                }
-
-                newPostCandidates = mergeNewPostCandidates(
-                    newPostCandidates,
-                    collectNewPostsSinceBaseline(bookmark, baselineKeys)
-                );
-
-                // Observer ist während des Restores ausgesetzt. Sichtbare Artikel direkt einlesen,
-                // damit der nächste Sprung den Abstand in der Landkarte kennt.
-                ingestArticles(visibleArticleElements(), 'new-posts-restore-scroll');
-
-                if (scrolledPastBookmark(bookmark)) {
-                    debugLog('Restore', 'Lesestelle liegt schon über dem Fenster — nicht weiter nach unten');
-                    break;
-                }
-
-                if (step > 0) {
-                    const articleCount = document.querySelectorAll('article').length;
-                    const scrollHeight = document.body.scrollHeight || document.documentElement.scrollHeight;
-                    const sig = visibleTweetSignature();
-                    const atBottom = window.scrollY + window.innerHeight >= scrollHeight - 80;
-                    const progressed = sig !== lastSig
-                        || articleCount !== lastArticleCount
-                        || scrollHeight !== lastScrollHeight;
-
-                    if (progressed) {
-                        stagnantLoads = 0;
-                        stagnantScroll = 0;
-                    } else {
-                        stagnantLoads++;
-                        stagnantScroll++;
-                    }
-                    lastArticleCount = articleCount;
-                    lastScrollHeight = scrollHeight;
-                    lastSig = sig;
-
-                    if (stagnantLoads >= CONFIG.NEW_POSTS_SCROLL_STAGNANT_LOADS &&
-                        stagnantScroll >= CONFIG.NEW_POSTS_SCROLL_STAGNANT_HEIGHT &&
-                        atBottom) {
-                        debugLog('Restore', `Keine weiteren Posts (${articleCount} articles, scrollHeight ${scrollHeight})`);
-                        break;
-                    }
-                }
-
-                if (step >= maxSteps) break;
-
-                const beforeSig = visibleTweetSignature();
-                const jump = searchJumpMagnitude(bookmark);
-                const beforeY = window.scrollY || 0;
-                window.scrollBy({ top: jump, behavior: 'auto' });
-                await waitForFeedSettle(beforeSig, 700);
-                if (await searchShouldStopAfterJump(jump, beforeY, beforeSig, bookmark)) {
-                    noteScrollLoopStopped();
-                    break;
-                }
-            }
-        } finally {
-            searchControl.isAutoScrolling = false;
-            noteProgrammaticScrollEnded();
-            releaseScrollAnchor();
-        }
-
-        if (scrollState.scrollLoopStopped) return null;
-
-        const finalExact = findBookmarkExactInDom(bookmark);
-        if (finalExact) {
-            return {
-                post: finalExact,
-                confidence: 100,
-                strategy: 'exact',
-                reason: 'new-posts-scroll-final',
-                adopt: false,
-                feedState: classifyFeedState(bookmark),
-            };
-        }
-
-        newPostCandidates = mergeNewPostCandidates(
-            newPostCandidates,
-            collectNewPostsSinceBaseline(bookmark, baselineKeys)
-        );
-        const oldestNew = pickOldestNewPost(newPostCandidates);
-        if (oldestNew) {
-            if (bookmarkStillBelowWindow(bookmark)) {
-                debugLog('Restore', 'Lesestelle noch unter dem Fenster — kein jüngerer Ersatz');
-                return null;
-            }
-            const tooYoung = resolvedPostIsTooYoung({ post: oldestNew }, bookmark);
-            if (tooYoung) {
-                debugLog('Restore', 'Jüngeren Ersatz nicht übernommen — Lesestelle bleibt');
-                return null;
-            }
-            debugLog('Restore', `Lesestelle nicht gefunden — ältester neuer Post: @${oldestNew.authorHandler} ${oldestNew.tweetId} (${newPostCandidates.length} Kandidaten)`);
-            diagPush('NEWPOSTS_OLDEST_NEW', 'warn', 'Lesestelle ersetzt durch ältesten neuen Post', {
-                frozen: diagBookmark(bookmark),
-                adopted: diagBookmark(oldestNew),
-                candidateCount: newPostCandidates.length,
-            });
-            return {
-                post: oldestNew,
-                confidence: 78,
-                strategy: 'new-posts-oldest',
-                reason: 'oldest-injected-post-after-scroll',
-                adopt: true,
-                feedState: classifyFeedState(bookmark),
-            };
-        }
-
-        debugLog('Restore', 'Weder Lesestelle noch neue Posts erkannt');
-        return null;
-    }
-
-    function resolveReadingPosition(bookmark = lastReadPost) {
-        const all = getAllLoadedPostsParsed();
-        const feedState = classifyFeedState(bookmark);
-        debugLog('Resolve', `Feed-State: ${feedState}`);
-
-        if (!bookmark || !bookmark.tweetId) {
-            return emergencyLandReadingPosition(bookmark);
-        }
-
-        ensureBookmarkInMap(bookmark);
-
-        const bookmarkIsRepost = !!bookmark.isRepost;
-
-        const exact = all.find(p =>
-            p.tweetId === bookmark.tweetId &&
-            p.authorHandler === bookmark.authorHandler &&
-            p.isRepost === bookmarkIsRepost
-        );
-        if (exact) {
-            return { post: exact, confidence: 100, strategy: 'exact', reason: 'tweet-id-match', feedState };
-        }
-
-        const older = findNextOlderPostInDom(bookmark, all);
-        if (older) {
-            older.feedState = feedState;
-            debugLog('Resolve', `Exakter Post fehlt — nächst älterer (Landkarte): @${older.post.authorHandler} ${older.post.tweetId}`);
-            return older;
-        }
-
-        debugLog('Resolve', 'Kein älterer Post in Landkarte — Emergency-Landing');
-        const emergency = emergencyLandReadingPosition(bookmark);
-        if (emergency) emergency.feedState = feedState;
-        return emergency;
-    }
-
-    function getResolveStrategyLabel(strategy, lang) {
-        const labels = {
-            de: { exact: 'exakt', older: 'nächster älterer', context: 'Kontext', trail: 'Verlauf', temporal: 'Zeit', emergency: 'Notfall', 'new-posts-oldest': 'ältester neuer Post' },
-            en: { exact: 'exact', older: 'next older', context: 'context', trail: 'history', temporal: 'time', emergency: 'emergency', 'new-posts-oldest': 'oldest new post' }
-        };
-        const table = labels[lang] || labels.en;
-        return table[strategy] || strategy;
-    }
-
-    function getResolvePopupKey(resolved) {
-        if (!resolved || resolved.strategy === 'exact') return null;
-        if (resolved.feedState === 'DEGRADED' || resolved.feedState === 'MASS_INFLUX') {
-            return 'feedStronglyChanged';
-        }
-        if (resolved.confidence >= 40) return 'approximatePosition';
-        return 'tweetIdNotFound';
-    }
-
-    function findBookmarkExactInDom(bookmark) {
-        if (!bookmark?.tweetId) return null;
-        const bookmarkIsRepost = !!bookmark.isRepost;
-        return getAllLoadedPostsParsed().find(p =>
-            p.tweetId === bookmark.tweetId &&
-            p.authorHandler === bookmark.authorHandler &&
-            p.isRepost === bookmarkIsRepost
-        ) || null;
-    }
-
-    function shouldScrollSearchForBookmark(bookmark) {
-        if (!bookmark?.tweetId) return false;
-        // Manuelle Suche: nur ohne Scroll-Suche beenden, wenn exakter Treffer im DOM liegt.
-        // Context/Trail/Temporal können „nah dran“ liegen, während der Ziel-Post wenige Einträge entfernt ist.
-        return findBookmarkExactInDom(bookmark) === null;
-    }
-
-    async function applyResolvedReadingPosition(resolved, options = {}) {
-        const { adopt = true, scroll = true, expectedBookmark = null, verifySource = 'resolve' } = options;
-        if (!resolved?.post?.element) {
-            diagPush('LANDING_FAIL', 'error', 'applyResolvedReadingPosition: kein Post-Element', {
-                strategy: resolved?.strategy,
-                snapshot: diagSnapshot(),
-            });
-            return false;
-        }
-
-        if (verifySource !== 'new-posts-restore' && expectedBookmark && isLiveReadingAheadOf(expectedBookmark)) {
-            debugLog('Position', 'Landing übersprungen — Lesestelle ist neuer als das Restore-Ziel');
-            syncHighlightIfDrifted();
-            return false;
-        }
-
-        const { post, confidence, strategy } = resolved;
-        if (verifySource === 'new-posts-restore' && strategy !== 'exact' && expectedBookmark &&
-            (bookmarkStillBelowWindow(expectedBookmark) || resolvedPostIsTooYoung(resolved, expectedBookmark))) {
-            debugLog('Position', 'Jüngeren Ersatz nicht übernommen — Lesestelle liegt noch weiter unten');
-            return false;
-        }
-
-        const fresh = resolveFreshPostElement(post.element, post.tweetId, post.authorHandler, !!post.isRepost) || post.element;
-        const nearBookmark = expectedBookmark || lastReadPost;
-        if (strategy !== 'exact' && !postIsNearBookmark(post, nearBookmark)) {
-            debugLog('Resolve', `Ersatz verworfen — @${post.authorHandler} ${post.tweetId} liegt nicht an der Lesestelle`);
-            return false;
-        }
-        if (strategy !== 'exact' && fresh?.getBoundingClientRect) {
-            const here = window.scrollY || 0;
-            const targetY = here + fresh.getBoundingClientRect().top - CONFIG.RESTORE_SCROLL_OFFSET;
-            const vh = window.innerHeight || 800;
-            if (here - targetY > vh * 1.25) {
-                debugLog('Resolve', 'Ersatz verworfen — der Sprung würde an den Seitenanfang gehen');
-                return false;
-            }
-        }
-
-        const scrollOpts = verifySource === 'new-posts-restore'
-            ? { ignoreAnchorStale: true }
-            : {};
-        if (scroll && isPostAtReadingOffset(fresh)) {
-            debugLog('Position', 'Restore liegt auf der Lesezeile — nach dem Nachladen noch einmal prüfen');
-            diagPush('POSITION_SKIP', 'info', 'Restore schon am Offset, Ausrichten prüft nach', {
-                deviation: Math.round(getPostOffsetDeviation(fresh)),
-            });
-        }
-
-        if (scroll) {
-            await new Promise(resolve => scrollToPostWithHighlight(post.element, resolve, scrollOpts));
-            if (verifySource !== 'new-posts-restore' && expectedBookmark && isLiveReadingAheadOf(expectedBookmark)) {
-                syncHighlightIfDrifted();
-                return false;
-            }
-            applyHighlightToPost(fresh, { confidence, strategy });
-        } else {
-            applyHighlightToPost(fresh, { confidence, strategy });
-        }
-
-        if (adopt) {
-            await adoptFallbackPost(fresh);
-            if (lastReadPost) {
-                lastReadPost.resolveStrategy = strategy;
-                lastReadPost.resolveConfidence = confidence;
-            }
-        } else if (verifySource === 'new-posts-restore' && expectedBookmark?.tweetId) {
-            scheduleHighlightRetries(expectedBookmark.tweetId, expectedBookmark.authorHandler, [0, 300, 900, 2000, 3500], !!expectedBookmark.isRepost);
-        }
-
-        log('Resolve', `Landing (${strategy}, ${confidence}%): @${post.authorHandler} ${post.tweetId}`);
-        if (expectedBookmark) {
-            diagVerifyLanding(expectedBookmark, resolved, verifySource);
-        }
-        return true;
-    }
-
-    async function landReadingPositionFromResolve(reason = '', bookmark = lastReadPost) {
-        if (reason) {
-            debugLog('Resolve', `Start: ${reason}`);
-        }
-
-        let resolved = resolveReadingPosition(bookmark);
-        if (!resolved) {
-            await new Promise(r => setTimeout(r, 900));
-            resolved = resolveReadingPosition(bookmark);
-        }
-
-        if (resolved?.strategy !== 'exact' &&
-            (bookmarkStillBelowWindow(bookmark) ||
-                resolvedPostIsTooYoung(resolved, bookmark) ||
-                !postIsNearBookmark(resolved?.post, bookmark))) {
-            log('Resolve', 'Ersatz übersprungen — Lesestelle liegt noch weiter unten oder der Treffer ist zu weit weg. Seite bleibt.');
-            dismissActionPopup();
-            endManualSearchSession();
-            searchControl.isFallbackSearching = false;
-            return false;
-        }
-
-        searchControl.isFallbackSearching = true;
-
-        if (resolved?.post?.element) {
-            const landed = await applyResolvedReadingPosition(resolved, {
-                expectedBookmark: bookmark,
-                verifySource: reason || 'land-resolve',
-            });
-            dismissActionPopup();
-            if (!landed) {
-                await markNearestVisibleReadingPost(bookmark);
-            } else {
-                const popupKey = getResolvePopupKey(resolved);
-                if (popupKey) {
-                    const lang = getUserLanguage();
-                    showPopup(popupKey, 6000, {
-                        strategy: getResolveStrategyLabel(resolved.strategy, lang)
-                    });
-                }
-            }
-        } else if (await markNearestVisibleReadingPost(bookmark)) {
-            dismissActionPopup();
-        } else {
-            log('Resolve', 'Kein article im DOM — Landing nicht möglich');
-            diagPush('RESOLVE_EMPTY_DOM', 'error', `Kein Landing möglich (${reason})`, {
-                expected: diagBookmark(bookmark),
-                snapshot: diagSnapshot(),
-            });
-            dismissActionPopup();
-            showPopup('searchNoPosition', 5000);
-        }
-
-        endManualSearchSession();
-        searchControl.isFallbackSearching = false;
-        return !!resolved;
-    }
-
-    function visibleTweetSignature() {
-        const ids = [];
-        for (const article of visibleArticleElements()) {
-            const id = getPostTweetId(article);
-            if (id) ids.push(id);
-        }
-        return ids.join('|');
-    }
-
-    /**
-     * Positiver Sprung in Pixeln. Richtung setzt der Aufrufer.
-     * Nie weiter als ein Bildschirm: die Beiträge dazwischen gibt es noch nicht.
-     */
-    function searchJumpMagnitude(bookmark) {
-        const vh = window.innerHeight || 800;
-        // Landkarte kann „Ziel schon hier“ sagen, während die Beiträge im
-        // Fenster noch deutlich jünger sind. Dann weiter in Bildschirm-Schritten.
-        // Manuelles Laden findet die Stelle, weil es weiterrollt. Solange im
-        // Fenster noch kein normaler Beitrag so alt ist wie die Lesestelle,
-        // bleiben die Schritte ein Bildschirm. Die Landkarte hat hier zu früh stop gesagt.
-        if (viewportStillNewerThanBookmark(bookmark) || bookmarkNotReachedByTweetId(bookmark)) {
-            return Math.round(vh * CONFIG.SEARCH_JUMP_MAX_VH);
-        }
-        const distance = getMapDistanceToTarget(bookmark);
-        const near = isSearchFineZoneDistance(distance)
-            || distance === 0
-            || (distance != null && distance <= 8);
-        if (near) return CONFIG.SLOW_SEARCH_FINE_STEP_PX;
-        return Math.round(vh * CONFIG.SEARCH_JUMP_MAX_VH);
-    }
-
-    function tweetIdMs(tweetId) {
-        if (!tweetId) return null;
-        try {
-            return Number((BigInt(tweetId) >> 22n) + 1288834974657n);
-        } catch (e) {
-            return null;
-        }
-    }
-
-    function bookmarkTargetMs(bookmark) {
-        const raw = getComparisonTimestamp(bookmark);
-        const ms = raw ? Date.parse(raw) : NaN;
-        if (Number.isFinite(ms)) return ms;
-        return tweetIdMs(bookmark?.tweetId);
-    }
-
-    /**
-     * Gleicher Name ist kein Treffer. Die Tweet-ID muss die Lesestelle sein
-     * oder höchstens FALLBACK_NEAR_MS älter. Jüngere Posts zählen nicht.
-     */
-    function postIsNearBookmark(post, bookmark) {
-        if (!post?.tweetId || !bookmark?.tweetId) return false;
-        if (post.tweetId === bookmark.tweetId && !!post.isRepost === !!bookmark.isRepost) return true;
-        const target = bookmarkTargetMs(bookmark);
-        const parsedCandidate = Date.parse(post.timestamp || '');
-        const candidate = tweetIdMs(post.tweetId) ?? (Number.isFinite(parsedCandidate) ? parsedCandidate : null);
-        if (target === null || candidate === null) return false;
-        if (candidate > target + 60 * 1000) return false;
-        return target - candidate <= CONFIG.FALLBACK_NEAR_MS;
-    }
-
-    /**
-     * Fenster ist noch jünger als die Lesestelle.
-     * Ein einzelner alter Beitrag (Zitat, unerkannt als Repost) reicht nicht:
-     * es zählt der Median der normalen Beiträge. Sind alle Tweet-IDs noch
-     * höher, liegt die Stelle sicher weiter unten.
-     */
-    function viewportStillNewerThanBookmark(bookmark) {
-        const target = bookmarkTargetMs(bookmark);
-        const times = [];
-        let bookmarkId = null;
-        let allIdsNewer = !bookmark?.isRepost && !!bookmark?.tweetId;
-        if (allIdsNewer) {
-            try {
-                bookmarkId = BigInt(bookmark.tweetId);
-            } catch (e) {
-                allIdsNewer = false;
-            }
-        }
-        let sawOriginal = false;
-        for (const vis of getVisiblePosts()) {
-            if (!vis?.tweetId || vis.isRepost) continue;
-            sawOriginal = true;
-            const ms = Date.parse(vis.timestamp || '');
-            if (Number.isFinite(ms)) times.push(ms);
-            if (allIdsNewer && bookmarkId !== null) {
-                try {
-                    if (BigInt(vis.tweetId) <= bookmarkId) allIdsNewer = false;
-                } catch (e) {
-                    allIdsNewer = false;
-                }
-            }
-        }
-        if (!sawOriginal) return false;
-        if (allIdsNewer) return true;
-        if (!times.length || target === null) return false;
-        times.sort((a, b) => a - b);
-        return times[Math.floor(times.length / 2)] > target;
-    }
-
-    function isUnanchoredTailGhost(bookmark, idx, orderedLen) {
-        if (idx < 0 || orderedLen <= 0 || idx !== orderedLen - 1) return false;
-        const entry = timelineMapByKey.get(postRefKey(bookmark));
-        if (entry?.ghostTail) return true;
-        return findInsertIndexFromHistory(bookmark) < 0;
-    }
-
-    /** Ziel-Index der Landkarte liegt noch unter dem sichtbaren Fenster. */
-    function bookmarkIndexStillBelow(bookmark) {
-        const useSnapshot = searchControl.isSearching && scrollState.mapSnapshotOrderedKeys?.length;
-        const idx = useSnapshot ? getFrozenSearchBookmarkIdx() : findBookmarkIndexInMap(bookmark);
-        if (idx < 0) return false;
-        const orderedLen = useSnapshot
-            ? scrollState.mapSnapshotOrderedKeys.length
-            : timelineMapOrderedKeys.length;
-        if (isUnanchoredTailGhost(bookmark, idx, orderedLen)) return false;
-        const viewport = useSnapshot ? getSearchViewportIndexRange() : getVisibleMapIndexRange();
-        return viewport.max >= 0 && idx > viewport.max;
-    }
-
-    /**
-     * Der Median der sichtbaren Original-IDs ist noch jünger als die Lesestelle.
-     * Ein einzelner älterer Beitrag reicht nicht, sonst bricht die Suche ab
-     * und der Fallback nimmt weiter oben einen anderen Post desselben Namens.
-     * Reposts zählen nicht: ihre ID ist die des Originals.
-     */
-    function bookmarkNotReachedByTweetId(bookmark) {
-        if (!bookmark?.tweetId || bookmark.isRepost) return false;
-        let bookmarkId;
-        try {
-            bookmarkId = BigInt(bookmark.tweetId);
-        } catch (e) {
-            return false;
-        }
-        const ids = [];
-        for (const vis of getVisiblePosts()) {
-            if (!vis?.tweetId || vis.isRepost) continue;
-            try {
-                ids.push(BigInt(vis.tweetId));
-            } catch (e) {
-                continue;
-            }
-        }
-        if (!ids.length) return false;
-        ids.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
-        return ids[Math.floor(ids.length / 2)] > bookmarkId;
-    }
-
-    function sawVisibleOriginal() {
-        for (const vis of getVisiblePosts()) {
-            if (vis?.tweetId && !vis.isRepost) return true;
-        }
-        return false;
-    }
-
-    function bookmarkStillBelowWindow(bookmark) {
-        if (bookmarkNotReachedByTweetId(bookmark)) return true;
-        if (viewportStillNewerThanBookmark(bookmark)) return true;
-        // Sichtbares Original hat die Tweet-ID schon erreicht: Kartenindex nicht mehr „darunter“.
-        if (!bookmark?.isRepost && sawVisibleOriginal()) return false;
-        return bookmarkIndexStillBelow(bookmark);
-    }
-
-    function searchStillReachingBookmark(bookmark = lastReadPost) {
-        if (bookmarkNotReachedByTweetId(bookmark)) return true;
-        if (bookmark?.isRepost && viewportStillNewerThanBookmark(bookmark)) return true;
-        return false;
-    }
-
-    function readingPostFromVisible(vis, confidence, reason) {
-        const parsed = parseLoadedPost(vis.element);
-        const post = parsed || {
-            element: vis.element,
-            tweetId: vis.tweetId,
-            authorHandler: vis.authorHandler,
-            timestamp: vis.timestamp,
-            isRepost: !!vis.isRepost
-        };
-        if (!post.element) return null;
-        return { post, confidence, strategy: 'older', reason };
-    }
-
-    /**
-     * Nächster sichtbarer normaler Beitrag, der nicht jünger ist als die Lesestelle.
-     * Jüngere Beiträge im Fenster sind kein Ersatz für eine Stelle, die noch tiefer liegt.
-     */
-    function nearestVisibleReadingPost(bookmark) {
-        const target = bookmarkTargetMs(bookmark);
-        const visible = getVisiblePosts().filter(v => v?.element && v.tweetId && !v.isRepost);
-        if (!visible.length) return null;
-        let best = null;
-        let bestDiff = Infinity;
-        for (const vis of visible) {
-            const ms = Date.parse(vis.timestamp || '');
-            if (!Number.isFinite(ms) || target === null) continue;
-            if (ms > target) continue;
-            const diff = target - ms;
-            if (diff < bestDiff) {
-                bestDiff = diff;
-                best = vis;
-            }
-        }
-        if (!best || !postIsNearBookmark(best, bookmark)) return null;
-        return readingPostFromVisible(best, 60, 'visible-nearest');
-    }
-
-    function closestVisibleReadingPost(bookmark) {
-        const target = bookmarkTargetMs(bookmark);
-        const visible = getVisiblePosts().filter(v => v?.element && v.tweetId);
-        if (!visible.length) return null;
-        let best = null;
-        let bestDiff = Infinity;
-        for (const vis of visible) {
-            const ms = Date.parse(vis.timestamp || '');
-            const diff = Number.isFinite(ms) && target !== null ? Math.abs(target - ms) : Number.MAX_SAFE_INTEGER;
-            if (diff < bestDiff) {
-                bestDiff = diff;
-                best = vis;
-            }
-        }
-        if (!best || !postIsNearBookmark(best, bookmark)) return null;
-        return readingPostFromVisible(best, 55, 'visible-closest');
-    }
-
-    function resolvedPostIsTooYoung(resolved, bookmark) {
-        const target = bookmarkTargetMs(bookmark);
-        const ms = Date.parse(resolved?.post?.timestamp || '');
-        if (target === null || !Number.isFinite(ms)) return false;
-        return ms > target + 60 * 1000;
-    }
-
-    async function markNearestVisibleReadingPost(bookmark) {
-        const nearest = nearestVisibleReadingPost(bookmark);
-        if (!nearest?.post?.element) return false;
-        const landed = await applyResolvedReadingPosition(nearest, {
-            adopt: true,
-            expectedBookmark: bookmark,
-            verifySource: 'visible-nearest',
-        });
-        if (!landed) {
-            applyHighlightToPost(nearest.post.element, { confidence: nearest.confidence, strategy: nearest.strategy });
-        }
-        showPopup('approximatePosition', 6000, {
-            strategy: getResolveStrategyLabel(nearest.strategy, getUserLanguage())
-        });
-        log('Resolve', `Nächsten sichtbaren Post markiert: @${nearest.post.authorHandler || '?'} ${nearest.post.tweetId}`);
-        return true;
-    }
-
-    function noteWindowStillTooYoung() {
-        if (scrollState.windowTooYoungLogged) return;
-        scrollState.windowTooYoungLogged = true;
-        log('Search', 'Beiträge im Fenster sind noch jünger als die Lesestelle — Suche läuft weiter nach unten.');
-    }
-
-    /** Sichtbare Beiträge sind schon älter als die Lesestelle. Weiter nach unten würde sie auslassen. */
-    function scrolledPastBookmark(bookmark) {
-        // Ganz oben liegt die Lesestelle nicht schon über dem Fenster.
-        // Sonst bricht die Suche ab, bevor sie überhaupt nach unten rollt.
-        if (timelineScrollOffset() <= CONFIG.AT_TOP_SCROLL_PX) return false;
-        if (bookmarkNotReachedByTweetId(bookmark) || viewportStillNewerThanBookmark(bookmark)) {
-            noteWindowStillTooYoung();
-            return false;
-        }
-        const idx = findBookmarkIndexInMap(bookmark);
-        if (idx < 0) return false;
-        const { min } = getVisibleMapIndexRange();
-        return min >= 0 && idx < min;
-    }
-
-    /**
-     * Wartet, bis neue Tweet-IDs da sind und scrollY stillsteht,
-     * oder bis ohne neue IDs eine kurze Ruhezeit um ist.
-     * Kleine Richtungswechsel in dichter Folge sind die Auf-und-ab-Schleife.
-     */
-    function waitForFeedSettle(beforeSig, maxMs = 700) {
-        const settleMs = CONFIG.SEARCH_SETTLE_MS;
-        const minMs = CONFIG.SEARCH_STEP_MIN_MS;
-        return new Promise(resolve => {
-            const start = performance.now();
-            let lastY = window.scrollY;
-            let stableFrames = 0;
-            let stableSince = start;
-            let lastSig = beforeSig;
-            let lastSigCheck = 0;
-            let lastSmallSign = 0;
-            let smallFlips = 0;
-            const tick = (now) => {
-                const y = window.scrollY;
-                const delta = y - lastY;
-                if (Math.abs(delta) > 1) {
-                    stableFrames = 0;
-                    if (Math.abs(delta) < CONFIG.SEARCH_BOUNCE_PX) {
-                        const sign = delta > 0 ? 1 : -1;
-                        if (lastSmallSign && sign !== lastSmallSign) smallFlips++;
-                        lastSmallSign = sign;
-                    } else {
-                        lastSmallSign = 0;
-                        smallFlips = 0;
-                    }
-                } else {
-                    stableFrames++;
-                    if (stableFrames === 1) stableSince = now;
-                }
-                lastY = y;
-                if (smallFlips >= 4) {
-                    scrollState.settleOscillated = true;
-                    resolve(lastSig);
-                    return;
-                }
-                const elapsed = now - start;
-                if (now - lastSigCheck >= 100) {
-                    lastSig = visibleTweetSignature();
-                    lastSigCheck = now;
-                }
-                const idsChanged = lastSig !== beforeSig;
-                const stillMs = now - stableSince;
-                if (elapsed >= minMs && idsChanged && stableFrames >= 2) {
-                    resolve(lastSig);
-                    return;
-                }
-                if (elapsed >= minMs && !idsChanged && stableFrames >= 2 && stillMs >= settleMs) {
-                    resolve(lastSig);
-                    return;
-                }
-                if (elapsed >= maxMs) {
-                    resolve(lastSig);
-                    return;
-                }
-                requestAnimationFrame(tick);
-            };
-            requestAnimationFrame(tick);
-        });
-    }
-
-    function noteScrollLoopStopped() {
-        log('Search', 'Suche angehalten: die Seite springt nur noch hin und her.');
-        scrollState.settleOscillated = false;
-        scrollState.scrollLoopStopped = true;
-    }
-
-    function stopSearchScrollLoop(onCleanup) {
-        noteScrollLoopStopped();
-        diagEndFlow('warn', 'SCROLL_LOOP', 'Scroll-Schleife angehalten');
-        clearMapSnapshotForSearch();
-        endManualSearchSession();
-        dismissActionPopup();
-        if (typeof onCleanup === 'function') {
-            try { onCleanup(); } catch (e) { /* ignore */ }
-        }
-    }
-
-    function rememberSearchStep(step, beforeY) {
-        const actual = (window.scrollY || 0) - beforeY;
-        const deltas = scrollState.recentStepDeltas;
-        deltas.push(actual);
-        if (deltas.length > 4) deltas.shift();
-        if (deltas.length >= 4) {
-            const sum = deltas.reduce((a, b) => a + b, 0);
-            let sawDown = false;
-            let sawUp = false;
-            for (const delta of deltas) {
-                if (delta > 40) sawDown = true;
-                else if (delta < -40) sawUp = true;
-            }
-            if (sawDown && sawUp && Math.abs(sum) < CONFIG.SEARCH_BOUNCE_PX) {
-                debugLog('Search', `Schleife über ${deltas.map(d => Math.round(d)).join(', ')}px`);
-                scrollState.searchBounceCount = CONFIG.SEARCH_BOUNCE_MAX;
-                return true;
-            }
-        }
-        const swallowed = Math.abs(step) > 80 && Math.abs(actual) < CONFIG.SEARCH_BOUNCE_PX;
-        const reversed = step > 0 ? actual < -8 : actual > 8;
-        if (swallowed || reversed) {
-            scrollState.searchBounceCount++;
-            debugLog('Search', `Sprung ohne Weg (${Math.round(actual)}px statt ${Math.round(step)}px, ${scrollState.searchBounceCount})`);
-            return scrollState.searchBounceCount >= CONFIG.SEARCH_BOUNCE_MAX;
-        }
-        if (Math.abs(actual) >= CONFIG.SEARCH_BOUNCE_PX) {
-            scrollState.searchBounceCount = 0;
-        }
-        return false;
-    }
-
-    /** Wartet, bis andere Tweet-IDs im Fenster stehen. true = nachgeladen. */
-    function waitForReloadedPosts(beforeSig, maxMs) {
-        const deadline = performance.now() + maxMs;
-        return new Promise(resolve => {
-            const tick = () => {
-                if (visibleTweetSignature() !== beforeSig) {
-                    resolve(true);
-                    return;
-                }
-                if (performance.now() >= deadline) {
-                    resolve(false);
-                    return;
-                }
-                setTimeout(tick, 120);
-            };
-            tick();
-        });
-    }
-
-    /**
-     * true = echte Auf-und-ab-Schleife, Suche anhalten.
-     * Ein Sprung ohne neue Beiträge ist noch keine Schleife: die Lesestelle
-     * liegt noch tiefer, der Feed hat nur noch nicht nachgeladen.
-     */
-    async function searchShouldStopAfterJump(step, beforeY, beforeSig, bookmark) {
-        const oscillated = scrollState.settleOscillated;
-        const bounced = rememberSearchStep(step, beforeY);
-        if (!oscillated && !bounced) {
-            if (visibleTweetSignature() !== beforeSig) scrollState.unloadedJumpCount = 0;
-            return false;
-        }
-        const postsLoaded = visibleTweetSignature() !== beforeSig;
-        // Leeres Fenster heißt: der Sprung hat die Beiträge noch nicht nachgeladen.
-        let sawOriginal = false;
-        for (const vis of getVisiblePosts()) {
-            if (vis?.tweetId && !vis.isRepost) {
-                sawOriginal = true;
-                break;
-            }
-        }
-        const stillBelow = bookmarkStillBelowWindow(bookmark) || !sawOriginal;
-        if (postsLoaded) {
-            scrollState.unloadedJumpCount = 0;
-            scrollState.settleOscillated = false;
-            scrollState.searchBounceCount = 0;
-            scrollState.recentStepDeltas = [];
-            return false;
-        }
-        // Stelle schon erreicht und trotzdem Pendeln: das ist die Schleife.
-        if (!stillBelow) return true;
-
-        scrollState.settleOscillated = false;
-        scrollState.searchBounceCount = 0;
-        scrollState.recentStepDeltas = [];
-        if (!scrollState.unloadedWaitLogged) {
-            scrollState.unloadedWaitLogged = true;
-            log('Search', 'Beiträge noch nicht nachgeladen — Suche wartet und läuft weiter.');
-        } else {
-            debugLog('Search', 'Weiter warten auf nachgeladene Beiträge');
-        }
-        const loaded = await waitForReloadedPosts(beforeSig, CONFIG.SEARCH_RELOAD_WAIT_MS);
-        if (loaded) {
-            scrollState.unloadedJumpCount = 0;
-            scrollState.settleOscillated = false;
-            scrollState.searchBounceCount = 0;
-            return false;
-        }
-        scrollState.unloadedJumpCount = (scrollState.unloadedJumpCount || 0) + 1;
-        return scrollState.unloadedJumpCount >= CONFIG.SEARCH_UNLOADED_JUMPS_MAX;
-    }
-
-    /**
-     * Ein Bildschirm weiter, dann prüfen, sobald der Feed nachzieht.
-     * Die eingefrorene Such-Landkarte wird hier nicht neu eingelesen.
-     */
-    async function performScrollAndContinue(continueFn, onStagnationCleanup = null) {
-        if (scrollState.scrollLoopStopped || scrollState.searchBounceCount >= CONFIG.SEARCH_BOUNCE_MAX) {
-            stopSearchScrollLoop(onStagnationCleanup);
-            return;
-        }
-        const beforeHeight = document.body.scrollHeight || document.documentElement.scrollHeight;
-        const beforeSig = visibleTweetSignature();
-        const magnitude = searchJumpMagnitude(lastReadPost);
-        const step = scrollState.searchDirection === 'up' ? -magnitude : magnitude;
-        const beforeY = window.scrollY || 0;
-        debugLog('Search', `Sprung ${step}px (Slow: ${scrollState.isSlowScrollMode}, Dir: ${scrollState.searchDirection})`);
-        window.scrollBy({ top: step, behavior: 'auto' });
-
-        await waitForFeedSettle(beforeSig, 700);
-        if (await searchShouldStopAfterJump(step, beforeY, beforeSig, lastReadPost)) {
-            stopSearchScrollLoop(onStagnationCleanup);
-            return;
-        }
-
-        // Nach dem Scrollen kann X einen "versteckte Beiträge"-Button eingefügt haben.
-        await tryClickShowHiddenPostsButton('scroll-search');
-
-        const afterHeight = document.body.scrollHeight || document.documentElement.scrollHeight;
-        const afterSig = visibleTweetSignature();
-        const progressed = afterHeight !== beforeHeight || afterSig !== beforeSig;
-        scrollState.lastScrollHeight = afterHeight;
-
-        if (progressed) {
-            scrollState.stagnantScrollCount = 0;
-        } else {
-            scrollState.stagnantScrollCount++;
-            const awaitingAnchors = isAwaitingHistoricalMapAnchors();
-            const stagnantLimit = awaitingAnchors
-                ? CONFIG.MAP_ANCHOR_SEARCH_MAX_STAGNANT
-                : CONFIG.MAX_STAGNANT_SCROLLS;
-
-            if (scrollState.stagnantScrollCount > stagnantLimit) {
-                if (bookmarkStillBelowWindow(lastReadPost)) {
-                    // Kurzes Stocken ist kein Ende. Die Versuchszahl beendet die Suche.
-                    scrollState.stagnantScrollCount = 0;
-                    debugLog('Search', 'Stocken, Lesestelle noch tiefer — weiter nach unten');
-                } else {
-                    log('Search', `Suche abgebrochen: Keine neuen Posts nach Stagnation (${stagnantLimit}).`);
-                    diagPush('SEARCH_STAGNATION', 'warn', 'Scroll-Suche stagniert — Fallback-Resolve', {
-                        stagnantScrolls: scrollState.stagnantScrollCount,
-                        awaitingMapAnchors: awaitingAnchors,
-                        snapshot: diagSnapshot(),
-                    });
-                    clearMapSnapshotForSearch();
-                    endManualSearchSession();
-                    void landReadingPositionFromResolve('stagnation');
-
-                    if (typeof onStagnationCleanup === 'function') {
-                        try { onStagnationCleanup(); } catch (e) { /* ignore */ }
-                    }
-                    return;
-                }
-            }
-
-            if (awaitingAnchors && scrollState.stagnantScrollCount > CONFIG.MAX_STAGNANT_SCROLLS) {
-                debugLog('Search', `Stagnation (${scrollState.stagnantScrollCount}), warte weiter auf historische Landkarten-Posts…`);
-            }
-        }
-
-        if (continueFn) requestAnimationFrame(continueFn);
-    }
-
-
-    /**
-     * Zentralisiert alle gängigen Abbruchbedingungen der Suche.
-     * Gibt true zurück, wenn die Suche abgebrochen werden soll (inkl. Side-Effects wie Cleanup).
-     * Mit optionale reason für besseres Logging während Punkt 4 Refactoring.
-     */
-    function shouldAbortSearch(reason = '', currentScrollCount = 0, onCleanup = null) {
-        const logPrefix = reason ? `[${reason}] ` : '';
-        const doCleanup = (dismissPopup = true) => {
-            endManualSearchSession();
-            if (dismissPopup) dismissActionPopup();
-            if (typeof onCleanup === 'function') {
-                try { onCleanup(); } catch (e) { /* ignore cleanup errors */ }
-            }
-        };
-
-        const startFallbackSearch = () => {
-            clearMapSnapshotForSearch();
-            endManualSearchSession();
-            void landReadingPositionFromResolve('search-abort');
-            if (typeof onCleanup === 'function') {
-                try { onCleanup(); } catch (e) { /* ignore cleanup errors */ }
-            }
-        };
-
-        if (searchControl.isSearchCancelled) {
-            debugLog('Search', `${logPrefix}Suche abgebrochen durch Benutzer.`);
-            diagPush('SEARCH_CANCELLED', 'warn', 'Suche vom User abgebrochen', { reason, snapshot: diagSnapshot() });
-            doCleanup(true);
-            return true;
-        }
-
-        if (!searchControl.isSearching) {
-            debugLog('Search', `${logPrefix}Suche bereits beendet.`);
-            diagPush('SEARCH_ALREADY_ENDED', 'anomaly', `Suche-Schleife lief obwohl isSearching=false (${reason})`, {
-                manualSearchActive: searchControl.manualSearchActive,
-                snapshot: diagSnapshot(),
-            });
-            doCleanup(true);
-            return true;
-        }
-
-        const reaching = searchStillReachingBookmark(lastReadPost);
-        const scrollAttemptLimit = reaching
-            ? CONFIG.MAP_ANCHOR_SEARCH_MAX_ATTEMPTS
-            : CONFIG.MAX_SCROLL_ATTEMPTS;
-        const loadedPostLimit = reaching
-            ? CONFIG.MAP_ANCHOR_SEARCH_MAX_LOADED
-            : CONFIG.MAX_LOADED_POSTS_BEFORE_FALLBACK;
-
-        if (currentScrollCount > scrollAttemptLimit) {
-            log('Search', `${logPrefix}Maximale Scroll-Versuche erreicht (${scrollAttemptLimit}), starte Fallback.`);
-            diagPush('SEARCH_MAX_ATTEMPTS', 'warn', 'Max Scroll-Versuche erreicht', {
-                scrollCount: currentScrollCount,
-                reachingBookmark: reaching,
-                snapshot: diagSnapshot(),
-            });
-            startFallbackSearch();
-            return true;
-        }
-
-        if (scrollState.totalLoadedPosts > loadedPostLimit) {
-            debugLog('Search', `${logPrefix}Über ${loadedPostLimit} Posts geladen – Suche abgebrochen.`);
-            diagPush('SEARCH_TOO_MANY_POSTS', 'warn', 'Zu viele Posts geladen — Fallback', {
-                loaded: scrollState.totalLoadedPosts,
-                reachingBookmark: reaching,
-                snapshot: diagSnapshot(),
-            });
-            startFallbackSearch();
-            return true;
-        }
-
-        if (reaching &&
-            (currentScrollCount > CONFIG.MAX_SCROLL_ATTEMPTS ||
-                scrollState.totalLoadedPosts > CONFIG.MAX_LOADED_POSTS_BEFORE_FALLBACK)) {
-            debugLog('Search', `${logPrefix}Normale Limits überschritten — Suche läuft weiter, bis die Lesestelle erreicht ist oder 800 Versuche um sind (${scrollState.totalLoadedPosts} geladen, Versuch ${currentScrollCount}).`);
-        }
-
-        return false;
-    }
-
-
-    async function startRefinedSearchForLastReadPost(fromFile = false) {
-    debugLog('Search', 'Starte optimierte Suche für letzte Leseposition...');
-    beginManualSearchSession();
-    diagBeginFlow('manual-search', { fromFile });
-
-    // Sofort prüfen, ob X schon einen "versteckte Beiträge"-Button zeigt (kann Suche blockieren)
-    await tryClickShowHiddenPostsButton('search-start');
-
-    scrollState.stagnantScrollCount = 0;
-    scrollState.isSlowScrollMode = false;
-    scrollState.searchDirection = 'down';
-    scrollState.lastScrollHeight = 0;
-    clearMapSnapshotForSearch();
-
-    try {
-    if (!isScriptActivated) {
-        showPopup('searchScrollPrompt', 5000);
-        diagEndFlow('warn', 'SEARCH_NOT_ACTIVATED', 'Skript nicht aktiviert');
-        endManualSearchSession();
-        return;
-    }
-    let storedData = null;
-    const account = await getCurrentUserHandle();
-    if (!fromFile) {
-        await loadLastReadPost(async (data) => {
-            if (!data) {
-                debugLog('Search', `Keine Leseposition für Account ${account} gefunden.`);
-                showPopup('searchNoPosition', 5000);
-                diagEndFlow('fail', 'SEARCH_NO_BOOKMARK', 'Keine Leseposition gespeichert');
-                endManualSearchSession();
-                return;
-            }
-            storedData = data;
-            debugLog('Search', `Geladene Leseposition für Account ${account}:`, storedData);
-        });
-    } else {
-        storedData = lastReadPost;
-    }
-    if (!storedData || !storedData.tweetId || !storedData.authorHandler || !storedData.timestamp) {
-        log('Search', 'Ungültige Leseposition:', storedData);
-        showPopup('invalidPosition', 5000);
-        diagEndFlow('fail', 'SEARCH_INVALID_BOOKMARK', 'Ungültige Leseposition', { storedData });
-        endManualSearchSession();
-        return;
-    }
-    lastReadPost = storedData;
-    const searchBookmark = {
-        tweetId: storedData.tweetId,
-        authorHandler: storedData.authorHandler,
-        timestamp: storedData.timestamp,
-        isRepost: !!storedData.isRepost,
-        readAt: storedData.readAt || storedData.timestamp,
-        account: storedData.account
-    };
-    if (!lastReadPost.readAt) {
-        lastReadPost.readAt = lastReadPost.timestamp;
-    }
-    const effectiveForAge = getEffectiveReadTimestamp(storedData);
-    const positionAge = Date.now() - new Date(effectiveForAge).getTime();
-    const ageThreshold = 24 * 60 * 60 * 1000;
-    if (positionAge > ageThreshold) {
-        const continueSearch = confirm(getTranslatedMessage('oldPositionWarning', getUserLanguage()));
-        if (!continueSearch) {
-            debugLog('Search', 'Suche abgebrochen: Benutzer hat alte Position abgelehnt.');
-            diagEndFlow('warn', 'SEARCH_OLD_DECLINED', 'User lehnte alte Position ab');
-            await landReadingPositionFromResolve('old-position-declined', searchBookmark);
-            return;
-        }
-    }
-    diagPush('BOOKMARK_TARGET', 'info', 'Such-Ziel gesetzt', { target: diagBookmark(searchBookmark) });
-    debugLog('Search', `Suche für Account ${account}:`, lastReadPost);
-    persistTimelineMap(true);
-    updateTimelineMap('search-init');
-    ensureBookmarkInMap(searchBookmark);
-    captureMapSnapshotForSearch(searchBookmark);
-    const exactInDom = findBookmarkExactInDom(searchBookmark);
-    if (exactInDom) {
-        debugLog('Search', 'Beitrag bereits im DOM gefunden, scrolle direkt.');
-        lastReadPost.found = true;
-        updateHighlightedPost();
-        const finishExactDomSearch = () => {
-            markTopVisiblePost(false);
-            diagEndFlow('ok', 'SEARCH_EXACT_DOM', 'Exakter Treffer im DOM', { target: diagBookmark(searchBookmark) });
-            clearMapSnapshotForSearch();
-            endManualSearchSession();
-        };
-        activateRestoreSuppression(searchBookmark.tweetId);
-        if (isPostAtReadingOffset(exactInDom.element)) {
-            debugLog('Position', 'Exakter Treffer bereits am Lesestellen-Offset — Scroll übersprungen');
-            diagPush('POSITION_SKIP', 'info', 'Lupe: kein Scroll nötig (bereits am Offset)', {
-                deviation: Math.round(getPostOffsetDeviation(exactInDom.element)),
-            });
-            scheduleHighlightRetries(searchBookmark.tweetId, searchBookmark.authorHandler, [0, 300, 900, 2000, 3500], !!searchBookmark.isRepost);
-            finishExactDomSearch();
-        } else {
-            setTimeout(() => {
-                scrollToPostWithHighlight(exactInDom.element, finishExactDomSearch);
-            }, 450);
-        }
-        return;
-    }
-
-    if (!shouldScrollSearchForBookmark(searchBookmark)) {
-        log('Search', 'Resolve-Landing ohne Scroll-Suche.');
-        diagEndFlow('warn', 'SEARCH_PRE_RESOLVE', 'Kein exakter DOM-Treffer — Resolve ohne Scroll');
-        await landReadingPositionFromResolve('search-pre-resolve', searchBookmark);
-        return;
-    }
-
-    updateSearchDirectionFromMap(searchBookmark);
-    const frozenIdx = getFrozenSearchBookmarkIdx();
-    const viewport = getSearchViewportIndexRange();
-    const inViewportRange = frozenIdx >= 0 && viewport.min >= 0 &&
-        frozenIdx >= viewport.min && frozenIdx <= viewport.max;
-    log('Search', inViewportRange
-        ? `Ziel idx ${frozenIdx} im Viewport (${viewport.min}–${viewport.max}) — Feinsuche.`
-        : `Ziel idx ${frozenIdx} außerhalb Viewport (${viewport.min}–${viewport.max}) — ${scrollState.searchDirection === 'up' ? 'nach oben' : 'nach unten'}.`);
-    popup = createSearchPopup(searchBookmark);
-    if (!popup) {
-        log('Search', 'Popup konnte nicht erstellt werden.');
-        diagEndFlow('fail', 'SEARCH_NO_POPUP', 'Such-Popup konnte nicht erstellt werden');
-        endManualSearchSession();
-        return;
-    }
-    const checkedTweetIds = new Set();
-    const io = new IntersectionObserver(entries => {
-        entries.forEach(entry => {
-            if (entry.isIntersecting) {
-                const post = entry.target;
-                const parsed = parseLoadedPost(post);
-                if (parsed &&
-                    parsed.tweetId === searchBookmark.tweetId &&
-                    parsed.authorHandler === searchBookmark.authorHandler &&
-                    parsed.isRepost === searchBookmark.isRepost) {
-                    debugLog('Search', 'Beitrag via IntersectionObserver gefunden:', searchBookmark);
-                    lastReadPost.found = true;
-                    updateHighlightedPost(); // Border sofort
-
-                    // Auch hier eine kleine Verzögerung, falls der Observer feuert, während noch gescrollt wird
-                    searchControl.isAutoScrolling = true;
-                    setTimeout(() => {
-                        scrollToPostWithHighlight(post);
-                    }, 300);
-
-                    activateRestoreSuppression(searchBookmark.tweetId);
-                    markTopVisiblePost(false);
-
-                    diagEndFlow('ok', 'SEARCH_IO_FOUND', 'Ziel via IntersectionObserver', {
-                        target: diagBookmark(searchBookmark),
-                    });
-                    clearMapSnapshotForSearch();
-                    endManualSearchSession();
-                    dismissActionPopup();
-                    window.removeEventListener('keydown', handleSpaceKey);
-                    io.disconnect();
-                }
-            }
-        });
-    }, { threshold: 0.2 });
-    function handleSpaceKey(event) {
-        if (event.code === 'Space' && (searchControl.isSearching || searchControl.isFallbackSearching)) {
-            searchControl.isSearchCancelled = true;
-            dismissActionPopup();
-            showPopup('fallbackSearchCancelled', 5000);
-            debugLog('Search', 'Lupe-Suche per Space abgebrochen — Skript bleibt aktiv (Auto-Save/New-Posts normal).');
-            endManualSearchSession();
-            searchControl.isFallbackSearching = false;
-            clearMapSnapshotForSearch();
-            if (isNearTimelineTop() && !isReadingPositionAtTargetOffset()) {
-                newPostsState.autoLoadPaused = false;
-            }
-            window.removeEventListener('keydown', handleSpaceKey);
-            io.disconnect();
-        }
-    }
-    window.addEventListener('keydown', handleSpaceKey);
-    let scrollCount = 0;
-    const search = async () => {
-        scrollCount++;
-
-        if (!searchControl.manualSearchActive) {
-            debugLog('Search', 'Manuelle Suche beendet — Scroll-Schleife stoppt.');
-            diagPush('SEARCH_LOOP_STOP', 'info', 'Scroll-Schleife sauber beendet');
-            clearMapSnapshotForSearch();
-            window.removeEventListener('keydown', handleSpaceKey);
-            if (io) io.disconnect();
-            return;
-        }
-
-        if (shouldAbortSearch('initial', scrollCount, () => {
-            window.removeEventListener('keydown', handleSpaceKey);
-            if (io) io.disconnect();
-        })) return;
-
-        let posts = getVisiblePosts().map(p => p.element);
-        scrollState.totalLoadedPosts = Array.from(document.querySelectorAll('article')).length;
-        debugLog('Search', `Prüfe ${posts.length} sichtbare Posts (Gesamt: ${scrollState.totalLoadedPosts}). Scroll-Versuch: ${scrollState.stagnantScrollCount + 1}`);
-
-        // Während Lesestelle-Suche: falls X einen "Versteckte Beiträge anzeigen" Button eingefügt hat,
-        // diesen sofort anklicken, damit die versteckten Posts geladen werden und die Suche das Ziel finden kann.
-        const gapClicked = await tryClickShowHiddenPostsButton('search');
-        if (gapClicked) {
-            // Nach dem Expand die sichtbaren Posts neu holen
-            posts = getVisiblePosts().map(p => p.element);
-            scrollState.totalLoadedPosts = Array.from(document.querySelectorAll('article')).length;
-            debugLog('Search', 'Nach Klick auf versteckte Beiträge: Posts neu geprüft.');
-        }
-
-        if (shouldAbortSearch('loaded-posts', scrollCount, () => {
-            window.removeEventListener('keydown', handleSpaceKey);
-            if (io) io.disconnect();
-        })) return;
-
-        if (posts.length === 0) {
-            debugLog('Search', 'Keine sichtbaren Posts im DOM, warte auf Laden...');
-            await tryClickShowHiddenPostsButton('search-empty');
-            await performScrollAndContinue(search, () => {
-                window.removeEventListener('keydown', handleSpaceKey);
-                if (io) io.disconnect();
-            });
-            return;
-        }
-        posts.forEach(post => io.observe(post));
-        let found = false;
-        for (const post of posts) {
-            const parsed = parseLoadedPost(post);
-            if (!parsed?.tweetId) continue;
-            const checkKey = `${parsed.tweetId}-${parsed.authorHandler || ''}-${parsed.isRepost}`;
-            if (checkedTweetIds.has(checkKey)) continue;
-            checkedTweetIds.add(checkKey);
-            if (parsed.tweetId === searchBookmark.tweetId &&
-                parsed.authorHandler === searchBookmark.authorHandler &&
-                parsed.isRepost === searchBookmark.isRepost) {
-                debugLog('Search', 'Beitrag gefunden:', searchBookmark);
-                lastReadPost.found = true;
-                updateHighlightedPost();
-
-                searchControl.isAutoScrolling = true;
-                setTimeout(() => {
-                    scrollToPostWithHighlight(post);
-                }, 250);
-
-                activateRestoreSuppression(searchBookmark.tweetId);
-                markTopVisiblePost(false);
-
-                diagEndFlow('ok', 'SEARCH_LOOP_FOUND', 'Ziel in Scroll-Schleife gefunden', {
-                    target: diagBookmark(searchBookmark),
-                });
-                clearMapSnapshotForSearch();
-                endManualSearchSession();
-                dismissActionPopup();
-                window.removeEventListener('keydown', handleSpaceKey);
-                io.disconnect();
-                found = true;
-                return;
-            }
-        }
-        if (found) return;
-
-        const searchCleanup = () => {
-            window.removeEventListener('keydown', handleSpaceKey);
-            io.disconnect();
-        };
-
-        const domExact = findBookmarkExactInDom(searchBookmark);
-        if (domExact?.element) {
-            await landExactSearchHit(searchBookmark, domExact.element, 'SEARCH_DOM_VISIBLE', searchCleanup);
-            return;
-        }
-
-        const previousDirection = scrollState.searchDirection;
-        updateSearchDirectionFromMap(searchBookmark);
-        // Dieselbe gespeicherte Stelle findet das manuelle Laden. Die Landkarte
-        // darf die automatische Suche nicht beenden, solange der Beitrag noch
-        // nicht im DOM ist und das Fenster noch jüngere Tweet-IDs zeigt.
-        const notReached = bookmarkStillBelowWindow(searchBookmark);
-        if (notReached) {
-            noteWindowStillTooYoung();
-            scrollState.searchDirection = 'down';
-            scrollState.slowScrollLockedDirection = null;
-            scrollState.slowScrollFineAttempts = 0;
-            scrollState.isSlowScrollMode = false;
-            scrollState.directionFlipStreak = 0;
-        } else if (scrollState.searchDirection !== previousDirection) {
-            // Ein einzelner Wechsel ist oft nur das Pendeln der Landkarte.
-            scrollState.directionFlipStreak++;
-            if (scrollState.directionFlipStreak < 2) {
-                debugLog('Search', `Richtungswechsel ${previousDirection} → ${scrollState.searchDirection} zurückgestellt`);
-                scrollState.searchDirection = previousDirection;
-            } else {
-                scrollState.directionFlipStreak = 0;
-            }
-        } else {
-            scrollState.directionFlipStreak = 0;
-        }
-
-        scrollState.lastSearchScrollDirection = scrollState.searchDirection;
-
-        await performScrollAndContinue(search, () => {
-            window.removeEventListener('keydown', handleSpaceKey);
-            if (io) io.disconnect();
-        });
-    };
-    await new Promise(resolve => requestAnimationFrame(resolve));
-    search();
-
-    } catch (err) {
-        log('Search', 'Unerwarteter Fehler in startRefinedSearchForLastReadPost:', err);
-        diagEndFlow('fail', 'SEARCH_EXCEPTION', String(err?.message || err), { snapshot: diagSnapshot() });
-        endManualSearchSession();
-    }
-}
-
-    function getPostOffsetDeviation(element) {
-        if (!element?.getBoundingClientRect) return Infinity;
-        return Math.abs(element.getBoundingClientRect().top - CONFIG.RESTORE_SCROLL_OFFSET);
-    }
-
-    function isPostAtReadingOffset(element, tolerance = CONFIG.POSITION_CORRECTION_TOLERANCE) {
-        return getPostOffsetDeviation(element) <= tolerance;
-    }
-
-    function topPostMatchesBookmark(topPost, bookmark) {
-        if (!topPost || !bookmark?.tweetId) return false;
-        const tweetId = getPostTweetId(topPost);
-        const authorHandler = getPostAuthorHandler(topPost);
-        return tweetId === bookmark.tweetId &&
-            authorHandler === bookmark.authorHandler &&
-            !!isRepost(topPost) === !!bookmark.isRepost;
-    }
-
-    function isReadingPositionAtTargetOffset(bookmark = lastReadPost) {
-        const restoreBookmark = snapshotReadingBookmark(bookmark);
-        if (!restoreBookmark) return false;
-        const anchorPost = getPostAtReadingOffset(150) || getTopVisiblePost();
-        return !!(anchorPost &&
-            topPostMatchesBookmark(anchorPost, restoreBookmark) &&
-            isPostAtReadingOffset(anchorPost));
-    }
-
-    function logNewPostsAutoLoadPausedOnce() {
-        const now = Date.now();
-        if (now - newPostsState.lastPausedLogAt < 60000) return;
-        newPostsState.lastPausedLogAt = now;
-        debugLog('NewPosts', `Top-Post am Ziel-Offset (${CONFIG.RESTORE_SCROLL_OFFSET}px) — Auto-Laden pausiert`);
-        diagPush('NEWPOSTS_ALREADY_POSITIONED', 'info', 'Auto-Laden pausiert (bereits am Offset)', {
-            snapshot: diagSnapshot(),
-        });
-    }
-
-    function isNewPostsAutoLoadPaused() {
-        if (!isNearTimelineTop()) {
-            newPostsState.autoLoadPaused = false;
-            return false;
-        }
-        // Eine sichtbare Pille heißt: oben liegen noch ungeladene Beiträge.
-        // Die schon ausgerichtete Lesestelle darf den Klick nicht schlucken.
-        if (getNewPostsIndicator()) {
-            newPostsState.autoLoadPaused = false;
-            return false;
-        }
-        // Lesestelle am Ziel-Offset und keine Pille: nicht im Leerlauf klicken.
-        if (isReadingPositionAtTargetOffset()) {
-            if (!newPostsState.autoLoadPaused) {
-                newPostsState.autoLoadPaused = true;
-                logNewPostsAutoLoadPausedOnce();
-            }
-            return true;
-        }
-        if (findNewestVisiblePostNewerThanBookmark(lastReadPost)) {
-            newPostsState.autoLoadPaused = false;
-            return false;
-        }
-        newPostsState.autoLoadPaused = false;
-        return false;
-    }
-
-    function tryAutoClickNewPosts() {
-        if (followingTabActive === false) return;
-        if (!isScriptActivated ||
-            searchControl.isSearching ||
-            searchControl.isFallbackSearching ||
-            searchControl.isAutoScrolling ||
-            searchControl.newPostsRestoreActive) {
-            return;
-        }
-        // Im Leerlauf nur ganz oben. Nach dem Zurückkommen oder nach „Folge ich“
-        // reicht die Nähe zum Anfang. Eine Pille, die erst danach erscheint,
-        // darf auch weiter unten geladen werden.
-        const watch = Date.now() < focusPillWatchUntil;
-        const catchLatePill = focusWatchAllowsOffTopClick();
-        if (!isAtTimelineTop() && !catchLatePill && !(watch && isNearTimelineTop())) return;
-        if (!catchLatePill && Date.now() - newPostsState.lastRestoreCompletedAt < 6000) return;
-        if (isNewPostsAutoLoadPaused()) return;
-        if (Date.now() - newPostsPillClickedAt < CONFIG.NEW_POSTS_PILL_RETRY_MS) return;
-        const indicator = getNewPostsIndicator();
-        if (!indicator) {
-            // Weg ist die Pille: der nächste Stapel darf wieder geladen werden.
-            if (Date.now() - newPostsPillClickedAt >= CONFIG.NEW_POSTS_PILL_RETRY_MS) {
-                newPostsPillClickCount = 0;
-                newPostsPillClickText = '';
-            }
-            return;
-        }
-        const label = (indicator.textContent || '').replace(/\s+/g, ' ').trim();
-        // Ein Klick, der die Pille nicht schließt, nicht endlos wiederholen.
-        if (newPostsPillClickCount >= 3 && label === newPostsPillClickText) return;
-        newPostsState.wakeClickArmedAt = Date.now();
-        clickNewPostsIndicator();
-    }
-
-    function finishPostHighlightAtOffset(element, anchorTweetId, anchorAuthor, onComplete, reason, options = {}) {
-        const { ignoreAnchorStale = false } = options;
-        const anchorRepost = element ? isRepost(element) : null;
-        if (!ignoreAnchorStale && isScrollAnchorStale(anchorTweetId, anchorAuthor, anchorRepost)) {
-            debugLog('Position', 'Scroll-Highlight abgebrochen — Lesestelle wurde zwischendurch aktualisiert');
-            searchControl.isAutoScrolling = false;
-            noteProgrammaticScrollEnded();
-            syncHighlightIfDrifted();
-            if (onComplete) onComplete();
-            return;
-        }
-        const freshPost = resolveFreshPostElement(element, anchorTweetId, anchorAuthor, anchorRepost) || element;
-        debugLog('Position', reason);
-        searchControl.isAutoScrolling = false;
-        noteProgrammaticScrollEnded();
-        updateHighlightedPost(freshPost);
-        applyHighlightToPost(freshPost);
-        if (anchorTweetId && anchorAuthor) {
-            scheduleHighlightRetries(anchorTweetId, anchorAuthor, [0, 300, 900, 2000, 3500], anchorRepost);
-        }
-        if (onComplete) onComplete();
-    }
-
-    /** Lebende Lesestelle ist ein anderer, neuerer Post als das eingefrorene Ziel. */
-    function isLiveReadingAheadOf(frozen) {
-        if (!frozen?.tweetId || !lastReadPost?.tweetId) return false;
-        if (postRefKey(lastReadPost) === postRefKey(frozen)) return false;
-        return isCandidateNewer(lastReadPost, frozen);
-    }
-
-    /**
-     * Hochscrollen hat die Lesestelle nach vorn gesetzt.
-     * Eine vorher gemerkte Aufwach-Suche darf danach nicht mehr zur alten Stelle springen.
-     */
-    function noteUserAdvancedReadingPosition(newPost) {
-        if (!newPost?.tweetId) return;
-        const hidden = newPostsState.hiddenBookmark;
-        if (!hidden?.tweetId) return;
-        if (postRefKey(newPost) === postRefKey(hidden)) return;
-        if (!isCandidateNewer(newPost, hidden)) return;
-        newPostsState.wakeGeneration++;
-        newPostsState.hiddenBookmark = null;
-        debugLog('Restore',
-            'Aufwach-Suche verworfen — neuere Lesestelle @' +
-            (newPost.authorHandler || '?') + ' ' + newPost.tweetId);
-    }
-
-    function liveReadingIsAheadOfPost(post) {
-        if (!post || !lastReadPost?.tweetId) return false;
-        const tweetId = getPostTweetId(post);
-        if (!tweetId) return false;
-        const authorHandler = getPostAuthorHandler(post);
-        if (tweetId === lastReadPost.tweetId &&
-            authorHandler === lastReadPost.authorHandler &&
-            !!isRepost(post) === !!lastReadPost.isRepost) {
-            return false;
-        }
-        return isCandidateNewer(lastReadPost, {
-            tweetId,
-            authorHandler,
-            timestamp: getPostTimestamp(post),
-            isRepost: isRepost(post)
-        });
-    }
-
-    async function reinstateFrozenReadingBookmark(bookmark, options = {}) {
-        const { save = true, highlight = true, force = false } = options;
-        const hold = manualScrollGeneration;
-        const frozen = snapshotReadingBookmark(bookmark);
-        if (!frozen?.tweetId || !frozen.authorHandler) return false;
-        if (manualScrollGeneration !== hold) return false;
-        if (!force && isLiveReadingAheadOf(frozen)) {
-            debugLog('Restore',
-                'Ältere Lesestelle nicht zurückgeschrieben — @' +
-                lastReadPost.authorHandler + ' ' + lastReadPost.tweetId + ' bleibt');
-            syncHighlightIfDrifted();
-            return false;
-        }
-
-        const account = frozen.account || await getCurrentUserHandle();
-        if (manualScrollGeneration !== hold || isLiveReadingAheadOf(frozen)) {
-            debugLog('Restore', 'Zurückschreiben verworfen — inzwischen manuell weitergescrollt');
-            syncHighlightIfDrifted();
-            return false;
-        }
-        lastReadPost = { ...frozen, account };
-        invalidateHighlightRetries();
-
-        if (highlight) {
-            const el = findPostElementInDOM(frozen.tweetId, frozen.authorHandler, !!frozen.isRepost);
-            if (el) {
-                applyHighlightToPost(el);
-                scheduleHighlightRetries(frozen.tweetId, frozen.authorHandler, [0, 300, 900, 2000, 3500], !!frozen.isRepost);
-            } else {
-                updateHighlightedPost();
-            }
-        }
-
-        if (save) {
-            await saveLastReadPost(lastReadPost, { force: true });
-        }
-        return true;
-    }
-
-    /**
-     * scrollTo nur zum Ausrichten. Ein Ziel ganz oben, während die Seite
-     * weiter unten steht, ist ein leerer Artikel (rect ≈ 0) und würde die
-     * Lesestelle entladen.
-     */
-    function scrollFeedTo(targetY, reason, options = {}) {
-        const y = Math.max(0, Number(targetY) || 0);
-        const here = window.scrollY || 0;
-        const vh = window.innerHeight || 800;
-        const upward = here - y;
-        if (!options.allowLongUp && upward > vh * 1.25) {
-            debugLog('Position', `Langer Sprung nach oben verworfen (${reason}, ${Math.round(here)} → ${Math.round(y)})`);
-            return false;
-        }
-        if (here > vh && y <= CONFIG.AT_TOP_SCROLL_PX) {
-            debugLog('Position', `Sprung an den Seitenanfang verworfen (${reason}, ${Math.round(here)} → ${Math.round(y)})`);
-            return false;
-        }
-        window.scrollTo({ top: y, behavior: 'auto' });
-        return true;
-    }
-
-    function scrollToPostWithHighlight(post, onComplete = null, options = {}) {
-    const { ignoreAnchorStale = false } = options;
-    if (!post) {
-        log('Search', 'Kein Beitrag zum Scrollen.');
-        endManualSearchSession();
-        searchControl.isFallbackSearching = false;
-        if (onComplete) onComplete();
-        return;
-    }
-    const anchorTweetId = getPostTweetId(post);
-    const anchorAuthor = getPostAuthorHandler(post);
-    const anchorRepost = isRepost(post);
-    if (liveReadingIsAheadOfPost(post)) {
-        debugLog('Position', 'Scroll abgebrochen — Lesestelle ist neuer als das Scroll-Ziel');
-        searchControl.isAutoScrolling = false;
-        noteProgrammaticScrollEnded();
-        syncHighlightIfDrifted();
-        if (onComplete) onComplete();
-        return;
-    }
-    if (!ignoreAnchorStale && isScrollAnchorStale(anchorTweetId, anchorAuthor, anchorRepost)) {
-        debugLog('Position', 'Scroll übersprungen — Lesestelle wurde vor Positionierung aktualisiert');
-        searchControl.isAutoScrolling = false;
-        syncHighlightIfDrifted();
-        if (onComplete) onComplete();
-        return;
-    }
-    // Ein gerade nachgeladener Post schiebt die Lesestelle nach unten.
-    // Solange sie im Fenster steht, gehört ihre Oberkante auf die Lesezeile,
-    // nicht nur der Rahmen. overflow-anchor würde den Sprung sonst zurücknehmen.
-    const offset = CONFIG.RESTORE_SCROLL_OFFSET;
-    const tolerance = CONFIG.POSITION_CORRECTION_TOLERANCE;
-    const generation = manualScrollGeneration;
-    let ownedAnchor = false;
-    let attempts = 0;
-    let unmoved = 0;
-    let settleOpen = true;
-
-    const anchorHeld = () => document.documentElement?.dataset.xtsAnchorHeld === '1';
-    const holdAlign = () => {
-        if (anchorHeld()) return;
-        holdScrollAnchor();
-        ownedAnchor = true;
-    };
-    const releaseAlign = () => {
-        if (!ownedAnchor) return;
-        ownedAnchor = false;
-        releaseScrollAnchor();
-    };
-    const fresh = () => resolveFreshPostElement(post, anchorTweetId, anchorAuthor, anchorRepost) || post;
-    const stillOurs = () => {
-        if (generation !== manualScrollGeneration) return false;
-        if (liveReadingIsAheadOfPost(post)) return false;
-        if (!ignoreAnchorStale && isScrollAnchorStale(anchorTweetId, anchorAuthor, anchorRepost)) return false;
-        return true;
-    };
-    const endSettle = () => {
-        if (!settleOpen) return;
-        settleOpen = false;
-        releaseAlign();
-    };
-
-    const scheduleSettle = () => {
-        const delays = [400, 1100];
-        let pending = delays.length;
-        delays.forEach((delay) => {
-            setTimeout(() => {
-                pending--;
-                const last = pending === 0;
-                if (!settleOpen) return;
-                if (!stillOurs() ||
-                    searchControl.isSearching ||
-                    searchControl.manualSearchActive ||
-                    searchControl.newPostsRestoreActive) {
-                    endSettle();
-                    return;
-                }
-                const active = fresh();
-                const rect = active?.getBoundingClientRect?.();
-                const vh = window.innerHeight || 800;
-                const visible = !!rect && rect.height >= 5 && rect.bottom > 40 && rect.top < vh;
-                const delta = rect ? rect.top - offset : 0;
-                if (!visible) {
-                    endSettle();
-                    return;
-                }
-                if (Math.abs(delta) <= tolerance) {
-                    if (last) endSettle();
-                    return;
-                }
-                debugLog('Position', `Lesestelle nach dem Nachladen noch nicht an der Linie (Δ=${Math.round(delta)}px) — richte aus`);
-                searchControl.isAutoScrolling = true;
-                holdAlign();
-                const beforeY = window.scrollY || 0;
-                const accepted = scrollFeedTo(beforeY + delta, 'nachziehen', { allowLongUp: true });
-                if (accepted && Math.abs((window.scrollY || 0) - beforeY) <= 2) {
-                    window.scrollBy({ top: delta, behavior: 'auto' });
-                }
-                requestAnimationFrame(() => {
-                    applyHighlightToPost(fresh());
-                    searchControl.isAutoScrolling = false;
-                    noteProgrammaticScrollEnded();
-                    if (last) endSettle();
-                });
-            }, delay);
-        });
-    };
-
-    const finishAligned = (reason, active) => {
-        finishPostHighlightAtOffset(active || fresh(), anchorTweetId, anchorAuthor, () => {
-            if (onComplete) onComplete();
-            if (settleOpen && !anchorHeld()) holdAlign();
-            scheduleSettle();
-        }, reason, options);
-    };
-
-    const step = () => {
-        if (!stillOurs()) {
-            searchControl.isAutoScrolling = false;
-            noteProgrammaticScrollEnded();
-            endSettle();
-            syncHighlightIfDrifted();
-            if (onComplete) onComplete();
-            return;
-        }
-        const active = fresh();
-        const rect = active.getBoundingClientRect();
-        const delta = rect.top - offset;
-        applyHighlightToPost(active);
-
-        if (rect.height < 5) {
-            finishAligned('Artikel ohne Höhe — kein Sprung an den Seitenanfang.', active);
-            return;
-        }
-        if (Math.abs(delta) <= tolerance) {
-            finishAligned(`Beitrag an der Leselinie (rect.top=${Math.round(rect.top)}, Ziel=${offset}px).`, active);
-            return;
-        }
-        if (attempts >= 4 || unmoved >= 2) {
-            finishAligned(`Ausrichten beendet (rect.top=${Math.round(rect.top)}, Ziel=${offset}px).`, active);
-            return;
-        }
-
-        attempts++;
-        holdAlign();
-        const beforeY = window.scrollY || 0;
-        const vh = window.innerHeight || 800;
-        const inView = rect.bottom > 0 && rect.top < vh;
-        debugLog('Position', `Ausrichten rect.top:${Math.round(rect.top)} Δ:${Math.round(delta)} Versuch:${attempts}`);
-        const exactSaved = !!(anchorTweetId && lastReadPost?.tweetId &&
-            anchorTweetId === lastReadPost.tweetId &&
-            anchorAuthor === lastReadPost.authorHandler &&
-            !!anchorRepost === !!lastReadPost.isRepost);
-        const accepted = scrollFeedTo(beforeY + delta, 'fein', { allowLongUp: exactSaved });
-        if (!accepted) {
-            finishAligned('Feiner Sprung an den Seitenanfang verworfen.', active);
-            return;
-        }
-        let moved = Math.abs((window.scrollY || 0) - beforeY) > 2;
-        if (!moved && inView) {
-            window.scrollBy({ top: delta, behavior: 'auto' });
-            moved = Math.abs((window.scrollY || 0) - beforeY) > 2;
-        }
-        if (!moved) unmoved++;
-        else unmoved = 0;
-        requestAnimationFrame(() => requestAnimationFrame(step));
-    };
-
-    searchControl.isAutoScrolling = true;
-    step();
-}
-
-    function createSearchPopup(position) {
-    const messageKey = searchControl.isFallbackSearching ? 'tweetIdNotFound' : 'searchPopup';
-    const actionPopup = showActionPopup(messageKey, {
-        authorHandler: position.authorHandler,
-        tweetId: position.tweetId
-    });
-    if (!actionPopup) {
-        log('Search', 'document.body nicht verfügbar für createSearchPopup.');
-    }
-    return actionPopup;
-}
-
-    function timelineScrollOffset() {
-        let offset = window.scrollY || document.documentElement.scrollTop || 0;
-        let node = document.querySelector('[data-testid="primaryColumn"]');
-        let guard = 0;
-        while (node && node !== document.documentElement && guard < 8) {
-            guard++;
-            if (node.scrollHeight > node.clientHeight + 40 && node.scrollTop > offset) {
-                offset = node.scrollTop;
-            }
-            node = node.parentElement;
-        }
-        return offset;
-    }
-
-    function isNearTimelineTop() {
-        // Nah am Anfang (Lesestelle, Pause). Nicht die Schwelle fürs Auto-Laden.
-        return timelineScrollOffset() < CONFIG.NEAR_TOP_SCROLL_THRESHOLD &&
-               window.location.href.includes('/home');
-    }
-
-    function isAtTimelineTop() {
-        return timelineScrollOffset() <= CONFIG.AT_TOP_SCROLL_PX &&
-               window.location.href.includes('/home');
-    }
-
-    function observeForNewPosts() {
-
-    if (window.newPostsObserver) window.newPostsObserver.disconnect();
-
-    const timelineContainer = document.querySelector('div[data-testid="primaryColumn"]') ||
-                              document.querySelector('main[role="main"]') ||
-                              document.documentElement;
-
-    let lastCheck = 0;
-    const THROTTLE_MS = 120;
-
-    window.newPostsObserver = new MutationObserver(() => {
-        const now = Date.now();
-        if (now - lastCheck < THROTTLE_MS) return;
-        lastCheck = now;
-        if (followingTabActive === false) return;
-
-        const indicator = getNewPostsIndicator();
-        if (indicator && (isAtTimelineTop() || focusWatchAllowsOffTopClick()) &&
-            !isNewPostsAutoLoadPaused() && !newPostsObserverClickTimer) {
-            debugLog('NewPosts', 'Indicator erkannt – Auto-Click in 600ms (nach Lesestellen-Prüfung)');
-            newPostsObserverClickTimer = setTimeout(() => {
-                newPostsObserverClickTimer = null;
-                if (searchControl.manualSearchActive) {
-                    debugLog('NewPosts', 'Auto-Click übersprungen — manuelle Suche aktiv.');
-                    return;
-                }
-                if (searchControl.newPostsRestoreActive) {
-                    debugLog('NewPosts', 'Auto-Click übersprungen — Restore läuft.');
-                    diagBlocked('GUARD_OBSERVER_DEBOUNCE', 'Observer-Auto-Click während Restore blockiert');
-                    return;
-                }
-                tryAutoClickNewPosts();
-            }, 600);
-        }
-
-        // Gap / "versteckte Beiträge anzeigen" Buttons behandeln (auch während Suche und Scroll)
-        // Diese Buttons blenden Teile der Timeline aus — wir klicken sie automatisch weg.
-        const gapBtn = getShowHiddenPostsButton();
-        if (gapBtn) {
-            setTimeout(() => {
-                tryClickShowHiddenPostsButton('observer');
-            }, 180);
-            // NICHT disconnecten — Gap-Buttons können mehrfach und an beliebiger Stelle auftauchen
-        }
-    });
-
-    window.newPostsObserver.observe(timelineContainer, {
-        childList: true,
-        subtree: true,
-        attributes: false,
-        characterData: false
-    });
-
-    log('NewPosts', 'Observer gestartet (throttled + targeted)');
-}
-
-    function pillHostIsShown(host) {
-        if (!host?.isConnected) return false;
-        let node = host;
-        while (node && node !== document.documentElement) {
-            if (node.getAttribute?.('aria-hidden') === 'true') return false;
-            try {
-                const style = getComputedStyle(node);
-                if (style.display === 'none' || style.visibility === 'hidden') return false;
-            } catch (e) { /* Sichtbarkeit nicht lesbar */ }
-            node = node.parentElement;
-        }
-        return true;
-    }
-
-    function getNewPostsIndicator() {
-
-    const postIndicatorPattern = /\b(new posts|neue posts(?:\s+sehen)?|neue posts sind verfügbar|neue Beiträge|nouveaux tweets|nuevos tweets|新しい投稿|Новые посты|novos posts|منشورات جديدة|nuovi post|새 게시물|new tweets|post anzeigen|posts anzeigen|show \d+ posts?)\b/i;
-    const excludePattern = /\b(teilen|share|posten|veröffentlichen|grok)\b/i;
-    const gapExcludePattern = /\b(versteckt\w*|hidden|show\s+more|mehr)\b/i;
-
-    const matchesNewPostsText = (text) => {
-        const normalized = (text || '').toLowerCase().replace(/\s+/g, ' ').trim();
-        if (!normalized || normalized.length > 80) return false;
-        return postIndicatorPattern.test(normalized) &&
-            !excludePattern.test(normalized) &&
-            !gapExcludePattern.test(normalized);
-    };
-
-    const isSmallTopPill = (host) => {
-        if (!host?.getBoundingClientRect) return false;
-        const rect = host.getBoundingClientRect();
-        return rect.top >= -80 && rect.top <= 420 &&
-            rect.width >= 40 && rect.width <= 520 &&
-            rect.height >= 12 && rect.height <= 96;
-    };
-
-    const isTwitterBlue = (value) => {
-        const compact = (value || '').replace(/\s+/g, '');
-        return compact === 'rgb(29,155,240)' || compact.startsWith('rgba(29,155,240,');
-    };
-
-    const nodeIsBlue = (node) => {
-        if (!node) return false;
-        const styleAttr = node.getAttribute?.('style') || '';
-        if (styleAttr.includes('29, 155, 240') || styleAttr.includes('29,155,240')) return true;
-        let bg = '';
-        let fg = '';
-        try {
-            const style = getComputedStyle(node);
-            bg = style.backgroundColor || '';
-            fg = style.color || '';
-        } catch (e) { /* Farbe nicht lesbar */ }
-        // Die Pille ist mal blau hinterlegt, mal nur der Text.
-        return isTwitterBlue(bg) || isTwitterBlue(fg);
-    };
-
-    const isBluePillSurface = (host) => {
-        if (!host) return false;
-        if (host.querySelector?.('[style*="29, 155, 240"], [style*="29,155,240"]')) return true;
-        const extra = host.querySelector?.('span');
-        const starts = extra && extra !== host ? [host, extra] : [host];
-        for (const start of starts) {
-            let node = start;
-            for (let depth = 0; node && depth < 6; depth++, node = node.parentElement) {
-                if (nodeIsBlue(node)) return true;
-            }
-        }
-        return false;
-    };
-
-    const acceptPill = (host, txt) => {
-        if (!host || !pillHostIsShown(host)) return null;
-        if (!matchesNewPostsText(txt) || !isSmallTopPill(host) || !isBluePillSurface(host)) return null;
-        const numMatch = String(txt).match(/(\d+)/);
-        pendingNewPosts = numMatch ? parseInt(numMatch[1], 10) : 1;
-        return host;
-    };
-
-    // Live-Crawl 06/2026: Pill-Button mit data-testid="pillLabel" + „Neue Posts sehen“.
-    // Nach dem Reiterwechsel kann die Pille des anderen Feeds noch im DOM stehen.
-    const pillLabels = document.querySelectorAll('[data-testid="pillLabel"]');
-    for (const pillLabel of pillLabels) {
-        const btn = pillLabel.closest('button, [role="button"]') || pillLabel.parentElement;
-        const combined = ((pillLabel.textContent || '') + ' ' + (btn?.getAttribute?.('aria-label') || '')).trim();
-        const found = acceptPill(btn, combined);
-        if (found) return found;
-    }
-
-    const selectors = [
-        'button[data-testid*="new-tweets"], button[data-testid*="new-posts"], [role="button"][data-testid*="new-tweets"], [role="button"][data-testid*="new-posts"]',
-        'button[aria-label*="Neue Posts"], button[aria-label*="neue Posts"], button[aria-label*="new posts"], button[aria-label*="neue Beiträge"], [role="button"][aria-label*="Neue Posts"], [role="button"][aria-label*="neue Posts"], [role="button"][aria-label*="new posts"], [role="button"][aria-label*="neue Beiträge"]',
-        '[role="button"][aria-label*="nouveaux tweets"], [role="button"][aria-label*="nuevos tweets"], [role="button"][aria-label*="new tweets"]',
-        'div[role="button"] span[data-testid*="new-tweet"], div[role="button"] span[aria-label*="posts"]'
-    ];
-
-    for (const selector of selectors) {
-        const buttons = document.querySelectorAll(selector);
-        for (const btn of buttons) {
-            const span = getSelectorFallback(btn, ['span', '[data-testid="pillLabel"]']);
-            const textContent = (span ? span.textContent : btn.getAttribute('aria-label') || '').toLowerCase().trim();
-
-            const found = acceptPill(btn, textContent);
-            if (found) return found;
-        }
-    }
-
-    const column = document.querySelector("[data-testid='primaryColumn']")
-        || document.querySelector('main[role="main"]');
-    if (!column) return null;
-
-    // Live 10.10.2026: die Pille ist kein Button, sondern
-    // div[dir=ltr] (blau) > span, Text z. B. „3 neue Posts anzeigen“.
-    const blueSpans = document.querySelectorAll('div[dir="ltr"][style*="29, 155, 240"] > span');
-    for (const span of blueSpans) {
-        if (span.closest('article')) continue;
-        const txt = (span.textContent || '').replace(/\s+/g, ' ').trim();
-        if (!txt || txt.length > 80 || !matchesNewPostsText(txt)) continue;
-        const host = span.closest('button, [role="button"]') || span.parentElement || span;
-        const found = acceptPill(host, txt);
-        if (found) return found;
-    }
-
-    // Kurze Beschriftung in der Spalte, ohne die Aktionsbuttons der Tweets.
-    const candidates = column.querySelectorAll('button, [role="button"], div[dir="ltr"] > span');
-    for (const el of candidates) {
-        if (el.closest('article')) continue;
-        if (el.parentElement?.closest('button, [role="button"]')) continue;
-        const txt = ((el.textContent || el.getAttribute('aria-label') || '')).replace(/\s+/g, ' ').trim();
-        if (!txt || txt.length > 80 || !matchesNewPostsText(txt)) continue;
-        const host = el.closest('button, [role="button"]') || el.closest('div[dir="ltr"]') || el;
-        const found = acceptPill(host, txt);
-        if (found) return found;
-    }
-
-    return null;
-}
-
-    /**
-     * Erkennt "Versteckte Beiträge anzeigen" / "Show more posts" / Gap-Buttons,
-     * die X in der Timeline einblendet, um Teile der Timeline auszublenden.
-     * Wird besonders während der Lesestelle-Suche benötigt, damit das Ziel nicht
-     * hinter versteckten Posts "versteckt" bleibt.
-     */
-    function getShowHiddenPostsButton() {
-        const hiddenPattern = /\b(versteckte\s+beiträge\s+anzeigen|versteckte\s+posts?\s+anzeigen|show\s+more\s+posts?|show\s+\d+\s+posts?|mehr\s+beiträge\s+anzeigen|mehr\s+posts?\s+anzeigen|\d+\s+beiträge\s+anzeigen|beiträge\s+anzeigen|posts?\s+anzeigen|show\s+more|hidden\s+posts?\s+anzeigen)\b/i;
-        const newPostsExclude = /\b(new\s*posts?|neue\s*posts?|neue\s*beiträge)\b/i;
-
-        // Bevorzugt: Buttons in cellInnerDiv, die NICHT in einem Tweet-Article liegen (das sind die Gap-Buttons)
-        const cellButtons = document.querySelectorAll('div[data-testid="cellInnerDiv"] button, div[data-testid="cellInnerDiv"] [role="button"]');
-        for (const btn of cellButtons) {
-            if (btn.dataset.processed === 'true') continue;
-            if (btn.closest('article')) continue; // keine Buttons innerhalb von Tweets (Replies etc.)
-            const txt = (btn.textContent || btn.getAttribute('aria-label') || btn.innerText || '').trim();
-            if (!txt) continue;
-            const lower = txt.toLowerCase();
-            if (hiddenPattern.test(lower) && !newPostsExclude.test(lower)) {
-                debugLog('Gap', `Gap-Button via cell gefunden: "${txt.substring(0, 80)}"`);
-                return btn;
-            }
-        }
-
-        // Robustes Fallback über alle Buttons (X ändert Struktur oft)
-        const candidates = document.querySelectorAll('button, [role="button"]');
-        for (const el of candidates) {
-            if (el.dataset.processed === 'true') continue;
-            if (el.closest('article')) continue;
-            const txt = (el.textContent || el.getAttribute('aria-label') || '').toLowerCase().trim();
-            if (hiddenPattern.test(txt) && !newPostsExclude.test(txt)) {
-                const rect = el.getBoundingClientRect();
-                if (rect.width > 60 && rect.height > 18 && rect.top > -200 && rect.top < (window.innerHeight + 800)) {
-                    debugLog('Gap', `Gap-Button via Fallback: "${txt.substring(0, 80)}"`);
-                    return el;
-                }
-            }
-        }
-        return null;
-    }
-
-    async function tryClickShowHiddenPostsButton(context = 'general') {
-        if (!isScriptActivated) return false;
-        const btn = getShowHiddenPostsButton();
-        if (!btn) return false;
-
-        // Defensive: nicht mit New-Posts-Pill verwechseln
-        const txt = ((btn.textContent || '') + ' ' + (btn.getAttribute('aria-label') || '')).toLowerCase();
-        if (/\b(new|neue)\b.*(post|beitr)/.test(txt)) {
-            return false;
-        }
-
-        btn.dataset.processed = 'true';
-        debugLog('Gap', `Klicke "versteckte Beiträge anzeigen"-Button (context=${context})`);
-        try {
-            btn.click();
-        } catch (e) {
-            debugLog('Gap', 'Click fehlgeschlagen: ' + e);
-            return false;
-        }
-
-        // Warten, bis X die versteckten Posts nachlädt. Besonders kritisch bei Lesestelle-Suche!
-        await new Promise(resolve => setTimeout(resolve, 520));
-
-        if (typeof scheduleTimelineMapUpdate === 'function') {
-            scheduleTimelineMapUpdate('hidden-gap-click');
-        }
-        return true;
-    }
-
-    async function ensureViewportLesestelleBeforeNewPosts() {
-        if (searchControl.manualSearchActive) {
-            debugLog('NewPosts', 'Lesestellen-Sync übersprungen — manuelle Suche aktiv.');
-            return false;
-        }
-        if (!window.location.href.includes('/home')) return true;
-
-        if (isScrollUpSessionActive()) {
-            debugLog('NewPosts', 'Lesestellen-Sync übersprungen — Hochscroll-Session aktiv');
-            return true;
-        }
-
-        const anchorPost = getTopVisiblePost() || getLesestelleAnchorPost();
-        if (!anchorPost) {
-            log('NewPosts', 'Kein Post im Viewport – Neue Beiträge zurückgestellt');
-            return false;
-        }
-
-        const tweetId = getPostTweetId(anchorPost);
-        const authorHandler = getPostAuthorHandler(anchorPost);
-        const timestamp = getPostTimestamp(anchorPost);
-        const repostFlag = isRepost(anchorPost);
-
-        if (!tweetId || !authorHandler || !timestamp) {
-            log('NewPosts', 'Top-Post im Viewport unvollständig – Neue Beiträge zurückgestellt');
-            return false;
-        }
-
-        const matchesCurrent = lastReadPost &&
-            lastReadPost.tweetId === tweetId &&
-            lastReadPost.authorHandler === authorHandler &&
-            !!lastReadPost.isRepost === repostFlag;
-
-        if (matchesCurrent) {
-            const logKey = `${tweetId}-${authorHandler}-${repostFlag}`;
-            if (newPostsState.lastLesestelleLogKey !== logKey) {
-                newPostsState.lastLesestelleLogKey = logKey;
-                debugLog('NewPosts', `Lesestelle = Top-Post (@${authorHandler} ${tweetId})`);
-            }
-            return true;
-        }
-
-        const viewportCandidate = {
-            tweetId,
-            authorHandler,
-            timestamp,
-            isRepost: repostFlag
-        };
-
-        if (isNearTimelineTop()) {
-            // Der oberste Post ist hier fast immer der neueste Beitrag.
-            // Den nicht zur Lesestelle machen — nach dem Laden wird die
-            // gespeicherte Stelle gesucht. Hochscrollen promotet separat.
-            debugLog('NewPosts',
-                `Am Timeline-Top: kein Lesestellen-Sync (@${authorHandler} ${tweetId}` +
-                `${repostFlag ? ', Repost' : ''} ≠ @${lastReadPost?.authorHandler} ${lastReadPost?.tweetId})`);
-            return true;
-        }
-
-        if (lastReadPost?.tweetId && BigInt(tweetId) < BigInt(lastReadPost.tweetId)) {
-            if (focusWatchAllowsOffTopClick()) {
-                // Nach dem Zurückkommen die Pille laden und danach die gespeicherte Stelle suchen.
-                // Runterscrollen hat die Lesestelle nicht mitgenommen.
-                debugLog('NewPosts', 'Nach dem Zurückkommen: gespeicherte Lesestelle bleibt, Pille wird geladen.');
-                return true;
-            }
-            log('NewPosts', `Viewport-Top (@${authorHandler} ${tweetId}) ist älter als Lesestelle (@${lastReadPost.authorHandler} ${lastReadPost.tweetId}) — kein Auto-Laden/Restore.`);
-            diagPush('BOOKMARK_OLDER_SKIPPED', 'warn',
-                'Viewport-Top ist älter als Lesestelle — kein Sync vor New-Posts', {
-                    viewport: diagBookmark(viewportCandidate),
-                    bookmark: diagBookmark(lastReadPost),
-                    snapshot: diagSnapshot(),
-                });
-            return false;
-        }
-
-        log('NewPosts', `Lesestelle weicht ab – synchronisiere @${authorHandler} ${tweetId} vor Neue-Beiträge`);
-
-        suppressionState.until = 0;
-        suppressionState.pastTweetId = null;
-
-        if (isCandidateNewer(viewportCandidate, lastReadPost)) {
-            const account = await getCurrentUserHandle();
-            invalidateHighlightRetries();
-            lastReadPost = {
-                tweetId,
-                authorHandler,
-                timestamp,
-                isRepost: repostFlag,
+            const now = new Date();
+            const fileName = account + '_' + bookmark.authorHandler + '_' +
+                now.toISOString().slice(0, 10) + '_' +
+                now.toISOString().slice(11, 16).replace(':', '') + '.json';
+            const exportData = {
                 account,
-                readAt: new Date().toISOString()
+                current: Object.assign({}, bookmark),
+                history: exportHistory,
+                repostLog: exportRepostLog,
+                timelineMap: exportedTimelineMap,
+                exportedAt: now.toISOString(),
+                version: '1.2'
             };
-            noteUserAdvancedReadingPosition(lastReadPost);
-            await saveLastReadPost(lastReadPost);
-            updateHighlightedPost();
-            log('Save', 'Lesestelle vor New-Posts synchronisiert: @' + authorHandler, tweetId);
-            diagPush('BOOKMARK_OVERWRITE', 'info', 'Lesestelle vor New-Posts aktualisiert', {
-                newBookmark: diagBookmark(lastReadPost),
-            });
-        }
-
-        return true;
-    }
-
-    let newPostsRestoreGeneration = 0;
-
-    function pageIsBackgrounded() {
-        // Nur ein verdeckter Tab. Ein sichtbares Fenster ohne Fokus soll die
-        // Lesestelle nach dem Laden neuer Beiträge trotzdem suchen.
-        return document.hidden;
-    }
-
-    function notePageHidden() {
-        if (!document.hidden) return;
-        if (newPostsState.hiddenAt) return;
-        newPostsState.hiddenAt = Date.now();
-        newPostsState.hiddenNearTop = isNearTimelineTop();
-        try {
-            newPostsState.hiddenBaselineKeys = snapshotLoadedPostKeys();
-            newPostsState.hiddenBookmark = snapshotReadingBookmark();
-        } catch (e) {
-            debugLog('Restore', 'Hintergrund-Stand konnte nicht gemerkt werden: ' + e);
-        }
-    }
-
-    function notePageVisible(source) {
-        const hiddenAt = newPostsState.hiddenAt;
-        if (!hiddenAt) return;
-        const sleptMs = Date.now() - hiddenAt;
-        newPostsState.hiddenAt = 0;
-        newPostsState.lastSleepMs = sleptMs;
-        newPostsState.lastWakeAt = Date.now();
-        if (sleptMs < CONFIG.BACKGROUND_SLEEP_MS) return;
-        if (!window.location.pathname.startsWith('/home')) return;
-        if (followingTabActive === false) return;
-        if (!searchControl.manualSearchActive) {
-            searchControl.isSearchCancelled = false;
-        }
-        if (!searchControl.manualSearchActive &&
-            (searchControl.isSearching || searchControl.newPostsRestoreActive ||
-                searchControl.isAutoScrolling || searchControl.isFallbackSearching)) {
-            debugLog('Restore', 'Laufende Suche oder Wiederherstellung bleibt — kein zweiter Start.');
-            return;
-        }
-        log('Restore', `Nach ${Math.round(sleptMs / 1000)}s im Hintergrund (${source}): Lesestelle wird nach neuen Posts gesucht.`);
-        if (activeNewPostsWait && !activeNewPostsWait.isDone()) {
-            activeNewPostsWait.extendForWake();
-            return;
-        }
-        scheduleWakeReadingSearch();
-    }
-
-    function nudgeStalledNewPostsRestore() {
-        if (pageIsBackgrounded() || searchControl.manualSearchActive) return;
-        if (!activeNewPostsWait || activeNewPostsWait.isDone()) return;
-        const started = newPostsState.restoreStartedAt || 0;
-        if (!started) return;
-        if (Date.now() - started < CONFIG.WAKE_RESTORE_GRACE_MS + 4000) return;
-        log('Restore', 'Suche nach der Lesestelle hing nach dem Aufwachen — starte sie jetzt.');
-        activeNewPostsWait.force('watchdog');
-    }
-
-    function scheduleWakeReadingSearch() {
-        const generation = ++newPostsState.wakeGeneration;
-        newPostsState.wakeSearchStarted = false;
-        newPostsState.wakeClickArmedAt = 0;
-        const bookmark = newPostsState.hiddenBookmark || snapshotReadingBookmark();
-        const baseline = newPostsState.hiddenBaselineKeys || snapshotLoadedPostKeys();
-        if (!bookmark?.tweetId) return;
-        const delays = [800, 2500, 6000, 12000];
-        delays.forEach((delay) => {
+            const blob = new Blob([JSON.stringify(exportData, null, 2)], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const anchor = document.createElement('a');
+            anchor.href = url;
+            anchor.download = fileName;
+            anchor.style.display = 'none';
+            document.body.appendChild(anchor);
+            anchor.click();
+            downloadedPosts.add(postKey);
+            saveDownloadedPosts();
+            showPopup('downloadSuccess', 8000, { fileName });
             setTimeout(() => {
-                if (generation !== newPostsState.wakeGeneration) return;
-                if (pageIsBackgrounded() || !isScriptActivated || searchControl.manualSearchActive) return;
-                if (!newPostsState.hiddenNearTop && !isNearTimelineTop()) return;
-                if (searchControl.isSearching || searchControl.newPostsRestoreActive) return;
-                if (isReadingPositionAtTargetOffset(bookmark)) return;
-                if (isLiveReadingAheadOf(bookmark)) {
-                    debugLog('Restore', 'Aufwach-Suche übersprungen — Lesestelle ist inzwischen neuer');
-                    return;
-                }
-                if (newPostsState.wakeClickArmedAt &&
-                    Date.now() - newPostsState.wakeClickArmedAt < 8000) {
-                    return;
-                }
-                const pill = typeof getNewPostsIndicator === 'function' ? getNewPostsIndicator() : null;
-                if (pill && !isNewPostsAutoLoadPaused()) {
-                    newPostsState.wakeClickArmedAt = Date.now();
-                    if (!isAtTimelineTop()) {
-                        // Langes Hintergrund: die Pille laden, auch wenn die Lesestelle nicht ganz oben steht.
-                        pillPresentAtWatchStart = false;
-                        focusPillWatchUntil = Date.now() + CONFIG.FOCUS_PILL_WATCH_MS;
-                    }
-                    tryAutoClickNewPosts();
-                    return;
-                }
-                if (newPostsState.wakeSearchStarted) return;
-                newPostsState.wakeSearchStarted = true;
-                void runWakeReadingSearch(bookmark, baseline);
-            }, delay);
-        });
-    }
-
-    async function runWakeReadingSearch(bookmark, baseline) {
-        if (searchControl.manualSearchActive || searchControl.isSearching || searchControl.newPostsRestoreActive) {
-            return;
-        }
-        if (isLiveReadingAheadOf(bookmark)) {
-            debugLog('Restore', 'Aufwach-Suche abgebrochen — Lesestelle ist inzwischen neuer');
-            return;
-        }
-        if (isReadingPositionAtTargetOffset(bookmark)) return;
-        searchControl.newPostsRestoreActive = true;
-        searchControl.isSearching = true;
-        newPostsState.restoreStartedAt = Date.now();
-        newPostsState.restoreGraceUntil = Date.now() + CONFIG.NEW_POSTS_GRACE_MS + 2500;
-        suppressionState.until = Date.now() + CONFIG.NEW_POSTS_GRACE_MS;
-        log('Restore', 'Nach dem Aufwachen: suche die Lesestelle.');
-        diagBeginFlow('wake-reading-search', { frozenBookmark: diagBookmark(bookmark) });
-        await finishNewPostsRestore(bookmark, baseline instanceof Set ? baseline : snapshotLoadedPostKeys());
-    }
-
-    function releaseNewPostsSearchHold() {
-        searchControl.isSearching = false;
-        searchControl.newPostsRestoreActive = false;
-        newPostsState.restoreGraceUntil = 0;
-        newPostsState.lastRestoreCompletedAt = Date.now();
-        newPostsState.suppressTopMarkUntil = Date.now() + CONFIG.NEW_POSTS_GRACE_MS;
-        lastScrollY = window.scrollY;
-        scrollState.lastMapScrollY = window.scrollY;
-        clearFreshUpScroll();
-    }
-
-    async function finishNewPostsRestore(restoreBookmark, postsBeforeNewPosts) {
-        const generation = ++newPostsRestoreGeneration;
-        try {
-            log('Restore', 'Nach dem Laden der Beiträge: suche die Lesestelle.');
-            const resolved = await restoreReadingPositionAfterNewPosts(restoreBookmark, postsBeforeNewPosts);
-            if (generation !== newPostsRestoreGeneration) return;
-            // Suche ist vorbei. Ab hier darf manuelles Scrollen sofort eine neue Lesestelle setzen.
-            const scrollHold = manualScrollGeneration;
-            releaseNewPostsSearchHold();
-            if (scrollState.scrollLoopStopped) {
-                scrollState.scrollLoopStopped = false;
-                diagEndFlow('warn', 'SCROLL_LOOP', 'Scroll-Schleife angehalten');
-                return;
-            }
-            if (!resolved) {
-                diagPush('NEWPOSTS_EMPTY_FEED', 'error', 'Kein Treffer nach New-Posts Scroll-Restore', {
-                    frozen: diagBookmark(restoreBookmark),
-                    snapshot: diagSnapshot(),
-                });
-                if (bookmarkStillBelowWindow(restoreBookmark)) {
-                    log('Restore', 'Lesestelle liegt noch weiter unten. Alte Stelle bleibt.');
-                    diagEndFlow('fail', 'NEWPOSTS_NO_RESOLVE', 'Lesestelle noch unter dem Fenster');
-                    return;
-                }
-                const marked = await markNearestVisibleReadingPost(restoreBookmark);
-                if (!marked) {
-                    showPopup('tweetIdNotFound', 6000, {
-                        authorHandler: restoreBookmark.authorHandler,
-                        tweetId: restoreBookmark.tweetId
-                    });
-                }
-                diagEndFlow(marked ? 'ok' : 'fail', 'NEWPOSTS_NO_RESOLVE', marked
-                    ? 'Nächsten sichtbaren Post markiert'
-                    : 'Weder Lesestelle noch neue Posts');
-                return;
-            }
-
-            if (resolved.strategy !== 'exact' &&
-                (bookmarkStillBelowWindow(restoreBookmark) || resolvedPostIsTooYoung(resolved, restoreBookmark))) {
-                log('Restore', 'Jüngeren Ersatz nicht übernommen — Lesestelle liegt noch weiter unten');
-                diagEndFlow('fail', 'NEWPOSTS_NO_RESOLVE', 'Lesestelle noch unter dem Fenster');
-                return;
-            }
-            const adopt = resolved.strategy !== 'exact' &&
-                (resolved.adopt === true || resolved.strategy === 'new-posts-oldest');
-            log('Restore', `New-Posts Restore (${resolved.strategy}, adopt=${adopt}) → @${resolved.post.authorHandler} ${resolved.post.tweetId}`);
-            const landingOk = await applyResolvedReadingPosition(resolved, {
-                adopt,
-                expectedBookmark: restoreBookmark,
-                verifySource: 'new-posts-restore',
-            });
-            if (generation !== newPostsRestoreGeneration) return;
-
-            const popupKey = getResolvePopupKey(resolved);
-            if (popupKey) {
-                const lang = getUserLanguage();
-                showPopup(popupKey, 5000, {
-                    strategy: getResolveStrategyLabel(resolved.strategy, lang)
-                });
-            }
-
-            if (landingOk) {
-                if (!adopt && manualScrollGeneration === scrollHold) {
-                    await reinstateFrozenReadingBookmark(restoreBookmark, { force: true });
-                } else if (!adopt) {
-                    debugLog('Restore', 'Gefundene Lesestelle nicht erneut gesetzt — schon manuell weitergescrollt');
-                }
-                newPostsState.lastRestoreCompletedAt = Date.now();
-                updateTimelineMap('new-posts-restore');
-                if (resolved.strategy === 'exact' && isReadingPositionAtTargetOffset(restoreBookmark)) {
-                    newPostsState.autoLoadPaused = true;
-                }
-                diagEndFlow('ok', 'NEWPOSTS_RESTORE_OK', 'Restore abgeschlossen', {
-                    strategy: resolved.strategy,
-                    frozen: diagBookmark(restoreBookmark),
-                });
-            } else {
-                diagEndFlow('fail', 'NEWPOSTS_RESTORE_FAIL', 'Restore ohne gültiges Landing');
-            }
+                if (anchor.parentNode) anchor.parentNode.removeChild(anchor);
+                URL.revokeObjectURL(url);
+            }, 3000);
         } catch (err) {
-            if (generation !== newPostsRestoreGeneration) return;
-            log('Restore', 'Fehler beim New-Posts Restore:', err);
-            diagPush('NEWPOSTS_RESTORE_ERROR', 'error', String(err?.message || err), {
-                frozen: diagBookmark(restoreBookmark),
-                snapshot: diagSnapshot(),
-            });
-            if (!isLiveReadingAheadOf(restoreBookmark)) {
-                await landReadingPositionFromResolve('new-posts-error', restoreBookmark);
-            }
-            diagEndFlow('fail', 'NEWPOSTS_RESTORE_EXCEPTION', 'Restore mit Exception beendet');
-        } finally {
-            if (generation !== newPostsRestoreGeneration) return;
-            searchControl.isSearching = false;
-            searchControl.newPostsRestoreActive = false;
-            newPostsState.restoreGraceUntil = 0;
-            flushDeferredTimelineMapUpdate('new-posts-restore');
+            log('Load', 'Download-Fehler', err);
+            showPopup('downloadFailed', 10000);
         }
     }
 
-    let newPostsClickLocked = false;
-
-    async function clickNewPostsIndicator(options = {}) {
-    if (newPostsClickLocked) {
-        debugLog('NewPosts', 'Klick läuft schon — zweiter Aufruf verworfen.');
-        return;
-    }
-    if (followingTabActive === false && options.fromUser !== true) return;
-    newPostsClickLocked = true;
-    try {
-    const fromUser = options.fromUser === true;
-
-    if (searchControl.manualSearchActive) {
-        debugLog('NewPosts', 'Neue Beiträge übersprungen — manuelle Suche aktiv.');
-        diagBlocked('GUARD_MANUAL_SEARCH', 'New-Posts während manueller Suche blockiert');
-        return;
-    }
-
-    if (searchControl.newPostsRestoreActive) {
-        debugLog('NewPosts', 'New-Posts-Restore läuft — Auto-Click übersprungen.');
-        diagBlocked('GUARD_RESTORE_RUNNING', 'Doppelter New-Posts-Klick blockiert (Restore läuft)');
-        return;
-    }
-
-    if (!fromUser && isNewPostsAutoLoadPaused()) {
-        if (!newPostsState.autoLoadPaused) {
-            newPostsState.autoLoadPaused = true;
-            logNewPostsAutoLoadPausedOnce();
-        }
-        return;
-    }
-
-    const ready = await ensureViewportLesestelleBeforeNewPosts();
-    if (!ready && !fromUser) {
-        return;
-    }
-
-    // Die gespeicherte Lesestelle bleibt das Suchziel. Hochscrollen an den
-    // Anfang darf den neuesten Beitrag nicht vorher als Lesestelle speichern.
-    clearFreshUpScroll();
-    newPostsState.suppressTopMarkUntil = Date.now() + CONFIG.NEW_POSTS_GRACE_MS;
-
-    const restoreBookmark = snapshotReadingBookmark();
-    if (!restoreBookmark) {
-        debugLog('NewPosts', 'Kein Bookmark — Neue Beiträge übersprungen.');
-        diagBlocked('GUARD_NO_BOOKMARK', 'New-Posts ohne gespeichertes Bookmark blockiert');
-        return;
-    }
-
-    if (!fromUser && isReadingPositionAtTargetOffset(restoreBookmark) && !getNewPostsIndicator()) {
-        newPostsState.autoLoadPaused = true;
-        return;
-    }
-
-    const viewportAnchor = getLesestelleAnchorPost();
-    const viewportTweetId = viewportAnchor ? getPostTweetId(viewportAnchor) : null;
-    if (!fromUser && !focusWatchAllowsOffTopClick() && viewportTweetId && restoreBookmark?.tweetId &&
-        BigInt(viewportTweetId) < BigInt(restoreBookmark.tweetId) &&
-        !isNearTimelineTop()) {
-        debugLog('NewPosts', 'Auto-Laden übersprungen — Viewport zeigt älteren Post als Lesestelle.');
-        diagBlocked('GUARD_VIEWPORT_OLDER', 'New-Posts blockiert (Viewport älter als Bookmark)');
-        return;
-    }
-
-    const btn = getNewPostsIndicator();
-    if (!btn) {
-        debugLog('NewPosts', 'Kein Button gefunden');
-        return;
-    }
-
-    const postsBeforeNewPosts = snapshotLoadedPostKeys();
-    debugLog('NewPosts', `Baseline vor Laden: ${postsBeforeNewPosts.size} Posts im DOM`);
-
-    searchControl.newPostsRestoreActive = true;
-    searchControl.isSearching = true;
-    newPostsState.restoreStartedAt = Date.now();
-    diagBeginFlow('new-posts-restore', { frozenBookmark: diagBookmark(restoreBookmark) });
-    diagPush('BOOKMARK_FROZEN', 'info', 'Restore-Bookmark eingefroren', {
-        frozen: diagBookmark(restoreBookmark),
-        live: diagBookmark(lastReadPost),
-    });
-    const domBaseline = {
-        baselinePostCount: document.querySelectorAll('article').length,
-        baselineCellCount: document.querySelectorAll("div[data-testid='cellInnerDiv']").length,
-        baselineScrollHeight: document.body.scrollHeight || document.documentElement.scrollHeight,
-    };
-
-    newPostsState.restoreGraceUntil = Date.now() + CONFIG.NEW_POSTS_GRACE_MS + 2500;
-    suppressionState.until = Date.now() + CONFIG.NEW_POSTS_GRACE_MS;
-    scrollState.hasScrolledUp = false;
-
-    // Den Text anklicken, damit das Event durch die Pille nach oben blubbert.
-    // Kein dauerhaftes dataset.processed: X benutzt denselben Knoten wieder,
-    // und eine gesetzte Markierung hat die nächste Pille dann nie geladen.
-    const clickTarget = btn.querySelector?.('span') || btn;
-    const clickLabel = (clickTarget.textContent || btn.textContent || '').replace(/\s+/g, ' ').trim();
-    if (clickLabel !== newPostsPillClickText) {
-        newPostsPillClickText = clickLabel;
-        newPostsPillClickCount = 0;
-    }
-    newPostsPillClickCount++;
-    newPostsPillClickedAt = Date.now();
-    syntheticNewPostsClick = true;
-    try {
-        clickTarget.click();
-    } finally {
-        syntheticNewPostsClick = false;
-    }
-
-    searchControl.isSearchCancelled = false;
-    log('NewPosts', 'Button automatisch geklickt');
-    debugLog('Restore', `Bookmark eingefroren für Restore: @${restoreBookmark.authorHandler} ${restoreBookmark.tweetId}`);
-    newPostsState.autoLoadPaused = false;
-    pendingNewPosts = 0;
-
-    // === Wichtiger Pfad: Nach automatischem Laden neuer Beiträge die letzte Lesestelle wiederherstellen ===
-    log('Restore', 'Nach neuen Beiträgen: Warte auf DOM-Stabilisierung und versuche letzte Lesestelle wiederherzustellen...');
-
-    waitForNewPosts(() => {
-        setTimeout(() => {
-            void finishNewPostsRestore(restoreBookmark, postsBeforeNewPosts);
-        }, 400);
-    }, {
-        ...domBaseline,
-        fallbackMs: 3000,
-        settleMs: 1200,
-    });
-
-    setTimeout(observeForNewPosts, 800);
-    } finally {
-        newPostsClickLocked = false;
-    }
-}
-
-    function createButtons() {
-    const observer = new MutationObserver(() => {
-        if (document.body) {
-            observer.disconnect();
-            try {
-                const buttonContainer = document.createElement('div');
-                buttonContainer.style.position = 'fixed';
-                buttonContainer.style.bottom = '100px';
-                buttonContainer.style.left = '10px';
-                buttonContainer.style.zIndex = '10000';
-                buttonContainer.style.display = 'flex';
-                buttonContainer.style.flexDirection = 'column';
-                buttonContainer.style.alignItems = 'flex-start';
-                buttonContainer.style.visibility = 'visible';
-                const buttonsConfig = [
-                    {
-                        icon: 'search',
-                        title: 'Start manual search',
-                        onClick: () => {
-                            log('UI', 'Manuelle Suche gestartet.');
-                            if (!isScriptActivated) {
-                                isScriptActivated = true;
-                                log('UI', 'Skript durch Lupen-Klick aktiviert.');
-                                observeForNewPosts();
-                            }
-                            redirectToHomeAndSearch();
-                        },
-                    },
-                    {
-                        icon: 'save',
-                        title: 'Save current position',
-                        onClick: async () => {
-                            if (!isScriptActivated) {
-                                isScriptActivated = true;
-                                log('UI', 'Skript durch Speichern-Klick aktiviert.');
-                                observeForNewPosts();
-                            }
-                            const saved = await markTopVisiblePost(true, true);
-                            if (!saved) {
-                                showPopup('noValidPosition', 5000);
-                                log('Save', 'Manuelles Speichern ohne Lesestelle abgebrochen');
-                                return;
-                            }
-                            await downloadLastReadPost({ force: true });
-                            log('Save', 'Manuell gespeichert');
-                        },
-                    },
-                    {
-                        icon: 'load',
-                        title: 'Load last read position',
-                        onClick: () => {
-                            loadLastReadPostFromFile();
-                        },
-                    },
-                    {
-                        icon: 'toggle',
-                        title: 'Toggle auto-save',
-                        onClick: () => {
-                            toggleAutoSave();
-                            setTimeout(() => updateToggleButtonState(), 50);
-                        },
-                    }
-                ];
-
-                function updateToggleButtonState() {
-                    if (window.autoSaveToggleBtn) {
-                        const isActive = typeof autoDownloadEnabled !== 'undefined' ? autoDownloadEnabled : true;
-                        updateAutoSaveButtonVisual();
-                        window.autoSaveToggleBtn.title = isActive ? 'Auto-Save: AKTIV (klick zum Deaktivieren)' : 'Auto-Save: INAKTIV (klick zum Aktivieren)';
-                    }
+    function loadBookmarkFromFile() {
+        try {
+            const input = document.createElement('input');
+            input.type = 'file';
+            input.accept = '.json,application/json';
+            input.style.display = 'none';
+            document.body.appendChild(input);
+            input.addEventListener('change', () => {
+                const file = input.files && input.files[0];
+                if (!file) {
+                    showPopup('fileSelectError', 5000);
+                    input.remove();
+                    return;
                 }
-
-                buttonsConfig.forEach((config, index) => {
-                    const btn = createButton(config.icon, config.title, config.onClick);
-                    if (index === 3) {
-                        window.autoSaveToggleBtn = btn;
+                if (file.size > IMPORT_FILE_MAX_BYTES) {
+                    showPopup('fileReadError', 5000);
+                    input.remove();
+                    return;
+                }
+                const reader = new FileReader();
+                reader.onload = async () => {
+                    try {
+                        const data = JSON.parse(String(reader.result || ''));
+                        const imported = sanitizeImportedPost(data && data.current);
+                        if (!imported) {
+                            showPopup('invalidPosition', 5000);
+                            return;
+                        }
+                        const account = readUserHandleFromNav();
+                        if (!isPlausibleUserHandle(account)) {
+                            showPopup('fileReadError', 5000);
+                            return;
+                        }
+                        imported.account = account;
+                        if (!imported.readAt) imported.readAt = imported.timestamp;
+                        bookmark = imported;
+                        GM_setValue(STORAGE_KEY(account), JSON.stringify(bookmark));
+                        if (Array.isArray(data.history)) {
+                            const importedHistory = [];
+                            for (const item of data.history) {
+                                const post = sanitizeImportedPost(item);
+                                if (!post) continue;
+                                post.account = account;
+                                importedHistory.push(post);
+                            }
+                            GM_setValue(HISTORY_KEY(account), importedHistory.slice(-50));
+                        }
+                        if (Array.isArray(data.repostLog)) {
+                            const importedReposts = [];
+                            for (const item of data.repostLog) {
+                                const entry = sanitizeImportedRepost(item);
+                                if (entry) importedReposts.push(entry);
+                            }
+                            GM_setValue(REPOST_LOG_KEY(account), importedReposts.slice(-REPOST_LOG_MAX));
+                        }
+                        if (data.timelineMap && typeof data.timelineMap === 'object') {
+                            applyMapObject(data.timelineMap);
+                            mapAccount = account;
+                            persistMap();
+                        }
+                        if (bookmark.tweetId) rememberMap(bookmark);
+                        bootedAccount = account;
+                        const selected = readFollowingTabSelected();
+                        showPopup('fileLoadSuccess', 4000);
+                        showBookmark();
+                        if (selected === false) {
+                            followingTab = false;
+                            showPopup('needFollowing', 5000);
+                        } else if (selected === true) {
+                            followingTab = true;
+                            void seekBookmark('datei', { silent: true });
+                        }
+                    } catch (err) {
+                        log('Load', 'JSON', err);
+                        showPopup('fileReadError', 5000);
+                    } finally {
+                        input.remove();
                     }
-                    buttonContainer.appendChild(btn);
-                });
-
-                document.body.appendChild(buttonContainer);
-                setTimeout(updateToggleButtonState, 100);
-                debugLog('UI', 'Buttons mit Auto-Save Toggle erstellt');
-
-            } catch (e) {
-                log('UI', 'Fehler beim Erstellen der Buttons:', e);
-            }
+                };
+                reader.readAsText(file);
+            });
+            input.click();
+        } catch (err) {
+            log('Load', 'Datei-Dialog', err);
+            showPopup('fileDialogError', 5000);
         }
-    });
-    observer.observe(document.documentElement, { childList: true, subtree: true });
-}
+    }
+
+    async function saveCurrentByHand() {
+        if (followingTab === false) {
+            showPopup('needFollowing', 5000);
+            return;
+        }
+        const top = topReadingPost();
+        if (!top) {
+            showPopup('noValidPosition', 5000);
+            return;
+        }
+        const saved = await adopt(top, true);
+        if (!saved) {
+            showPopup('noValidPosition', 5000);
+            return;
+        }
+        await downloadBookmark(true);
+    }
 
     function toggleAutoSave() {
-    autoDownloadEnabled = !autoDownloadEnabled;
-    GM_setValue(AUTO_DOWNLOAD_KEY, autoDownloadEnabled);
-    log('UI', `Auto-Save ${autoDownloadEnabled ? 'AKTIVIERT' : 'DEAKTIVIERT'}`);
-    updateAutoSaveButtonVisual();
-
-}
-
-function updateAutoSaveButtonVisual() {
-    if (!window.autoSaveToggleBtn) return;
-    const btn = window.autoSaveToggleBtn;
-
-    // Clear any old content
-    while (btn.firstChild) btn.removeChild(btn.firstChild);
-
-    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-    svg.setAttribute('width', '20');
-    svg.setAttribute('height', '20');
-    svg.setAttribute('viewBox', '0 0 24 24');
-    svg.setAttribute('fill', 'none');
-    svg.setAttribute('stroke', autoDownloadEnabled ? '#ffffff' : '#ff6b6b');
-    svg.setAttribute('stroke-width', '2.25');
-    svg.setAttribute('stroke-linecap', 'round');
-    svg.setAttribute('stroke-linejoin', 'round');
-
-    if (autoDownloadEnabled) {
-        // Power symbol (On)
-        svg.innerHTML = `
-            <circle cx="12" cy="12" r="10"></circle>
-            <line x1="12" y1="6" x2="12" y2="12"></line>
-        `;
-        btn.style.opacity = '1';
-        btn.style.filter = 'none';
-    } else {
-        // Power symbol with slash (Off)
-        svg.innerHTML = `
-            <circle cx="12" cy="12" r="10"></circle>
-            <line x1="12" y1="6" x2="12" y2="12"></line>
-            <line x1="5" y1="5" x2="19" y2="19"></line>
-        `;
-        btn.style.opacity = '0.5';
-        btn.style.filter = 'grayscale(50%)';
+        autoDownloadEnabled = !autoDownloadEnabled;
+        GM_setValue(AUTO_DOWNLOAD_KEY, autoDownloadEnabled);
+        log('UI', 'Auto-Save ' + (autoDownloadEnabled ? 'an' : 'aus'));
+        updateAutoSaveButtonVisual();
+        showPopup('autoDownloadToggled', 5000, {
+            status: userText(autoDownloadEnabled ? 'enabled' : 'disabled')
+        });
     }
 
-    btn.appendChild(svg);
-}
+    function updateAutoSaveButtonVisual() {
+        if (!window.autoSaveToggleBtn) return;
+        const btn = window.autoSaveToggleBtn;
+        while (btn.firstChild) btn.removeChild(btn.firstChild);
+        const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+        svg.setAttribute('width', '20');
+        svg.setAttribute('height', '20');
+        svg.setAttribute('viewBox', '0 0 24 24');
+        svg.setAttribute('fill', 'none');
+        svg.setAttribute('stroke', autoDownloadEnabled ? '#ffffff' : '#ff6b6b');
+        svg.setAttribute('stroke-width', '2.25');
+        svg.setAttribute('stroke-linecap', 'round');
+        svg.setAttribute('stroke-linejoin', 'round');
+        svg.innerHTML = autoDownloadEnabled
+            ? '<circle cx="12" cy="12" r="10"></circle><line x1="12" y1="6" x2="12" y2="12"></line>'
+            : '<circle cx="12" cy="12" r="10"></circle><line x1="12" y1="6" x2="12" y2="12"></line><line x1="5" y1="5" x2="19" y2="19"></line>';
+        btn.style.opacity = autoDownloadEnabled ? '1' : '0.5';
+        btn.appendChild(svg);
+        btn.title = autoDownloadEnabled ? 'Auto-Save: AN' : 'Auto-Save: AUS';
+    }
 
     function createButton(iconType, title, onClick) {
         const button = document.createElement('div');
@@ -7629,15 +2177,11 @@ function updateAutoSaveButtonVisual() {
         button.style.alignItems = 'center';
         button.style.cursor = 'pointer';
         button.style.boxShadow = '0 2px 10px rgba(0, 0, 0, 0.35)';
-        button.style.transition = 'all 0.2s cubic-bezier(0.4, 0, 0.2, 1)';
         button.style.zIndex = '10001';
         button.style.marginBottom = '10px';
-        button.style.backdropFilter = 'blur(4px)';
         button.title = title;
         button.setAttribute('role', 'button');
         button.setAttribute('aria-label', title);
-
-        // Create SVG icon
         const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
         svg.setAttribute('width', '22');
         svg.setAttribute('height', '22');
@@ -7647,104 +2191,54 @@ function updateAutoSaveButtonVisual() {
         svg.setAttribute('stroke-width', '2');
         svg.setAttribute('stroke-linecap', 'round');
         svg.setAttribute('stroke-linejoin', 'round');
-
-        let path = '';
-
-        switch (iconType) {
-            case 'search': // Magnifier
-                path = 'M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z';
-                break;
-            case 'save': // Floppy disk / Save
-                path = 'M19 21H5a2 2 0 01-2-2V5a2 2 0 012-2h11l5 5v11a2 2 0 01-2 2zM17 21v-8H7v8M7 3v5h8';
-                break;
-            case 'load': // Folder / Load
-                path = 'M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z';
-                break;
-            case 'toggle': // Circular arrows
-                path = 'M4 4v5h.582m15.356 2A8.001 8.001 0 004.058 11H1M20 12v5h-.582M4.058 11H1M12 21v-4M12 3v4';
-                break;
-            default:
-                path = 'M12 6v12M6 12h12'; // fallback plus
-        }
-
-        svg.innerHTML = `<path d="${path}"></path>`;
+        let path = 'M12 6v12M6 12h12';
+        if (iconType === 'search') path = 'M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z';
+        if (iconType === 'save') path = 'M19 21H5a2 2 0 01-2-2V5a2 2 0 012-2h11l5 5v11a2 2 0 01-2 2zM17 21v-8H7v8M7 3v5h8';
+        if (iconType === 'load') path = 'M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z';
+        if (iconType === 'toggle') path = 'M4 4v5h.582m15.356 2A8.001 8.001 0 004.058 11H1M20 12v5h-.582M4.058 11H1M12 21v-4M12 3v4';
+        svg.innerHTML = '<path d="' + path + '"></path>';
         button.appendChild(svg);
-
-        // Hover effects
-        button.addEventListener('mouseenter', () => {
-            button.style.backgroundColor = 'rgba(29, 155, 240, 0.35)';
-            button.style.transform = 'scale(1.12)';
-            button.style.boxShadow = '0 4px 14px rgba(29, 155, 240, 0.45)';
-        });
-
-        button.addEventListener('mouseleave', () => {
-            button.style.backgroundColor = 'rgba(29, 155, 240, 0.18)';
-            button.style.transform = 'scale(1)';
-            button.style.boxShadow = '0 2px 10px rgba(0, 0, 0, 0.35)';
-        });
-
-        button.addEventListener('click', () => {
-            button.style.transform = 'scale(0.9)';
-            setTimeout(() => {
-                button.style.transform = 'scale(1)';
-            }, 120);
+        button.addEventListener('click', (event) => {
+            event.stopPropagation();
             onClick();
         });
-
         return button;
     }
 
-    function showPopup(messageKey, duration = 5000, params = {}) {
-
-    const lang = getUserLanguage();
-    const message = getTranslatedMessage(messageKey, lang, params);
-
-    const displayDuration = 5000;
-    const fadeDuration = 1000;
-
-    let localPopup = document.createElement('div');
-    Object.assign(localPopup.style, {
-        position: 'fixed',
-        top: '20px',
-        left: '50%',
-        transform: 'translateX(-50%)',
-        backgroundColor: 'rgba(0, 0, 0, 0.9)',
-        color: '#ffffff',
-        padding: (messageKey === 'autoDownloadToggled') ? '20px 40px' : '10px 20px',
-        borderRadius: '8px',
-        fontSize: (messageKey === 'autoDownloadToggled') ? '22px' : '14px',
-        boxShadow: '0 0 10px rgba(246, 146, 25, 0.8)',
-        zIndex: '10000',
-        maxWidth: '500px',
-        whiteSpace: 'pre-wrap',
-        transition: `opacity ${fadeDuration / 1000}s ease`,
-        opacity: '1'
-    });
-
-    localPopup.textContent = message;
-
-    if (document.body) {
-        document.body.appendChild(localPopup);
-
-        setTimeout(() => {
-            if (localPopup) {
-                localPopup.style.opacity = '0';
-                setTimeout(() => {
-                    if (localPopup && localPopup.parentNode) {
-                        localPopup.parentNode.removeChild(localPopup);
+    function createButtons() {
+        if (document.getElementById('xts-reading-buttons')) return;
+        const mount = () => {
+            if (!document.body || document.getElementById('xts-reading-buttons')) return;
+            const box = document.createElement('div');
+            box.id = 'xts-reading-buttons';
+            box.style.position = 'fixed';
+            box.style.bottom = '100px';
+            box.style.left = '10px';
+            box.style.zIndex = '10000';
+            box.style.display = 'flex';
+            box.style.flexDirection = 'column';
+            const buttons = [
+                ['search', 'Start manual search', () => {
+                    if (followingTab === false) {
+                        showPopup('needFollowing', 5000);
+                        return;
                     }
-                }, fadeDuration + 200);
-            }
-        }, displayDuration);
-    } else {
-        log('UI', 'document.body nicht verfügbar für showPopup.');
-    }
-}
-
-    function promptManualFallback(data) {
-        const content = JSON.stringify(data);
-        showPopup('downloadClipboardFailed', 10000);
-        log('Load', 'Download fehlgeschlagen, Position bleibt gespeichert:', content);
+                    void seekBookmark('lupe');
+                }],
+                ['save', 'Save current position', () => { void saveCurrentByHand(); }],
+                ['load', 'Load last read position', () => loadBookmarkFromFile()],
+                ['toggle', 'Toggle auto-save', () => toggleAutoSave()]
+            ];
+            buttons.forEach((entry, index) => {
+                const btn = createButton(entry[0], entry[1], entry[2]);
+                if (index === 3) window.autoSaveToggleBtn = btn;
+                box.appendChild(btn);
+            });
+            document.body.appendChild(box);
+            updateAutoSaveButtonVisual();
+        };
+        if (document.body) mount();
+        else document.addEventListener('DOMContentLoaded', mount);
     }
 
     // =====================================================
@@ -8441,9 +2935,20 @@ function updateAutoSaveButtonVisual() {
         debugLog('Media', 'Medien-Download-Buttons aktiv');
     }
 
-    window.addEventListener('load', initMediaDownloadButtons);
-    installSpaRouting();
-    window.addEventListener('load', onSpaRoute);
-    if (document.readyState === 'complete') onSpaRoute();
-})();
+    let mediaBooted = false;
+    function bootMediaOnce() {
+        if (mediaBooted) return;
+        mediaBooted = true;
+        initMediaDownloadButtons();
+    }
 
+    installSpaRouting();
+    if (document.readyState === 'complete') {
+        bootMediaOnce();
+        onSpaRoute();
+    } else {
+        window.addEventListener('load', bootMediaOnce);
+        if (document.readyState !== 'loading') onSpaRoute();
+        else document.addEventListener('DOMContentLoaded', onSpaRoute);
+    }
+})();
