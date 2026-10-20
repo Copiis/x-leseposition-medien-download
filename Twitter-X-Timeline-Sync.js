@@ -15,7 +15,7 @@
 // @description:ko Twitter/X에서 마지막 읽기 위치를 추적하고 동기화합니다. 수동 및 자동 옵션 포함. 새로운 게시물을 확인하면서 현재 위치를 잃지 않도록 이상적입니다. 트윗 ID를 사용하여 정확한 위치 지정을 하고, 리포스트를 지원합니다。
 // @icon https://x.com/favicon.ico
 // @namespace https://github.com/Copiis/x-leseposition-medien-download
-// @version 2026.10.14f
+// @version 2026.10.20a
 // @author Copiis
 // @license MIT
 // @match https://x.com/*
@@ -386,8 +386,9 @@
 
     // =====================================================
     // Lesestelle — ein Ablauf
-    // idle: mitlesen. pill: neue Posts laden. seek: gespeicherte Stelle suchen. align: auf die Lesezeile rücken.
+    // idle: mitlesen. pill: neue Posts laden. seek: gespeicherte Stelle suchen, markieren und auf die Lesezeile rücken.
     // Nur der Reiter „Folge ich“. „Für dich“ bleibt auf x.com/home und wird ignoriert.
+    // Eine laufende Suche bricht die Pille nicht ab. Space oder das Mausrad bricht sie ab.
     // =====================================================
 
     const DEBUG = false;
@@ -416,11 +417,16 @@
     const SEARCH_MAX_STEPS = 800;
     const SEARCH_JUMP_VH = 0.85;
     const FINE_STEP_PX = 280;
-    const RELOAD_WAIT_MS = 2000;
+    // Durch schon geladene Beiträge nicht warten. Am geladenen Ende auf Nachladen warten.
+    const JUMP_FOLLOW_MS = 160;
+    const LOAD_WAIT_MS = 1500;
+    const CLOSE_LOAD_WAIT_MS = 400;
+    const JUMP_GAP_MS = 40;
     const EMPTY_WAITS_MAX = 8;
     const NEAR_MS = 90 * 60 * 1000;
     const NEWER_SLACK_MS = 60 * 1000;
-    const SLEEP_MS = 45000;
+    // Feinschritte erst, wenn der sichtbare Rand nah an der Lesestelle ist.
+    const NEAR_ZONE_MS = 30 * 60 * 1000;
     const MAP_MAX = 2500;
     const HISTORY_MAX = 500;
     const REPOST_LOG_MAX = 500;
@@ -437,8 +443,14 @@
     const MAX_DOWNLOADED_POSTS = 2000;
 
     const EXTRA = {
-        de: { needFollowing: 'ℹ️ Bitte den Reiter „Folge ich“ wählen.' },
-        en: { needFollowing: 'ℹ️ Switch to the Following tab.' }
+        de: {
+            needFollowing: 'ℹ️ Bitte den Reiter „Folge ich“ wählen.',
+            searchCancelled: 'ℹ️ Suche abgebrochen.'
+        },
+        en: {
+            needFollowing: 'ℹ️ Switch to the Following tab.',
+            searchCancelled: 'ℹ️ Search cancelled.'
+        }
     };
 
     function userText(key, params = {}) {
@@ -677,7 +689,9 @@
 
     function getPostTweetId(post) {
         if (!post) return null;
-        const linkElement = post.querySelector("a[role='link'][href*='/status/']");
+        const time = post.querySelector('time');
+        const timeLink = time && time.closest("a[href*='/status/']");
+        const linkElement = timeLink || post.querySelector("a[href*='/status/']");
         if (!linkElement) return null;
         const href = linkElement.getAttribute('href') || '';
         const match = href.match(/\/status\/(\d+)/);
@@ -704,7 +718,7 @@
         if (!postElement) return null;
         const socialContext = postElement.querySelector('span[data-testid="socialContext"]');
         const links = socialContext
-            ? socialContext.querySelectorAll('a[role="link"][href^="/"]:not([href*="/status/"])')
+            ? socialContext.querySelectorAll("a[href^='/']:not([href*='/status/'])")
             : [];
         for (const link of links) {
             const href = link.getAttribute('href') || '';
@@ -721,15 +735,15 @@
         if (repostFlag) {
             const innerArticle = post.querySelector('article');
             if (innerArticle) {
-                handlerElement = innerArticle.querySelector("a[role='link'][href^='/']:not([href*='/status/'])");
+                handlerElement = innerArticle.querySelector("a[href^='/']:not([href*='/status/'])");
             }
             if (!handlerElement) {
                 const socialContext = post.querySelector('span[data-testid="socialContext"]');
-                const allLinks = Array.from(post.querySelectorAll("a[role='link'][href^='/']:not([href*='/status/'])"));
+                const allLinks = Array.from(post.querySelectorAll("a[href^='/']:not([href*='/status/'])"));
                 handlerElement = allLinks.find((link) => !socialContext || !socialContext.contains(link)) || null;
             }
         } else {
-            handlerElement = post.querySelector("a[role='link'][href*='/']:not([href*='/status/'])");
+            handlerElement = post.querySelector("a[href^='/']:not([href*='/status/'])");
         }
         if (!handlerElement) return null;
         const href = handlerElement.getAttribute('href') || '';
@@ -750,7 +764,7 @@
         if (!postElement) return null;
         const tweetId = getPostTweetId(postElement);
         const authorHandler = getPostAuthorHandler(postElement);
-        if (!tweetId || !authorHandler) return null;
+        if (!tweetId) return null;
         const repostFlag = isRepost(postElement);
         let timestamp = getPostTimestamp(postElement);
         if (!timestamp) {
@@ -774,12 +788,16 @@
 
     function findArticle(bm) {
         if (!bm || !bm.tweetId) return null;
-        return feedArticles().find((post) => {
-            if (getPostTweetId(post) !== bm.tweetId) return false;
-            if (bm.authorHandler && getPostAuthorHandler(post) !== bm.authorHandler) return false;
+        const articles = feedArticles().filter((post) => getPostTweetId(post) === bm.tweetId);
+        if (!articles.length) return null;
+        const full = articles.find((post) => {
+            if (bm.authorHandler && getPostAuthorHandler(post) && getPostAuthorHandler(post) !== bm.authorHandler) return false;
             if (!!isRepost(post) !== !!bm.isRepost) return false;
             return true;
-        }) || null;
+        });
+        if (full) return full;
+        const sameKind = articles.find((post) => !!isRepost(post) === !!bm.isRepost);
+        return sameKind || (articles.length === 1 ? articles[0] : null);
     }
 
     function visibleParsed() {
@@ -853,6 +871,20 @@
         return scroller.scrollTop || 0;
     }
 
+    function scrollRoomBelow() {
+        const scroller = feedScroller();
+        const offset = scrollOffset();
+        if (isWindowScroller(scroller)) {
+            const view = window.innerHeight || 800;
+            const height = Math.max(
+                document.documentElement.scrollHeight || 0,
+                document.body ? document.body.scrollHeight : 0
+            );
+            return height - offset - view;
+        }
+        return (scroller.scrollHeight || 0) - offset - (scroller.clientHeight || 0);
+    }
+
     function atTop() {
         return scrollOffset() <= AT_TOP_PX;
     }
@@ -869,19 +901,159 @@
         else scroller.scrollTop += dy;
     }
 
+    function tailKey() {
+        const posts = feedArticles();
+        const last = posts[posts.length - 1];
+        if (!last) return '';
+        return (getPostTweetId(last) || '') + (isRepost(last) ? 'r' : '');
+    }
+
+    // Der letzte gezeichnete Originalbeitrag liegt schon hinter der Lesestelle.
+    // Dann nur eine Bildschirmhöhe, sonst würde der Sprung an den Schwanz vorbeiziehen.
+    function renderedTailOlderThanBookmark() {
+        const target = bookmarkTargetMs(bookmark);
+        if (target === null) return false;
+        const posts = feedArticles();
+        for (let i = posts.length - 1; i >= 0; i -= 1) {
+            const post = posts[i];
+            if (isRepost(post)) continue;
+            const ms = tweetIdMs(getPostTweetId(post));
+            if (ms === null) continue;
+            return ms + NEWER_SLACK_MS < target;
+        }
+        return false;
+    }
+
+    function stepTowardBookmark() {
+        const vh = window.innerHeight || 800;
+        const cap = Math.round(vh * 2);
+        let dy;
+        if (renderedTailOlderThanBookmark()) {
+            dy = Math.round(vh * SEARCH_JUMP_VH);
+        } else {
+            const posts = feedArticles();
+            const last = posts[posts.length - 1];
+            if (!last) dy = Math.round(vh * 0.9);
+            else {
+                const delta = last.getBoundingClientRect().bottom - vh + 8;
+                dy = delta > 24 ? delta : Math.round(vh * 0.9);
+            }
+        }
+        if (dy > cap) dy = cap;
+        if (dy > 24) scrollByDelta(dy);
+        return dy > 0 ? dy : 0;
+    }
+
     function nudgeToward(el) {
-        if (!el || !el.isConnected) return 'blocked';
+        if (!el || !el.isConnected) return 'lost';
         const rect = el.getBoundingClientRect();
-        if (rect.height < 5) return 'blocked';
+        if (rect.height < 5) return 'wait';
         const delta = rect.top - READING_LINE_PX;
         if (Math.abs(delta) <= ALIGN_TOLERANCE_PX) return 'aligned';
         const vh = window.innerHeight || 800;
         const cap = Math.max(FINE_STEP_PX, Math.round(vh * SEARCH_JUMP_VH));
-        const step = Math.max(-cap, Math.min(cap, delta));
+        let step = Math.max(-cap, Math.min(cap, delta));
         const here = scrollOffset();
-        if (here > vh && here + step <= AT_TOP_PX) return 'blocked';
+        if (here > vh && here + step <= AT_TOP_PX) {
+            step = -(here - (AT_TOP_PX + 1));
+            if (step >= -1) return 'stuck';
+        }
         scrollByDelta(step);
+        if (Math.abs(scrollOffset() - here) < 1) return 'stuck';
         return 'moved';
+    }
+
+    function ageSpan() {
+        const times = visibleOriginalTimes();
+        const target = bookmarkTargetMs(bookmark);
+        if (!times.length || target === null) return null;
+        return {
+            oldest: Math.min.apply(null, times),
+            newest: Math.max.apply(null, times),
+            target
+        };
+    }
+
+    function seekZone(span) {
+        if (!span) return 'far';
+        if (span.newest + NEWER_SLACK_MS < span.target) return 'passed';
+        if (span.oldest <= span.target + NEWER_SLACK_MS) return 'band';
+        if (span.oldest - span.target < NEAR_ZONE_MS) return 'near';
+        return 'far';
+    }
+
+    async function placeOnReadingLine(el, gen) {
+        if (!el) return false;
+        const wantId = getPostTweetId(el);
+        const wantRepost = isRepost(el);
+        const recover = () => {
+            if (!wantId) return null;
+            return feedArticles().find((post) => getPostTweetId(post) === wantId && !!isRepost(post) === !!wantRepost) || null;
+        };
+        let missed = 0;
+        let stuck = 0;
+        for (let i = 0; i < 40; i += 1) {
+            if (gen !== generation || seekCancel || !readingOn()) return false;
+            if (!el || !el.isConnected) {
+                el = recover();
+                if (!el) {
+                    missed += 1;
+                    if (missed >= 10) return false;
+                    await sleep(80);
+                    continue;
+                }
+            }
+            missed = 0;
+            highlight(el);
+            const status = nudgeToward(el);
+            if (status === 'aligned') {
+                await sleep(140);
+                if (gen !== generation || seekCancel || !readingOn()) return false;
+                if (!el.isConnected) el = recover();
+                if (!el || !el.isConnected) {
+                    missed += 1;
+                    continue;
+                }
+                highlight(el);
+                if (nudgeToward(el) === 'aligned') return true;
+                continue;
+            }
+            if (status === 'lost') {
+                el = null;
+                continue;
+            }
+            if (status === 'stuck') {
+                stuck += 1;
+                if (stuck >= 4) return false;
+                await sleep(120);
+                continue;
+            }
+            stuck = 0;
+            await sleep(status === 'wait' ? 120 : 40);
+        }
+        return false;
+    }
+
+    async function scanForBookmark(gen, direction, maxPx) {
+        let moved = 0;
+        while (moved < maxPx) {
+            if (gen !== generation || seekCancel || !readingOn()) return null;
+            const exact = findArticle(bookmark);
+            if (exact) return exact;
+            const here = scrollOffset();
+            if (direction < 0 && here <= AT_TOP_PX) return findArticle(bookmark);
+            const step = Math.min(FINE_STEP_PX, maxPx - moved);
+            const before = visibleSignature();
+            scrollByDelta(direction * step);
+            moved += step;
+            await waitForFeedChange(JUMP_FOLLOW_MS, before, JUMP_GAP_MS);
+            if (Math.abs(scrollOffset() - here) < 24) return findArticle(bookmark);
+            if (direction < 0) {
+                const span = ageSpan();
+                if (span && span.oldest > span.target + NEWER_SLACK_MS) return findArticle(bookmark);
+            }
+        }
+        return findArticle(bookmark);
     }
 
     function holdAnchor() {
@@ -904,15 +1076,55 @@
     }
 
     // baseline leer: ab jetzt auf eine Änderung warten.
-    // Mit baseline: die Änderung darf schon passiert sein, dann sofort weiter.
-    async function waitForFeedChange(ms, baseline) {
+    // Mit baseline: die Änderung darf schon passiert sein.
+    // minMs lässt den Feed kurz zeichnen, statt im selben Takt weiterzuspringen.
+    async function waitForFeedChange(ms, baseline, minMs) {
         const start = baseline === undefined ? visibleSignature() : baseline;
         const t0 = Date.now();
+        const floor = Math.min(ms, Math.max(0, minMs || 0));
+        if (floor > 0) await sleep(floor);
+        if (seekCancel) return false;
+        if (visibleSignature() !== start) return true;
         while (Date.now() - t0 < ms) {
+            if (seekCancel) return false;
+            await sleep(40);
+            if (seekCancel) return false;
             if (visibleSignature() !== start) return true;
-            await sleep(80);
         }
         return false;
+    }
+
+    async function waitForLoad(ms, beforeSig, beforeTail) {
+        const t0 = Date.now();
+        const changed = () => visibleSignature() !== beforeSig || tailKey() !== beforeTail;
+        if (changed()) return true;
+        while (Date.now() - t0 < ms) {
+            if (seekCancel) return false;
+            await sleep(40);
+            if (seekCancel) return false;
+            if (changed()) return true;
+        }
+        return changed();
+    }
+
+    // Nach der ersten Änderung kurz stillhalten, bis der Feed nicht mehr nachrückt.
+    async function waitForSignatureSettle(ms) {
+        let last = visibleSignature() + '|' + tailKey();
+        let stableSince = Date.now();
+        const cap = Date.now() + ms;
+        while (Date.now() < cap) {
+            if (seekCancel || !readingOn()) return false;
+            await sleep(50);
+            if (seekCancel || !readingOn()) return false;
+            const nowSig = visibleSignature() + '|' + tailKey();
+            if (nowSig !== last) {
+                last = nowSig;
+                stableSince = Date.now();
+                continue;
+            }
+            if (Date.now() - stableSince >= 180) return true;
+        }
+        return !seekCancel && readingOn();
     }
 
     // ---------- Zustand ----------
@@ -923,10 +1135,10 @@
     let seekCancel = false;
     let programmaticUntil = 0;
     let blockTopMarkUntil = 0;
+    let lastUserInputAt = 0;
     let lastScrollY = 0;
     let activeScroller = null;
     let pillWatchUntil = 0;
-    let pillSeenAtWatchStart = false;
     let pillClicks = 0;
     let pillClickLabel = '';
     let pillClickedAt = 0;
@@ -939,7 +1151,8 @@
     let observedColumn = null;
     let listenersBound = false;
     let bootedAccount = null;
-    let hiddenAt = 0;
+    let lastNewPostArm = 0;
+    let newPostCheckTimers = [];
     let mapAccount = null;
     let orderedKeys = [];
     const mapEntries = new Map();
@@ -1317,11 +1530,9 @@
         pillClicks = 0;
         pillClickLabel = '';
         pillClickedAt = 0;
-        pillSeenAtWatchStart = !!findPill();
-        pillWatchUntil = Date.now() + PILL_WATCH_MS;
         log('Init', 'Folge ich aktiv (' + reason + ').');
         showBookmark();
-        tryPill();
+        armNewPostCheck('folge-ich');
     }
 
     function syncTab(reason) {
@@ -1341,7 +1552,7 @@
         else {
             followingTab = true;
             showBookmark();
-            tryPill();
+            armNewPostCheck('reiter');
         }
     }
 
@@ -1446,10 +1657,12 @@
 
     function tryPill() {
         if (!readingOn()) return;
+        // Suche und Pille laufen zu Ende. Eine zweite Pille bricht das Wiederfinden nicht ab.
         if (phase !== 'idle') return;
         const watch = Date.now() < pillWatchUntil;
-        const late = watch && !pillSeenAtWatchStart;
-        if (!atTop() && !late && !(watch && nearTop())) return;
+        // Im Leerlauf nur ganz oben. Nach Fokus liegt die Pille am Viewport,
+        // auch wenn die Timeline weiter unten steht.
+        if (!watch && !atTop()) return;
         const pill = findPill();
         if (!pill) {
             if (Date.now() - pillClickedAt >= PILL_RETRY_MS) {
@@ -1477,23 +1690,33 @@
         blockTopMarkUntil = Date.now() + 4000;
         const target = bookmark ? Object.assign({}, bookmark) : null;
         log('NewPosts', 'Pille', pill.text);
+        const beforeClick = visibleSignature();
+        const beforeTail = tailKey();
         try {
             pill.host.click();
         } catch (e) {
             log('NewPosts', 'Klick fehlgeschlagen', e);
         }
-        await sleep(400);
-        await waitForFeedChange(3000);
-        if (gen !== generation || !readingOn()) {
+        if (gen !== generation || seekCancel || !readingOn()) {
+            if (gen === generation) phase = 'idle';
+            return;
+        }
+        const changed = await waitForLoad(800, beforeClick, beforeTail);
+        if (gen !== generation || seekCancel || !readingOn()) {
+            if (gen === generation) phase = 'idle';
+            return;
+        }
+        if (changed) await waitForSignatureSettle(700);
+        if (gen !== generation || seekCancel || !readingOn()) {
             if (gen === generation) phase = 'idle';
             return;
         }
         bookmark = target;
         blockTopMarkUntil = Date.now() + 1800;
-        phase = 'idle';
         if (target && target.tweetId) {
             await seekBookmark('pill', { silent: true, generationHint: gen });
         }
+        if (gen === generation && phase === 'pill') phase = 'idle';
     }
 
     // ---------- Suche ----------
@@ -1520,6 +1743,7 @@
 
     async function seekBookmark(reason, options = {}) {
         const silent = options.silent === true;
+        const reportMiss = options.reportMiss !== false;
         if (!bookmark || !bookmark.tweetId) {
             if (!silent) showPopup('searchNoPosition', 5000);
             return;
@@ -1545,88 +1769,201 @@
             });
         }
         log('Search', 'Suche', reason, '@' + bookmark.authorHandler, bookmark.tweetId);
-        const onKey = (event) => {
-            if (event.code !== 'Space') return;
-            const tag = event.target && event.target.tagName;
-            if (tag === 'INPUT' || tag === 'TEXTAREA') return;
-            seekCancel = true;
-            event.preventDefault();
-        };
-        window.addEventListener('keydown', onKey, true);
         let emptyWaits = 0;
         let stagnant = 0;
         let bounces = 0;
         let lastY = scrollOffset();
+        let lastJump = 0;
+        let lastDir = 0;
+        let placeMisses = 0;
+        const still = () => gen === generation && !seekCancel && readingOn();
+        const centerExact = async (el) => {
+            const placed = await placeOnReadingLine(el, gen);
+            if (!still()) return 'abort';
+            if (placed) {
+                placeMisses = 0;
+                return 'done';
+            }
+            const live = findArticle(bookmark);
+            if (!live) return 'gone';
+            placeMisses += 1;
+            if (placeMisses < 3) return 'retry';
+            highlight(live);
+            return 'marked';
+        };
         try {
             for (let step = 0; step < SEARCH_MAX_STEPS; step += 1) {
-                if (gen !== generation || seekCancel || !readingOn()) break;
+                if (!still()) break;
                 const exact = findArticle(bookmark);
                 if (exact) {
-                    highlight(exact);
-                    const status = nudgeToward(exact);
-                    if (status === 'aligned' || status === 'blocked') {
+                    const outcome = await centerExact(exact);
+                    if (outcome === 'abort') return;
+                    if (outcome === 'retry') continue;
+                    if (outcome === 'done' || outcome === 'marked') {
                         finishFlow(gen);
-                        log('Search', status === 'aligned' ? 'Lesestelle steht' : 'Lesestelle markiert, kein Sprung an den Anfang');
+                        log('Search', outcome === 'done' ? 'Lesestelle steht' : 'Lesestelle markiert, Ausrichten am Anschlag');
                         return;
                     }
-                    await sleep(80);
-                    lastY = scrollOffset();
-                    continue;
+                } else {
+                    placeMisses = 0;
                 }
-                const reached = windowReachedBookmark(visibleOriginalTimes(), bookmark);
-                if (reached) {
-                    const near = nearestNearPost();
+                const zone = seekZone(ageSpan());
+                const vhNow = window.innerHeight || 800;
+                if (zone === 'passed' && scrollOffset() > AT_TOP_PX) {
+                    const hereUp = scrollOffset();
+                    const foundUp = await scanForBookmark(gen, -1, Math.round(vhNow * 0.9));
+                    if (!still()) break;
+                    if (foundUp) {
+                        const outcome = await centerExact(foundUp);
+                        if (outcome === 'abort') return;
+                        if (outcome === 'retry' || outcome === 'gone') continue;
+                        finishFlow(gen);
+                        log('Search', 'Lesestelle oberhalb ausgerichtet');
+                        return;
+                    }
+                    const movedUp = Math.abs(scrollOffset() - hereUp) >= 24;
+                    if (movedUp) {
+                        emptyWaits = 0;
+                        lastY = scrollOffset();
+                        if (lastDir === 1) bounces += 1;
+                        else bounces = 0;
+                        lastDir = -1;
+                        if (bounces >= 3) break;
+                        ingestDomOrder();
+                        continue;
+                    }
+                    emptyWaits += 1;
+                    if (emptyWaits < EMPTY_WAITS_MAX) continue;
+                }
+                if (zone === 'passed' || zone === 'band') {
+                    const vh = vhNow;
+                    let found = null;
+                    if (zone !== 'passed') found = await scanForBookmark(gen, 1, Math.round(vh * 0.85));
+                    if (!found && still()) {
+                        const back = Math.max(Math.round(vh * 2), lastJump + Math.round(vh * 0.5));
+                        found = await scanForBookmark(gen, -1, Math.min(back, Math.round(vh * 8)));
+                    }
+                    if (zone === 'passed' && !found && still()) {
+                        found = await scanForBookmark(gen, 1, Math.round(vh * 1.5));
+                    }
+                    if (!still()) break;
+                    if (found) {
+                        const outcome = await centerExact(found);
+                        if (outcome === 'abort') return;
+                        if (outcome === 'retry' || outcome === 'gone') continue;
+                        finishFlow(gen);
+                        log('Search', 'Lesestelle in der Nähe ausgerichtet');
+                        return;
+                    }
+                    const reached = zone === 'passed' || windowReachedBookmark(visibleOriginalTimes(), bookmark);
+                    const near = reached ? nearestNearPost() : null;
                     if (near && near.element) {
-                        highlight(near.element);
+                        await placeOnReadingLine(near.element, gen);
+                        if (!still()) break;
                         showPopup('approximatePosition', 5000, { strategy: 'nah' });
-                        log('Search', 'Nahersatz markiert, Lesestelle bleibt gespeichert');
-                    } else if (!silent) {
+                        log('Search', 'Nahersatz markiert und auf die Lesezeile gerückt');
+                    } else if (reportMiss) {
                         showPopup('tweetIdNotFound', 5000);
                     }
-                    finishFlow(gen);
+                    if (gen === generation) finishFlow(gen);
                     return;
                 }
                 const before = visibleSignature();
+                const beforeTail = tailKey();
                 const here = scrollOffset();
                 const vh = window.innerHeight || 800;
-                const jump = Math.max(FINE_STEP_PX, Math.round(vh * SEARCH_JUMP_VH));
-                scrollByDelta(jump);
-                const changed = await waitForFeedChange(RELOAD_WAIT_MS, before);
+                if (zone === 'near') {
+                    lastJump = FINE_STEP_PX;
+                    scrollByDelta(FINE_STEP_PX);
+                } else {
+                    lastJump = stepTowardBookmark();
+                }
+                const didMove = Math.abs(scrollOffset() - here) >= 24;
+                const revealed = visibleSignature() !== before || tailKey() !== beforeTail;
+                let changed = revealed;
+                const atEdge = !didMove || scrollRoomBelow() < vh * 0.5;
+                if (!revealed) {
+                    changed = await waitForLoad(atEdge ? LOAD_WAIT_MS : CLOSE_LOAD_WAIT_MS, before, beforeTail);
+                }
                 const y2 = scrollOffset();
-                const after = visibleSignature();
-                if (!changed && after === before) {
+                if (changed) {
+                    emptyWaits = 0;
+                } else if (atEdge) {
                     emptyWaits += 1;
                     if (emptyWaits >= EMPTY_WAITS_MAX) break;
-                } else {
-                    emptyWaits = 0;
                 }
-                if (Math.abs(y2 - here) < 24) {
-                    stagnant += 1;
-                    if (stagnant >= 4) break;
-                } else {
-                    stagnant = 0;
+                if (zone === 'near') {
+                    if (Math.abs(y2 - here) < 24) {
+                        stagnant += 1;
+                        if (stagnant >= 4) break;
+                    } else {
+                        stagnant = 0;
+                    }
                 }
-                if (y2 < lastY - 40) {
-                    bounces += 1;
+                if (Math.abs(y2 - lastY) >= 24) {
+                    const dir = y2 > lastY ? 1 : -1;
+                    if (lastDir && dir !== lastDir) bounces += 1;
+                    else bounces = 0;
+                    lastDir = dir;
                     if (bounces >= 3) break;
-                } else if (y2 > lastY + 40) {
-                    bounces = 0;
                 }
                 lastY = y2;
                 ingestDomOrder();
             }
-            if (gen === generation) {
-                const exact = findArticle(bookmark);
-                if (exact) highlight(exact);
-                else if (!silent) showPopup('tweetIdNotFound', 5000);
-                finishFlow(gen);
-                log('Search', 'Suche beendet ohne Sprung an den Anfang');
+            if (!still()) {
+                log('Search', 'Suche abgebrochen');
+                return;
             }
+            const vh = window.innerHeight || 800;
+            let found = findArticle(bookmark);
+            if (!found) found = await scanForBookmark(gen, -1, Math.round(vh * 2));
+            if (!found && still()) found = await scanForBookmark(gen, 1, Math.round(vh * 1.5));
+            if (found && still()) {
+                const outcome = await centerExact(found);
+                if (outcome === 'abort') return;
+                if (outcome === 'done' || outcome === 'marked') {
+                    finishFlow(gen);
+                    log('Search', 'Lesestelle am Ende der Suche');
+                    return;
+                }
+            }
+            if (!still()) return;
+            const near = windowReachedBookmark(visibleOriginalTimes(), bookmark) ? nearestNearPost() : null;
+            if (near && near.element) {
+                await placeOnReadingLine(near.element, gen);
+                if (gen === generation) {
+                    showPopup('approximatePosition', 5000, { strategy: 'nah' });
+                    finishFlow(gen);
+                }
+                log('Search', 'Suche beendet mit Nahersatz');
+                return;
+            }
+            if (reportMiss) showPopup('tweetIdNotFound', 5000);
+            if (gen === generation) finishFlow(gen);
+            log('Search', 'Suche beendet ohne Sprung an den Anfang');
         } finally {
-            window.removeEventListener('keydown', onKey, true);
             releaseAnchor();
             if (gen === generation && phase === 'seek') finishFlow(gen);
         }
+    }
+
+    function typingTarget(target) {
+        if (!target || target.nodeType !== 1) return false;
+        const tag = target.tagName;
+        if (tag === 'INPUT' || tag === 'TEXTAREA' || target.isContentEditable) return true;
+        return !!(target.closest && target.closest('input, textarea, [contenteditable="true"], [role="textbox"]'));
+    }
+
+    function onSearchKey(event) {
+        if (event.code !== 'Space' && event.code !== 'Spacebar') return;
+        if (event.repeat || event.ctrlKey || event.altKey || event.metaKey) return;
+        if (phase !== 'seek' && phase !== 'pill') return;
+        if (typingTarget(event.target)) return;
+        event.preventDefault();
+        event.stopPropagation();
+        cancelFlow();
+        showPopup('searchCancelled', 2500);
+        log('Search', 'Space bricht die Suche ab');
     }
 
     function finishFlow(gen) {
@@ -1634,7 +1971,29 @@
         phase = 'idle';
         programmaticUntil = Date.now() + 800;
         blockTopMarkUntil = Date.now() + 1800;
+        const finishedAt = Date.now();
+        let anchorY = scrollOffset();
         showBookmark();
+        const recheck = async (delay) => {
+            await sleep(delay);
+            if (gen !== generation || phase !== 'idle' || !bookmark) return;
+            if (lastUserInputAt > finishedAt) return;
+            if (Math.abs(scrollOffset() - anchorY) > 80) return;
+            const el = findArticle(bookmark);
+            if (!el) return;
+            highlight(el);
+            if (nudgeToward(el) !== 'moved') return;
+            anchorY = scrollOffset();
+            await sleep(80);
+            if (gen !== generation || phase !== 'idle' || lastUserInputAt > finishedAt) return;
+            if (Math.abs(scrollOffset() - anchorY) > 80) return;
+            const again = findArticle(bookmark);
+            if (!again) return;
+            highlight(again);
+            if (nudgeToward(again) === 'moved') anchorY = scrollOffset();
+        };
+        void recheck(400);
+        void recheck(1100);
     }
 
     async function goHomeThen(next) {
@@ -1672,6 +2031,7 @@
             lastScrollY = y;
             return;
         }
+        lastUserInputAt = Date.now();
         const delta = y - lastScrollY;
         lastScrollY = y;
         const arrivedTop = atTop() || nearTop();
@@ -1697,7 +2057,9 @@
         if (arrivedTop) tryPill();
     }
 
-    function onWheel() {
+    function onWheel(event) {
+        if (event && event.isTrusted === false) return;
+        lastUserInputAt = Date.now();
         if (phase === 'idle') return;
         cancelFlow();
         programmaticUntil = 0;
@@ -1706,24 +2068,48 @@
 
     const debouncedScroll = debounce(onUserScroll, 150);
 
+    function clearNewPostChecks() {
+        for (const timer of newPostCheckTimers) clearTimeout(timer);
+        newPostCheckTimers = [];
+    }
+
+    // Sofort und kurz danach noch einmal: die Pille erscheint oft erst nach dem Fokus.
+    function armNewPostCheck(reason) {
+        if (document.visibilityState === 'hidden') return;
+        if (!onHome() || followingTab === false) return;
+        const now = Date.now();
+        const again = now - lastNewPostArm < 700;
+        lastNewPostArm = now;
+        if (!again) {
+            pillClicks = 0;
+            pillClickLabel = '';
+            pillClickedAt = 0;
+            pillWatchUntil = Date.now() + PILL_WATCH_MS;
+            log('NewPosts', 'Prüfe neue Posts', reason);
+            clearNewPostChecks();
+            for (const delay of [200, 600, 1200, 2500]) {
+                newPostCheckTimers.push(setTimeout(() => {
+                    if (!readingOn() || Date.now() > pillWatchUntil) return;
+                    tryPill();
+                }, delay));
+            }
+        }
+        tryPill();
+    }
+
+    function onWindowFocus() {
+        if (!document.hasFocus()) return;
+        armNewPostCheck('fokus');
+    }
+
     function onVisibility() {
         if (document.visibilityState === 'hidden') {
-            hiddenAt = Date.now();
+            clearNewPostChecks();
             persistMap();
             maybeAutoDownload();
             return;
         }
-        if (!onHome() || followingTab === false) return;
-        const slept = hiddenAt ? Date.now() - hiddenAt : 0;
-        pillClicks = 0;
-        pillClickLabel = '';
-        pillClickedAt = 0;
-        pillSeenAtWatchStart = !!findPill();
-        pillWatchUntil = Date.now() + PILL_WATCH_MS;
-        tryPill();
-        if (slept >= SLEEP_MS && bookmark && phase === 'idle' && !findArticle(bookmark)) {
-            void seekBookmark('wake', { silent: true });
-        }
+        armNewPostCheck('sichtbar');
     }
 
     function maybeAutoDownload() {
@@ -1743,8 +2129,9 @@
             const now = Date.now();
             if (now - last < 400) return;
             last = now;
-            if (!readingOn() || phase !== 'idle') return;
+            if (!readingOn()) return;
             tryPill();
+            if (phase !== 'idle') return;
             ingestDomOrder();
         });
         columnObserver.observe(column, { childList: true, subtree: true });
@@ -1755,8 +2142,8 @@
         syncTab('tick');
         if (!readingOn()) return;
         rebindColumnObserver();
+        tryPill();
         if (phase === 'idle') {
-            tryPill();
             ingestDomOrder();
             showBookmark();
         }
@@ -1825,13 +2212,9 @@
         await loadStoredBookmark();
         const account = readUserHandleFromNav() || cachedUserHandle;
         if (isPlausibleUserHandle(account)) bootedAccount = account;
-        log('Init', 'Lesestelle 2026.10.14f');
+        log('Init', 'Lesestelle 2026.10.20a');
         syncTab('boot');
-        if (readingOn()) {
-            pillSeenAtWatchStart = !!findPill();
-            pillWatchUntil = Date.now() + PILL_WATCH_MS;
-            tryPill();
-        }
+        if (readingOn()) armNewPostCheck('start');
         showBookmark();
         watchTabs(8);
     }
@@ -1846,6 +2229,8 @@
             document.addEventListener('click', onTabClick, true);
             window.addEventListener('wheel', onWheel, { passive: true, capture: true });
             document.addEventListener('visibilitychange', onVisibility);
+            window.addEventListener('keydown', onSearchKey, true);
+            window.addEventListener('focus', onWindowFocus);
             window.addEventListener('blur', debounce(maybeAutoDownload, 1000));
             window.addEventListener('beforeunload', () => {
                 persistMap();
@@ -2092,12 +2477,14 @@
                         bootedAccount = account;
                         const selected = readFollowingTabSelected();
                         showPopup('fileLoadSuccess', 4000);
-                        showBookmark();
+                        const already = findArticle(bookmark);
+                        if (already) highlight(already);
                         if (selected === false) {
                             followingTab = false;
                             showPopup('needFollowing', 5000);
-                        } else if (selected === true) {
-                            followingTab = true;
+                        } else {
+                            if (selected === true) followingTab = true;
+                            cancelFlow();
                             void seekBookmark('datei', { silent: true });
                         }
                     } catch (err) {
