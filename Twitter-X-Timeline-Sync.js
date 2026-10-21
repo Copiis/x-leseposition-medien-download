@@ -15,7 +15,7 @@
 // @description:ko Twitter/X에서 마지막 읽기 위치를 추적하고 동기화합니다. 수동 및 자동 옵션 포함. 새로운 게시물을 확인하면서 현재 위치를 잃지 않도록 이상적입니다. 트윗 ID를 사용하여 정확한 위치 지정을 하고, 리포스트를 지원합니다。
 // @icon https://x.com/favicon.ico
 // @namespace https://github.com/Copiis/x-leseposition-medien-download
-// @version 2026.10.21b
+// @version 2026.10.21c
 // @author Copiis
 // @license MIT
 // @match https://x.com/*
@@ -528,18 +528,6 @@
         return Number.isFinite(parsed) ? parsed : null;
     }
 
-    function postIsNear(post, bm) {
-        if (!post || !post.tweetId || !bm || !bm.tweetId) return false;
-        if (post.tweetId === bm.tweetId && !!post.isRepost === !!bm.isRepost) return true;
-        const target = bookmarkTargetMs(bm);
-        const fromId = tweetIdMs(post.tweetId);
-        const parsed = Date.parse(post.timestamp || '');
-        const candidate = fromId !== null ? fromId : (Number.isFinite(parsed) ? parsed : null);
-        if (target === null || candidate === null) return false;
-        if (candidate > target + NEWER_SLACK_MS) return false;
-        return target - candidate <= NEAR_MS;
-    }
-
     function getComparisonTimestamp(postData) {
         if (!postData) return null;
         return postData.isRepost
@@ -795,16 +783,28 @@
 
     function findArticle(bm) {
         if (!bm || !bm.tweetId) return null;
-        const articles = feedArticles().filter((post) => getPostTweetId(post) === bm.tweetId);
+        const want = String(bm.tweetId);
+        const articles = feedArticles().filter((post) => String(getPostTweetId(post) || '') === want);
         if (!articles.length) return null;
-        const full = articles.find((post) => {
-            if (bm.authorHandler && getPostAuthorHandler(post) && getPostAuthorHandler(post) !== bm.authorHandler) return false;
-            if (!!isRepost(post) !== !!bm.isRepost) return false;
-            return true;
-        });
-        if (full) return full;
-        const sameKind = articles.find((post) => !!isRepost(post) === !!bm.isRepost);
-        return sameKind || (articles.length === 1 ? articles[0] : null);
+        const vh = window.innerHeight || 800;
+        let best = null;
+        let bestScore = Infinity;
+        for (const post of articles) {
+            const author = getPostAuthorHandler(post);
+            const repost = isRepost(post);
+            let penalty = 0;
+            if (bm.authorHandler && author && author !== bm.authorHandler) penalty += 5;
+            if (!!repost !== !!bm.isRepost) penalty += 2;
+            const rect = post.getBoundingClientRect();
+            const off = rect.height < 5 || rect.bottom <= 0 || rect.top >= vh;
+            const dist = Math.abs(rect.top - READING_LINE_PX);
+            const score = (off ? 100000000 : 0) + penalty * 100000 + dist;
+            if (score < bestScore) {
+                bestScore = score;
+                best = post;
+            }
+        }
+        return best;
     }
 
     function visibleParsed() {
@@ -1741,24 +1741,101 @@
 
     // ---------- Suche ----------
 
-    function nearestNearPost() {
-        if (!bookmark) return null;
-        let best = null;
-        let bestGap = Infinity;
-        const target = bookmarkTargetMs(bookmark);
-        for (const post of visibleParsed()) {
-            if (!postIsNear(post, bookmark)) continue;
-            if (post.tweetId === bookmark.tweetId && !!post.isRepost === !!bookmark.isRepost) return post;
-            const candidate = tweetIdMs(post.tweetId);
-            if (target === null || candidate === null) continue;
-            if (candidate > target) continue;
-            const gap = target - candidate;
-            if (gap < bestGap) {
-                bestGap = gap;
-                best = post;
+    function visibleSameTweet(bm) {
+        if (!bm || !bm.tweetId) return null;
+        const want = String(bm.tweetId);
+        const posts = visibleParsed();
+        return posts.find((post) => String(post.tweetId) === want && !!post.isRepost === !!bm.isRepost)
+            || posts.find((post) => String(post.tweetId) === want)
+            || null;
+    }
+
+    // Originalzeit. Ein Repost liegt im Feed bei readAt, nicht bei der Tweet-ID.
+    function originalGap(post, target) {
+        if (!post || post.isRepost || target === null) return null;
+        const moment = tweetIdMs(post.tweetId);
+        if (moment === null) return null;
+        return Math.abs(target - moment);
+    }
+
+    function elementOnReadingLine() {
+        const vh = window.innerHeight || 800;
+        let topmost = null;
+        let topmostTop = Infinity;
+        for (const post of feedArticles()) {
+            const rect = post.getBoundingClientRect();
+            if (rect.height < 5 || rect.bottom <= 40 || rect.top >= vh) continue;
+            if (rect.top <= READING_LINE_PX && rect.bottom >= READING_LINE_PX) return post;
+            if (rect.top < topmostTop) {
+                topmostTop = rect.top;
+                topmost = post;
             }
         }
-        return best;
+        return topmost;
+    }
+
+    // Die gespeicherte ID fehlt. Nimm dieselbe ID, sonst den Beitrag auf der
+    // Lesezeile, wenn er zeitlich mit dem nächsten gleichauf liegt, sonst den
+    // zeitnächsten sichtbaren Originalbeitrag.
+    function chooseNearest(atBookmark) {
+        if (!bookmark) return null;
+        const same = visibleSameTweet(bookmark);
+        if (same) return same;
+        const target = bookmarkTargetMs(bookmark);
+        let best = null;
+        let bestGap = Infinity;
+        for (const post of visibleParsed()) {
+            const gap = originalGap(post, target);
+            if (gap === null || gap >= bestGap) continue;
+            bestGap = gap;
+            best = post;
+        }
+        const line = rereadOnReadingLine();
+        if (atBookmark && line) {
+            const lineGap = originalGap(line, target);
+            if (lineGap === null || !best || lineGap <= bestGap + 2 * 60 * 1000) return line;
+        }
+        if (best && (atBookmark || bestGap <= NEAR_MS)) return best;
+        return null;
+    }
+
+    async function settleOnNearest(gen, atBookmark) {
+        let post = chooseNearest(atBookmark);
+        let raw = null;
+        if ((!post || !post.element) && atBookmark) {
+            raw = elementOnReadingLine();
+            if (raw) post = readArticle(raw) || post;
+        }
+        const el = (post && post.element) || raw;
+        if (!el) return null;
+        const same = !!(post && bookmark && String(post.tweetId) === String(bookmark.tweetId));
+        highlight(el);
+        await placeOnReadingLine(el, gen);
+        if (gen !== generation || seekCancel || !readingOn()) return 'abort';
+        let live = el.isConnected ? el : null;
+        if (!live && post && post.tweetId) {
+            const want = String(post.tweetId);
+            live = feedArticles().find((node) => String(getPostTweetId(node) || '') === want) || null;
+        }
+        if (!live && atBookmark) live = elementOnReadingLine();
+        if (live) highlight(live);
+        if (!same && post && post.tweetId) {
+            const fresh = (live && readArticle(live)) || post;
+            if (fresh.isRepost && bookmark && (bookmark.readAt || bookmark.timestamp)) {
+                fresh.readAt = bookmark.readAt || bookmark.timestamp;
+            }
+            if (live) fresh.element = live;
+            const saved = await adopt(fresh, true);
+            const marked = findArticle(bookmark);
+            if (marked) highlight(marked);
+            else if (live && live.isConnected) highlight(live);
+            log('Search', saved
+                ? 'Zeitnächster Post ist die neue Lesestelle'
+                : 'Zeitnächster Post markiert, Speichern ohne Autor übersprungen', fresh.tweetId);
+            return 'nearest';
+        }
+        log('Search', 'Sichtbare Lesestelle markiert und zentriert');
+        return 'same';
     }
 
     async function seekBookmark(reason, options = {}) {
@@ -1875,16 +1952,9 @@
                         log('Search', 'Lesestelle in der Nähe ausgerichtet');
                         return;
                     }
-                    const reached = zone === 'passed' || windowReachedBookmark(visibleOriginalTimes(), bookmark);
-                    const near = reached ? nearestNearPost() : null;
-                    if (near && near.element) {
-                        await placeOnReadingLine(near.element, gen);
-                        if (!still()) break;
-                        showPopup('approximatePosition', 5000, { strategy: 'nah' });
-                        log('Search', 'Nahersatz markiert und auf die Lesezeile gerückt');
-                    } else if (reportMiss) {
-                        showPopup('tweetIdNotFound', 5000);
-                    }
+                    const settled = await settleOnNearest(gen, true);
+                    if (settled === 'abort') return;
+                    if (settled === 'nearest' && reportMiss) showPopup('tweetIdNotFound', 5000);
                     if (gen === generation) finishFlow(gen);
                     return;
                 }
@@ -1948,19 +2018,14 @@
                 }
             }
             if (!still()) return;
-            const near = windowReachedBookmark(visibleOriginalTimes(), bookmark) ? nearestNearPost() : null;
-            if (near && near.element) {
-                await placeOnReadingLine(near.element, gen);
-                if (gen === generation) {
-                    showPopup('approximatePosition', 5000, { strategy: 'nah' });
-                    finishFlow(gen);
-                }
-                log('Search', 'Suche beendet mit Nahersatz');
-                return;
-            }
-            if (reportMiss) showPopup('tweetIdNotFound', 5000);
+            const zoneNow = seekZone(ageSpan());
+            const atBookmark = zoneNow === 'band' || zoneNow === 'passed'
+                || windowReachedBookmark(visibleOriginalTimes(), bookmark);
+            const settled = await settleOnNearest(gen, atBookmark);
+            if (settled === 'abort') return;
+            if (settled === 'nearest' && reportMiss) showPopup('tweetIdNotFound', 5000);
+            if (!settled) log('Search', 'Suche beendet ohne Ersatz');
             if (gen === generation) finishFlow(gen);
-            log('Search', 'Suche beendet ohne Sprung an den Anfang');
         } finally {
             releaseAnchor();
             if (gen === generation && phase === 'seek') finishFlow(gen);
@@ -2338,7 +2403,7 @@
         await loadStoredBookmark();
         const account = readUserHandleFromNav() || cachedUserHandle;
         if (isPlausibleUserHandle(account)) bootedAccount = account;
-        log('Init', 'Lesestelle 2026.10.21b');
+        log('Init', 'Lesestelle 2026.10.21c');
         syncTab('boot');
         if (bookmark && bookmark.tweetId && followingTab !== false && takeSeekAfterRefresh()) {
             log('Search', 'Nach dem Auffrischen die Lesestelle suchen');
