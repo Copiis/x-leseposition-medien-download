@@ -15,7 +15,7 @@
 // @description:ko Twitter/X에서 마지막 읽기 위치를 추적하고 동기화합니다. 수동 및 자동 옵션 포함. 새로운 게시물을 확인하면서 현재 위치를 잃지 않도록 이상적입니다. 트윗 ID를 사용하여 정확한 위치 지정을 하고, 리포스트를 지원합니다。
 // @icon https://x.com/favicon.ico
 // @namespace https://github.com/Copiis/x-leseposition-medien-download
-// @version 2026.10.21a
+// @version 2026.10.21b
 // @author Copiis
 // @license MIT
 // @match https://x.com/*
@@ -431,6 +431,10 @@
     const HISTORY_MAX = 500;
     const REPOST_LOG_MAX = 500;
     const SCROLL_DEAD_PX = 8;
+    // Hochscrollen bleibt ein kurzes Stück gültig, auch wenn der Feed die Position danach nach unten schiebt.
+    const UP_INTENT_MS = 1600;
+    const UP_RECHECK_MS = [400, 1000, 1500];
+    const DOWN_WHEEL_CANCEL_PX = 80;
     const SMALL_SVG_MAX = 22;
     const IMPORT_FILE_MAX_BYTES = 2 * 1024 * 1024;
     const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
@@ -1140,6 +1144,10 @@
     let blockTopMarkUntil = 0;
     let lastUserInputAt = 0;
     let lastScrollY = 0;
+    let lastRawScrollY = null;
+    let upIntentUntil = 0;
+    let downWheelPx = 0;
+    let upSettleTimers = [];
     let activeScroller = null;
     let pillWatchUntil = 0;
     let pillClicks = 0;
@@ -1686,6 +1694,7 @@
         const gen = ++generation;
         phase = 'pill';
         seekCancel = false;
+        clearUpIntent();
         if (pill.text !== pillClickLabel) {
             pillClickLabel = pill.text;
             pillClicks = 0;
@@ -2030,6 +2039,71 @@
         if (node.scrollHeight > node.clientHeight + 40) activeScroller = node;
     }
 
+    function clearUpIntent() {
+        upIntentUntil = 0;
+        downWheelPx = 0;
+        for (const timer of upSettleTimers) clearTimeout(timer);
+        upSettleTimers = [];
+    }
+
+    function upIntentFresh() {
+        return Date.now() < upIntentUntil;
+    }
+
+    // „hat repostet“ steht oft erst nach dem Scrollen im Beitrag.
+    function rereadOnReadingLine() {
+        const top = topReadingPost();
+        if (!top || !top.element) return top;
+        const cached = repostCache.get(top.element);
+        if (cached && !cached.isRepost) repostCache.delete(top.element);
+        return readArticle(top.element) || top;
+    }
+
+    function promoteNewerOnReadingLine() {
+        if (!readingOn() || phase !== 'idle' || Date.now() < programmaticUntil) return;
+        if (Date.now() < blockTopMarkUntil && nearTop()) return;
+        const top = rereadOnReadingLine();
+        if (!top || (bookmark && !isCandidateNewer(top, bookmark))) return;
+        void adopt(top, false);
+    }
+
+    function armUpRecheck() {
+        for (const timer of upSettleTimers) clearTimeout(timer);
+        upSettleTimers = UP_RECHECK_MS.map((delay) => setTimeout(() => {
+            if (!upIntentFresh() || phase !== 'idle') return;
+            promoteNewerOnReadingLine();
+        }, delay));
+    }
+
+    // Rad, Tastatur oder ein echter Schritt nach oben. Ein späteres Nach-unten
+    // durch den nachgeladenen Post löscht die Richtung nicht.
+    function noteUpIntent() {
+        if (phase !== 'idle' || !readingOn() || Date.now() < programmaticUntil) return;
+        downWheelPx = 0;
+        upIntentUntil = Date.now() + UP_INTENT_MS;
+        armUpRecheck();
+    }
+
+    function noteRawScroll() {
+        if (!readingOn() || phase !== 'idle' || Date.now() < programmaticUntil) return;
+        const y = scrollOffset();
+        if (lastRawScrollY === null) {
+            lastRawScrollY = y;
+            lastScrollY = y;
+            return;
+        }
+        const delta = y - lastRawScrollY;
+        lastRawScrollY = y;
+        if (delta < -SCROLL_DEAD_PX) noteUpIntent();
+    }
+
+    function wheelPixels(event) {
+        const dy = event.deltaY || 0;
+        if (event.deltaMode === 1) return dy * 16;
+        if (event.deltaMode === 2) return dy * (window.innerHeight || 800);
+        return dy;
+    }
+
     function onUserScroll(event) {
         if (!onHome()) return;
         noteScroller(event);
@@ -2045,36 +2119,45 @@
         lastUserInputAt = Date.now();
         const delta = y - lastScrollY;
         lastScrollY = y;
+        if (delta < -SCROLL_DEAD_PX) noteUpIntent();
+        const wentUp = upIntentFresh();
         const arrivedTop = atTop() || nearTop();
-        if (Math.abs(delta) < SCROLL_DEAD_PX) {
+        if (!wentUp && Math.abs(delta) < SCROLL_DEAD_PX) {
             showBookmark();
             if (arrivedTop) tryPill();
             return;
         }
-        if (Date.now() < blockTopMarkUntil && nearTop()) {
+        if (!wentUp && Date.now() < blockTopMarkUntil && nearTop()) {
             showBookmark();
             if (arrivedTop) tryPill();
             return;
         }
-        if (delta < 0) {
-            const top = topReadingPost();
-            if (top && (!bookmark || isCandidateNewer(top, bookmark))) {
-                void adopt(top, false);
-                if (arrivedTop) tryPill();
-                return;
-            }
+        if (wentUp) {
+            promoteNewerOnReadingLine();
+            showBookmark();
+            if (arrivedTop) tryPill();
+            return;
         }
         showBookmark();
         if (arrivedTop) tryPill();
     }
 
     function onWheel(event) {
-        if (event && event.isTrusted === false) return;
+        if (!event || event.isTrusted === false || event.ctrlKey) return;
         lastUserInputAt = Date.now();
-        if (phase === 'idle') return;
-        cancelFlow();
-        programmaticUntil = 0;
-        blockTopMarkUntil = 0;
+        if (phase !== 'idle') {
+            cancelFlow();
+            programmaticUntil = 0;
+            blockTopMarkUntil = 0;
+            clearUpIntent();
+            return;
+        }
+        const dy = wheelPixels(event);
+        if (dy < -1) noteUpIntent();
+        else if (dy > 1 && upIntentFresh()) {
+            downWheelPx += dy;
+            if (downWheelPx > DOWN_WHEEL_CANCEL_PX) clearUpIntent();
+        }
     }
 
     const debouncedScroll = debounce(onUserScroll, 150);
@@ -2255,7 +2338,7 @@
         await loadStoredBookmark();
         const account = readUserHandleFromNav() || cachedUserHandle;
         if (isPlausibleUserHandle(account)) bootedAccount = account;
-        log('Init', 'Lesestelle 2026.10.21a');
+        log('Init', 'Lesestelle 2026.10.21b');
         syncTab('boot');
         if (bookmark && bookmark.tweetId && followingTab !== false && takeSeekAfterRefresh()) {
             log('Search', 'Nach dem Auffrischen die Lesestelle suchen');
@@ -2274,6 +2357,7 @@
             listenersBound = true;
             document.addEventListener('scroll', (event) => {
                 noteScroller(event);
+                noteRawScroll();
                 debouncedScroll(event);
             }, true);
             document.addEventListener('click', onTabClick, true);
