@@ -15,7 +15,7 @@
 // @description:ko Twitter/X에서 마지막 읽기 위치를 추적하고 동기화합니다. 수동 및 자동 옵션 포함. 새로운 게시물을 확인하면서 현재 위치를 잃지 않도록 이상적입니다. 트윗 ID를 사용하여 정확한 위치 지정을 하고, 리포스트를 지원합니다。
 // @icon https://x.com/favicon.ico
 // @namespace https://github.com/Copiis/x-leseposition-medien-download
-// @version 2026.10.21c
+// @version 2026.10.23b
 // @author Copiis
 // @license MIT
 // @match https://x.com/*
@@ -59,6 +59,8 @@
             postDeletedFallback: "ℹ️ Post possibly deleted - using closest post by timestamp.",
             newPostsDetectionDelayed: "ℹ️ No new posts detected after checking. Please refresh or scroll to load them.",
             autoDownloadToggled: "ℹ️ Auto-download {status}.",
+            searchToggled: "ℹ️ Search {status}.",
+            searchDisabled: "ℹ️ Search is off. Right-click the magnifier to turn it back on.",
             enabled: "enabled",
             disabled: "disabled",
             fallbackSearchCancelled: "ℹ️ Fallback search cancelled.",
@@ -93,6 +95,8 @@
             postDeletedFallback: "ℹ️ Beitrag möglicherweise gelöscht - verwende zeitlich nächsten Post.",
             newPostsDetectionDelayed: "ℹ️ Keine neuen Beiträge nach Prüfung erkannt. Bitte die Seite aktualisieren oder scrollen, um sie zu laden.",
             autoDownloadToggled: "ℹ️ Automatischer Download {status}.",
+            searchToggled: "ℹ️ Suche {status}.",
+            searchDisabled: "ℹ️ Suche ist aus. Rechtsklick auf die Lupe schaltet sie wieder an.",
             enabled: "aktiviert",
             disabled: "deaktiviert",
             fallbackSearchCancelled: "ℹ️ Fallback-Suche abgebrochen.",
@@ -424,6 +428,8 @@
     const JUMP_GAP_MS = 40;
     const EMPTY_WAITS_MAX = 8;
     const NEAR_MS = 90 * 60 * 1000;
+    // Bevor der zeitnächste Post die Lesestelle ersetzt: noch so viele Beiträge darunter prüfen.
+    const FALLBACK_LOOKAHEAD_POSTS = 3;
     const NEWER_SLACK_MS = 60 * 1000;
     // Feinschritte erst, wenn der sichtbare Rand nah an der Lesestelle ist.
     const NEAR_ZONE_MS = 30 * 60 * 1000;
@@ -447,6 +453,7 @@
     const REPOST_LOG_KEY = (account) => 'repostLog_' + account;
     const TIMELINE_MAP_KEY = (account) => 'timelineMap_' + account;
     const AUTO_DOWNLOAD_KEY = 'autoDownloadEnabled';
+    const SEARCH_ENABLED_KEY = 'searchEnabled';
     const MAX_DOWNLOADED_POSTS = 2000;
 
     const EXTRA = {
@@ -1156,6 +1163,7 @@
     let followingTab = null;
     let followingArmAt = 0;
     let autoDownloadEnabled = false;
+    let searchEnabled = true;
     let downloadedPosts = new Set();
     let highlighted = null;
     let columnObserver = null;
@@ -1720,7 +1728,7 @@
             if (gen === generation) phase = 'idle';
             return;
         }
-        if (changed && feedStale && target && target.tweetId && markSeekAfterRefresh()) {
+        if (searchEnabled && changed && feedStale && target && target.tweetId && markSeekAfterRefresh()) {
             feedStale = false;
             log('NewPosts', 'Tab auffrischen, danach Lesestelle suchen');
             location.reload();
@@ -1733,7 +1741,7 @@
         }
         bookmark = target;
         blockTopMarkUntil = Date.now() + 1800;
-        if (target && target.tweetId) {
+        if (searchEnabled && target && target.tweetId) {
             await seekBookmark('pill', { silent: true, generationHint: gen });
         }
         if (gen === generation && phase === 'pill') phase = 'idle';
@@ -1774,6 +1782,63 @@
         return topmost;
     }
 
+    // Der zeitnächste Post ist zentriert, die echte Tweet-ID fehlt noch.
+    // Zwei Beiträge darunter reichen. Drei zählen, damit der zweite sicher im DOM hängt.
+    // Ohne Treffer geht der Fallback wieder auf die Lesezeile.
+    async function probeBookmarkBelow(gen) {
+        const start = scrollOffset();
+        const vh = window.innerHeight || 800;
+        const cap = Math.round(vh * 2);
+        let moved = 0;
+        let stalls = 0;
+        let advanced = 0;
+        let lastTail = tailKey();
+        log('Search', 'Unter dem Fallback noch nach der Lesestelle sehen');
+        while (advanced < FALLBACK_LOOKAHEAD_POSTS && moved < cap) {
+            if (gen !== generation || seekCancel || !readingOn()) return 'abort';
+            const exact = findArticle(bookmark);
+            if (exact) return exact;
+            const here = scrollOffset();
+            const before = visibleSignature();
+            const beforeTail = tailKey();
+            const step = Math.min(FINE_STEP_PX, cap - moved);
+            if (step < 24) break;
+            scrollByDelta(step);
+            moved += step;
+            await waitForLoad(CLOSE_LOAD_WAIT_MS, before, beforeTail);
+            if (gen !== generation || seekCancel || !readingOn()) return 'abort';
+            const tail = tailKey();
+            if (tail && tail !== lastTail) {
+                advanced += 1;
+                lastTail = tail;
+                stalls = 0;
+            } else if (Math.abs(scrollOffset() - here) < 24) {
+                stalls += 1;
+                if (stalls >= 3) break;
+            }
+        }
+        if (gen !== generation || seekCancel || !readingOn()) return 'abort';
+        const exact = findArticle(bookmark);
+        if (exact) return exact;
+        const back = start - scrollOffset();
+        if (back < -24) {
+            scrollByDelta(back);
+            await sleep(80);
+        }
+        if (gen !== generation || seekCancel || !readingOn()) return 'abort';
+        return null;
+    }
+
+    async function centerExactBookmark(el, gen) {
+        highlight(el);
+        await placeOnReadingLine(el, gen);
+        if (gen !== generation || seekCancel || !readingOn()) return 'abort';
+        const live = findArticle(bookmark) || (el.isConnected ? el : null);
+        if (live) highlight(live);
+        log('Search', 'Lesestelle lag unter dem Fallback');
+        return 'same';
+    }
+
     // Die gespeicherte ID fehlt. Nimm dieselbe ID, sonst den Beitrag auf der
     // Lesezeile, wenn er zeitlich mit dem nächsten gleichauf liegt, sonst den
     // zeitnächsten sichtbaren Originalbeitrag.
@@ -1812,12 +1877,36 @@
         highlight(el);
         await placeOnReadingLine(el, gen);
         if (gen !== generation || seekCancel || !readingOn()) return 'abort';
+        if (!same) {
+            let exact = findArticle(bookmark);
+            if (!exact && scrollRoomBelow() > 80) {
+                const probed = await probeBookmarkBelow(gen);
+                if (probed === 'abort') return 'abort';
+                exact = probed;
+            }
+            if (exact) return centerExactBookmark(exact, gen);
+        }
+        if (gen !== generation || seekCancel || !readingOn()) return 'abort';
         let live = el.isConnected ? el : null;
         if (!live && post && post.tweetId) {
             const want = String(post.tweetId);
             live = feedArticles().find((node) => String(getPostTweetId(node) || '') === want) || null;
         }
         if (!live && atBookmark) live = elementOnReadingLine();
+        if (live && !same) {
+            const rect = live.getBoundingClientRect();
+            if (rect.height < 5 || Math.abs(rect.top - READING_LINE_PX) > ALIGN_TOLERANCE_PX) {
+                highlight(live);
+                await placeOnReadingLine(live, gen);
+                if (gen !== generation || seekCancel || !readingOn()) return 'abort';
+                const revealed = findArticle(bookmark);
+                if (revealed) return centerExactBookmark(revealed, gen);
+                if (!live.isConnected && post && post.tweetId) {
+                    const want = String(post.tweetId);
+                    live = feedArticles().find((node) => String(getPostTweetId(node) || '') === want) || null;
+                }
+            }
+        }
         if (live) highlight(live);
         if (!same && post && post.tweetId) {
             const fresh = (live && readArticle(live)) || post;
@@ -1841,6 +1930,10 @@
     async function seekBookmark(reason, options = {}) {
         const silent = options.silent === true;
         const reportMiss = options.reportMiss !== false;
+        if (!searchEnabled) {
+            if (reason === 'lupe') showPopup('searchDisabled', 4000);
+            return;
+        }
         if (!bookmark || !bookmark.tweetId) {
             if (!silent) showPopup('searchNoPosition', 5000);
             return;
@@ -1873,6 +1966,7 @@
         let lastJump = 0;
         let lastDir = 0;
         let placeMisses = 0;
+        let probedBelow = false;
         const still = () => gen === generation && !seekCancel && readingOn();
         const centerExact = async (el) => {
             const placed = await placeOnReadingLine(el, gen);
@@ -1936,6 +2030,12 @@
                     const vh = vhNow;
                     let found = null;
                     if (zone !== 'passed') found = await scanForBookmark(gen, 1, Math.round(vh * 0.85));
+                    if (!found && zone !== 'passed' && !probedBelow && still() && scrollRoomBelow() > 80) {
+                        probedBelow = true;
+                        const probed = await probeBookmarkBelow(gen);
+                        if (probed === 'abort') return;
+                        if (probed) found = probed;
+                    }
                     if (!found && still()) {
                         const back = Math.max(Math.round(vh * 2), lastJump + Math.round(vh * 0.5));
                         found = await scanForBookmark(gen, -1, Math.min(back, Math.round(vh * 8)));
@@ -2124,11 +2224,21 @@
         return readArticle(top.element) || top;
     }
 
+    // Die Oberkante muss im Bild liegen. Ein hoher Post, dessen Anfang noch
+    // darüber hängt, wird noch nicht zur Lesestelle.
+    function topEdgeInView(el) {
+        if (!el || !el.isConnected) return false;
+        const rect = el.getBoundingClientRect();
+        const vh = window.innerHeight || 800;
+        return rect.height >= 5 && rect.top >= 0 && rect.top < vh;
+    }
+
     function promoteNewerOnReadingLine() {
         if (!readingOn() || phase !== 'idle' || Date.now() < programmaticUntil) return;
         if (Date.now() < blockTopMarkUntil && nearTop()) return;
         const top = rereadOnReadingLine();
-        if (!top || (bookmark && !isCandidateNewer(top, bookmark))) return;
+        if (!top || !topEdgeInView(top.element)) return;
+        if (bookmark && !isCandidateNewer(top, bookmark)) return;
         void adopt(top, false);
     }
 
@@ -2350,8 +2460,10 @@
         const account = await getCurrentUserHandle();
         if (!isPlausibleUserHandle(account)) return;
         autoDownloadEnabled = GM_getValue(AUTO_DOWNLOAD_KEY, false) === true;
+        loadSearchEnabled();
         downloadedPosts = new Set(capDownloadedPostList(GM_getValue('downloadedPosts', [])));
         updateAutoSaveButtonVisual();
+        updateSearchButtonVisual();
         let position = null;
         try {
             const raw = GM_getValue(STORAGE_KEY(account), null);
@@ -2403,9 +2515,9 @@
         await loadStoredBookmark();
         const account = readUserHandleFromNav() || cachedUserHandle;
         if (isPlausibleUserHandle(account)) bootedAccount = account;
-        log('Init', 'Lesestelle 2026.10.21c');
+        log('Init', 'Lesestelle 2026.10.23b');
         syncTab('boot');
-        if (bookmark && bookmark.tweetId && followingTab !== false && takeSeekAfterRefresh()) {
+        if (searchEnabled && bookmark && bookmark.tweetId && followingTab !== false && takeSeekAfterRefresh()) {
             log('Search', 'Nach dem Auffrischen die Lesestelle suchen');
             showBookmark();
             watchTabs(8);
@@ -2438,6 +2550,9 @@
             });
             setInterval(tick, 3000);
             createButtons();
+            if (typeof GM_registerMenuCommand === 'function') {
+                GM_registerMenuCommand('Suche an/aus', () => toggleSearch());
+            }
         }
         void bootReading();
     }
@@ -2721,6 +2836,46 @@
         await downloadBookmark(true);
     }
 
+    function loadSearchEnabled() {
+        searchEnabled = GM_getValue(SEARCH_ENABLED_KEY, true) !== false;
+    }
+
+    function toggleSearch() {
+        searchEnabled = !searchEnabled;
+        GM_setValue(SEARCH_ENABLED_KEY, searchEnabled);
+        if (!searchEnabled) cancelFlow();
+        updateSearchButtonVisual();
+        log('UI', 'Suche ' + (searchEnabled ? 'an' : 'aus'));
+        showPopup('searchToggled', 4000, {
+            status: userText(searchEnabled ? 'enabled' : 'disabled')
+        });
+    }
+
+    function updateSearchButtonVisual() {
+        const btn = window.searchToggleBtn;
+        if (!btn) return;
+        while (btn.firstChild) btn.removeChild(btn.firstChild);
+        const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+        svg.setAttribute('width', '22');
+        svg.setAttribute('height', '22');
+        svg.setAttribute('viewBox', '0 0 24 24');
+        svg.setAttribute('fill', 'none');
+        svg.setAttribute('stroke', searchEnabled ? '#ffffff' : '#ff6b6b');
+        svg.setAttribute('stroke-width', '2');
+        svg.setAttribute('stroke-linecap', 'round');
+        svg.setAttribute('stroke-linejoin', 'round');
+        svg.innerHTML = searchEnabled
+            ? '<circle cx="11" cy="11" r="7"></circle><line x1="16.5" y1="16.5" x2="21" y2="21"></line>'
+            : '<circle cx="11" cy="11" r="7"></circle><line x1="16.5" y1="16.5" x2="21" y2="21"></line><line x1="5" y1="5" x2="19" y2="19"></line>';
+        btn.style.opacity = searchEnabled ? '1' : '0.5';
+        btn.appendChild(svg);
+        const title = searchEnabled
+            ? 'Suche: AN — Klick sucht, Rechtsklick schaltet aus'
+            : 'Suche: AUS — Rechtsklick schaltet wieder an';
+        btn.title = title;
+        btn.setAttribute('aria-label', title);
+    }
+
     function toggleAutoSave() {
         autoDownloadEnabled = !autoDownloadEnabled;
         GM_setValue(AUTO_DOWNLOAD_KEY, autoDownloadEnabled);
@@ -2805,23 +2960,27 @@
             box.style.display = 'flex';
             box.style.flexDirection = 'column';
             const buttons = [
-                ['search', 'Start manual search', () => {
-                    if (followingTab === false) {
-                        showPopup('needFollowing', 5000);
-                        return;
-                    }
-                    void seekBookmark('lupe');
-                }],
+                ['search', 'Suche', () => { void seekBookmark('lupe'); }],
                 ['save', 'Save current position', () => { void saveCurrentByHand(); }],
                 ['load', 'Load last read position', () => loadBookmarkFromFile()],
                 ['toggle', 'Toggle auto-save', () => toggleAutoSave()]
             ];
             buttons.forEach((entry, index) => {
                 const btn = createButton(entry[0], entry[1], entry[2]);
+                if (index === 0) {
+                    window.searchToggleBtn = btn;
+                    btn.addEventListener('contextmenu', (event) => {
+                        event.preventDefault();
+                        event.stopPropagation();
+                        toggleSearch();
+                    });
+                }
                 if (index === 3) window.autoSaveToggleBtn = btn;
                 box.appendChild(btn);
             });
             document.body.appendChild(box);
+            loadSearchEnabled();
+            updateSearchButtonVisual();
             updateAutoSaveButtonVisual();
         };
         if (document.body) mount();
