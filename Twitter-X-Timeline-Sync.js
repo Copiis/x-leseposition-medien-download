@@ -15,7 +15,7 @@
 // @description:ko Twitter/X에서 마지막 읽기 위치를 추적하고 동기화합니다. 수동 및 자동 옵션 포함. 새로운 게시물을 확인하면서 현재 위치를 잃지 않도록 이상적입니다. 트윗 ID를 사용하여 정확한 위치 지정을 하고, 리포스트를 지원합니다。
 // @icon https://x.com/favicon.ico
 // @namespace https://github.com/Copiis/x-leseposition-medien-download
-// @version 2026.10.23c
+// @version 2026.10.23d
 // @author Copiis
 // @license MIT
 // @match https://x.com/*
@@ -441,6 +441,8 @@
     const UP_INTENT_MS = 1600;
     const UP_RECHECK_MS = [400, 1000, 1500];
     const DOWN_WHEEL_CANCEL_PX = 80;
+    // Ein leichtes Touchpad während der Suche scrollt mit, bricht sie aber nicht ab.
+    const SEEK_WHEEL_CANCEL_PX = 160;
     const SMALL_SVG_MAX = 22;
     const IMPORT_FILE_MAX_BYTES = 2 * 1024 * 1024;
     const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
@@ -1154,7 +1156,9 @@
     let lastRawScrollY = null;
     let upIntentUntil = 0;
     let downWheelPx = 0;
+    let seekWheelPx = 0;
     let upSettleTimers = [];
+    let bookmarkReady = false;
     // Neuerer Post auf der Lesezeile, dessen Oberkante noch über dem Bild hing.
     let pendingNewerId = null;
     let pendingTimers = [];
@@ -1954,6 +1958,9 @@
         const gen = options.generationHint || (++generation);
         phase = 'seek';
         seekCancel = false;
+        seekWheelPx = 0;
+        clearUpIntent();
+        clearPendingNewer();
         holdAnchor();
         if (!silent) {
             showPopup('searchPopup', 5000, {
@@ -2159,6 +2166,8 @@
         phase = 'idle';
         programmaticUntil = Date.now() + 800;
         blockTopMarkUntil = Date.now() + 1800;
+        clearUpIntent();
+        clearPendingNewer();
         const finishedAt = Date.now();
         let anchorY = scrollOffset();
         showBookmark();
@@ -2253,7 +2262,7 @@
     // Hochscrollen merkt sich den neueren Post, bis seine Oberkante ins Bild kommt.
     // Ein Ruck nach unten löscht das nicht, solange derselbe Post auf der Lesezeile liegt.
     function promoteNewerOnReadingLine() {
-        if (!readingOn() || phase !== 'idle' || Date.now() < programmaticUntil) return;
+        if (!bookmarkReady || !readingOn() || phase !== 'idle' || Date.now() < programmaticUntil) return;
         if (Date.now() < blockTopMarkUntil && nearTop()) return;
         const top = rereadOnReadingLine();
         if (!top || !top.tweetId) return;
@@ -2353,14 +2362,24 @@
 
     function onWheel(event) {
         if (!event || event.isTrusted === false || event.ctrlKey) return;
-        lastUserInputAt = Date.now();
         if (phase !== 'idle') {
+            const dy = wheelPixels(event);
+            if (!dy) return;
+            if ((seekWheelPx > 0 && dy < 0) || (seekWheelPx < 0 && dy > 0)) seekWheelPx = 0;
+            seekWheelPx += dy;
+            if (Math.abs(seekWheelPx) < SEEK_WHEEL_CANCEL_PX) return;
+            seekWheelPx = 0;
             cancelFlow();
-            programmaticUntil = 0;
-            blockTopMarkUntil = 0;
+            programmaticUntil = Date.now() + 800;
+            blockTopMarkUntil = Date.now() + 1800;
             clearUpIntent();
+            clearPendingNewer();
+            showPopup('searchCancelled', 2500);
+            log('Search', 'Scrollen bricht die Suche ab');
             return;
         }
+        seekWheelPx = 0;
+        lastUserInputAt = Date.now();
         const dy = wheelPixels(event);
         if (dy < -1) noteUpIntent();
         else if (dy > 1 && upIntentFresh()) {
@@ -2520,6 +2539,7 @@
         if (!position || !position.tweetId || !position.authorHandler || !position.timestamp) {
             bookmark = null;
             loadMap(account);
+            bookmarkReady = true;
             return;
         }
         if (!position.readAt) position.readAt = position.timestamp;
@@ -2535,6 +2555,7 @@
             GM_setValue(HISTORY_KEY(account), filtered);
         } catch (e) { /* Historie bleibt */ }
         loadMap(account);
+        bookmarkReady = true;
         log('Init', 'Lesestelle geladen @' + bookmark.authorHandler, bookmark.tweetId);
     }
 
@@ -2549,7 +2570,7 @@
         await loadStoredBookmark();
         const account = readUserHandleFromNav() || cachedUserHandle;
         if (isPlausibleUserHandle(account)) bootedAccount = account;
-        log('Init', 'Lesestelle 2026.10.23c');
+        log('Init', 'Lesestelle 2026.10.23d');
         syncTab('boot');
         if (searchEnabled && bookmark && bookmark.tweetId && followingTab !== false && takeSeekAfterRefresh()) {
             log('Search', 'Nach dem Auffrischen die Lesestelle suchen');
