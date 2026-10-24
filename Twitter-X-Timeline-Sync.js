@@ -15,7 +15,7 @@
 // @description:ko Twitter/X에서 마지막 읽기 위치를 추적하고 동기화합니다. 수동 및 자동 옵션 포함. 새로운 게시물을 확인하면서 현재 위치를 잃지 않도록 이상적입니다. 트윗 ID를 사용하여 정확한 위치 지정을 하고, 리포스트를 지원합니다。
 // @icon https://x.com/favicon.ico
 // @namespace https://github.com/Copiis/x-leseposition-medien-download
-// @version 2026.10.23d
+// @version 2026.10.24a
 // @author Copiis
 // @license MIT
 // @match https://x.com/*
@@ -446,9 +446,6 @@
     const SMALL_SVG_MAX = 22;
     const IMPORT_FILE_MAX_BYTES = 2 * 1024 * 1024;
     const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
-    // Nach langem Wegsein ist die virtuelle Timeline verzogen. Erst neu laden, dann suchen.
-    const STALE_AWAY_MS = 10 * 60 * 1000;
-    const REFRESH_SEEK_KEY = 'xTimelineSeekAfterRefresh';
 
     const STORAGE_KEY = (account) => 'lastReadPost_' + account;
     const HISTORY_KEY = (account) => 'postHistory_' + account;
@@ -1179,8 +1176,6 @@
     let bootedAccount = null;
     let lastNewPostArm = 0;
     let newPostCheckTimers = [];
-    let awayAt = 0;
-    let feedStale = false;
     let mapAccount = null;
     let orderedKeys = [];
     const mapEntries = new Map();
@@ -1730,15 +1725,9 @@
             if (gen === generation) phase = 'idle';
             return;
         }
-        const changed = await waitForLoad(feedStale ? 2500 : 800, beforeClick, beforeTail);
+        const changed = await waitForLoad(800, beforeClick, beforeTail);
         if (gen !== generation || seekCancel || !readingOn()) {
             if (gen === generation) phase = 'idle';
-            return;
-        }
-        if (searchEnabled && changed && feedStale && target && target.tweetId && markSeekAfterRefresh()) {
-            feedStale = false;
-            log('NewPosts', 'Tab auffrischen, danach Lesestelle suchen');
-            location.reload();
             return;
         }
         if (changed) await waitForSignatureSettle(700);
@@ -2419,50 +2408,18 @@
         tryPill();
     }
 
-    function noteAway() {
-        if (!awayAt) awayAt = Date.now();
-    }
-
-    function noteBack() {
-        if (!awayAt) return;
-        if (Date.now() - awayAt >= STALE_AWAY_MS) feedStale = true;
-        awayAt = 0;
-    }
-
-    function markSeekAfterRefresh() {
-        try {
-            sessionStorage.setItem(REFRESH_SEEK_KEY, '1');
-            return true;
-        } catch (e) {
-            return false;
-        }
-    }
-
-    function takeSeekAfterRefresh() {
-        try {
-            if (sessionStorage.getItem(REFRESH_SEEK_KEY) !== '1') return false;
-            sessionStorage.removeItem(REFRESH_SEEK_KEY);
-            return true;
-        } catch (e) {
-            return false;
-        }
-    }
-
     function onWindowFocus() {
-        noteBack();
         if (!document.hasFocus()) return;
         armNewPostCheck('fokus');
     }
 
     function onVisibility() {
         if (document.visibilityState === 'hidden') {
-            noteAway();
             clearNewPostChecks();
             persistMap();
             maybeAutoDownload();
             return;
         }
-        noteBack();
         armNewPostCheck('sichtbar');
     }
 
@@ -2570,15 +2527,8 @@
         await loadStoredBookmark();
         const account = readUserHandleFromNav() || cachedUserHandle;
         if (isPlausibleUserHandle(account)) bootedAccount = account;
-        log('Init', 'Lesestelle 2026.10.23d');
+        log('Init', 'Lesestelle 2026.10.24a');
         syncTab('boot');
-        if (searchEnabled && bookmark && bookmark.tweetId && followingTab !== false && takeSeekAfterRefresh()) {
-            log('Search', 'Nach dem Auffrischen die Lesestelle suchen');
-            showBookmark();
-            watchTabs(8);
-            void seekBookmark('auffrischen');
-            return;
-        }
         if (readingOn()) armNewPostCheck('start');
         showBookmark();
         watchTabs(8);
@@ -2597,7 +2547,6 @@
             document.addEventListener('visibilitychange', onVisibility);
             window.addEventListener('keydown', onSearchKey, true);
             window.addEventListener('focus', onWindowFocus);
-            window.addEventListener('blur', () => noteAway());
             window.addEventListener('blur', debounce(maybeAutoDownload, 1000));
             window.addEventListener('beforeunload', () => {
                 persistMap();
