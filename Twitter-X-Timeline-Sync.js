@@ -15,7 +15,7 @@
 // @description:ko Twitter/X에서 마지막 읽기 위치를 추적하고 동기화합니다. 수동 및 자동 옵션 포함. 새로운 게시물을 확인하면서 현재 위치를 잃지 않도록 이상적입니다. 트윗 ID를 사용하여 정확한 위치 지정을 하고, 리포스트를 지원합니다。
 // @icon https://x.com/favicon.ico
 // @namespace https://github.com/Copiis/x-leseposition-medien-download
-// @version 2026.10.25c
+// @version 2026.10.25d
 // @author Copiis
 // @license MIT
 // @match https://x.com/*
@@ -740,11 +740,54 @@
         return false;
     }
 
+    // Zitat und verschachtelter Beitrag gehören nicht zum äußeren Post.
+    function isInsideQuote(node, post) {
+        if (!node || !post) return false;
+        const nested = node.closest("article[data-testid='tweet']");
+        if (nested && nested !== post) return true;
+        let parent = node.parentElement;
+        while (parent && parent !== post) {
+            const test = parent.getAttribute && parent.getAttribute('data-testid');
+            if (test === 'quoteTweet' || test === 'quote') return true;
+            parent = parent.parentElement;
+        }
+        return false;
+    }
+
+    function ownTime(post) {
+        if (!post) return null;
+        const times = Array.from(post.querySelectorAll('time[datetime]'));
+        const outer = times.filter((time) => !isInsideQuote(time, post));
+        const pool = outer.length ? outer : times;
+        let best = null;
+        let bestTop = Infinity;
+        for (const time of pool) {
+            const top = time.getBoundingClientRect().top;
+            if (top < bestTop) {
+                bestTop = top;
+                best = time;
+            }
+        }
+        return best;
+    }
+
     function getPostTweetId(post) {
         if (!post) return null;
-        const time = post.querySelector('time');
+        const time = ownTime(post);
         const timeLink = time && time.closest("a[href*='/status/']");
-        const linkElement = timeLink || post.querySelector("a[href*='/status/']");
+        let linkElement = timeLink && !isInsideQuote(timeLink, post) ? timeLink : null;
+        if (!linkElement) {
+            let bestTop = Infinity;
+            for (const link of post.querySelectorAll("a[href*='/status/']")) {
+                if (isInsideQuote(link, post)) continue;
+                const top = link.getBoundingClientRect().top;
+                if (top < bestTop) {
+                    bestTop = top;
+                    linkElement = link;
+                }
+            }
+        }
+        if (!linkElement) linkElement = post.querySelector("a[href*='/status/']");
         if (!linkElement) return null;
         const href = linkElement.getAttribute('href') || '';
         const match = href.match(/\/status\/(\d+)/);
@@ -796,7 +839,11 @@
                 handlerElement = allLinks.find((link) => !socialContext || !socialContext.contains(link)) || null;
             }
         } else {
-            handlerElement = post.querySelector("a[href^='/']:not([href*='/status/'])");
+            for (const link of post.querySelectorAll("a[href^='/']:not([href*='/status/'])")) {
+                if (isInsideQuote(link, post)) continue;
+                handlerElement = link;
+                break;
+            }
         }
         if (!handlerElement) return null;
         const href = handlerElement.getAttribute('href') || '';
@@ -809,7 +856,7 @@
 
     function getPostTimestamp(post) {
         if (!post) return null;
-        const timeElement = post.querySelector('time[datetime]');
+        const timeElement = ownTime(post);
         return timeElement ? timeElement.getAttribute('datetime') : null;
     }
 
@@ -836,7 +883,10 @@
 
     function feedArticles() {
         const column = document.querySelector("[data-testid='primaryColumn']") || document;
-        return Array.from(column.querySelectorAll("article[data-testid='tweet']"));
+        return Array.from(column.querySelectorAll("article[data-testid='tweet']")).filter((post) => {
+            const parent = post.parentElement;
+            return !(parent && parent.closest("article[data-testid='tweet']"));
+        });
     }
 
     function findArticle(bm) {
@@ -2514,14 +2564,16 @@
     function promoteNewerOnReadingLine() {
         if (!bookmarkReady || !readingOn() || phase !== 'idle' || Date.now() < programmaticUntil) return;
         if (Date.now() < blockTopMarkUntil && nearTop()) return;
-        const top = rereadOnReadingLine();
-        if (!top || !top.tweetId) return;
-        const newer = !bookmark || isCandidateNewer(top, bookmark);
-        const close = !newer && scrollUpCloseEnough(top, bookmark);
-        if (!newer && !close) {
+        const line = rereadOnReadingLine();
+        const marked = bookmark ? findArticle(bookmark) : null;
+        const aboveEl = marked ? articleAbove(marked) : null;
+        const above = aboveEl ? readArticle(aboveEl) : null;
+        const chosen = scrollUpChoice(line, above);
+        if (!chosen) {
             clearPendingNewer();
             return;
         }
+        const top = chosen.post;
         if (!topEdgeInView(top.element)) {
             if (upIntentFresh()) {
                 pendingNewerId = String(top.tweetId);
@@ -2532,8 +2584,37 @@
         const waiting = pendingNewerId === String(top.tweetId);
         if (!upIntentFresh() && !waiting) return;
         clearPendingNewer();
-        if (close) log('Save', 'Knapp ältere Stelle beim Hochscrollen', top.tweetId);
-        void adopt(top, close);
+        if (chosen.close) log('Save', 'Knapp ältere Stelle beim Hochscrollen', top.tweetId);
+        void adopt(top, chosen.close);
+    }
+
+    // Der Beitrag direkt über der markierten Lesestelle.
+    function articleAbove(el) {
+        const markTop = el.getBoundingClientRect().top;
+        let best = null;
+        let bestBottom = -Infinity;
+        for (const post of feedArticles()) {
+            if (post === el) continue;
+            const rect = post.getBoundingClientRect();
+            if (rect.height < 5 || rect.bottom > markTop + 4) continue;
+            if (rect.bottom > bestBottom) {
+                bestBottom = rect.bottom;
+                best = post;
+            }
+        }
+        return best;
+    }
+
+    function scrollUpChoice(line, above) {
+        const accept = (post) => {
+            if (!post || !post.tweetId || !post.element) return null;
+            if (bookmark && samePost(post, bookmark)) return null;
+            const newer = !bookmark || isCandidateNewer(post, bookmark);
+            const close = !newer && scrollUpCloseEnough(post, bookmark);
+            if (!newer && !close) return null;
+            return { post, close };
+        };
+        return accept(line) || accept(above);
     }
 
     function armUpRecheck() {
@@ -2796,7 +2877,7 @@
         await loadStoredBookmark();
         const account = readUserHandleFromNav() || cachedUserHandle;
         if (isPlausibleUserHandle(account)) bootedAccount = account;
-        log('Init', 'Lesestelle 2026.10.25c');
+        log('Init', 'Lesestelle 2026.10.25d');
         syncTab('boot');
         if (readingOn()) armNewPostCheck('start');
         showBookmark();
