@@ -15,7 +15,7 @@
 // @description:ko Twitter/X에서 마지막 읽기 위치를 추적하고 동기화합니다. 수동 및 자동 옵션 포함. 새로운 게시물을 확인하면서 현재 위치를 잃지 않도록 이상적입니다. 트윗 ID를 사용하여 정확한 위치 지정을 하고, 리포스트를 지원합니다。
 // @icon https://x.com/favicon.ico
 // @namespace https://github.com/Copiis/x-leseposition-medien-download
-// @version 2026.10.25e
+// @version 2026.10.25f
 // @author Copiis
 // @license MIT
 // @match https://x.com/*
@@ -392,7 +392,7 @@
     // Lesestelle — ein Ablauf
     // idle: mitlesen. pill: neue Posts laden. seek: gespeicherte Stelle suchen, markieren und auf die Lesezeile rücken.
     // Nur der Reiter „Folge ich“. „Für dich“ bleibt auf x.com/home und wird ignoriert.
-    // Eine laufende Suche bricht die Pille nicht ab. Space oder das Mausrad bricht sie ab.
+    // Eine laufende Suche bricht die Pille nicht ab. Space bricht sie ab.
     // =====================================================
 
     const DEBUG = false;
@@ -444,7 +444,7 @@
     const UP_RECHECK_MS = [400, 1000, 1500];
     const DOWN_WHEEL_CANCEL_PX = 80;
     // Ein leichtes Touchpad während der Suche scrollt mit, bricht sie aber nicht ab.
-    const SEEK_WHEEL_CANCEL_PX = 160;
+
     const SMALL_SVG_MAX = 22;
     const IMPORT_FILE_MAX_BYTES = 2 * 1024 * 1024;
     const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
@@ -1289,7 +1289,7 @@
     let lastRawScrollY = null;
     let upIntentUntil = 0;
     let downWheelPx = 0;
-    let seekWheelPx = 0;
+
     let upSettleTimers = [];
     let bookmarkReady = false;
     // Neuerer Post auf der Lesezeile, dessen Oberkante noch über dem Bild hing.
@@ -2193,7 +2193,6 @@
         const gen = options.generationHint || (++generation);
         phase = 'seek';
         seekCancel = false;
-        seekWheelPx = 0;
         clearUpIntent();
         clearPendingNewer();
         holdAnchor();
@@ -2719,23 +2718,7 @@
 
     function onWheel(event) {
         if (!event || event.isTrusted === false || event.ctrlKey) return;
-        if (phase !== 'idle') {
-            const dy = wheelPixels(event);
-            if (!dy) return;
-            if ((seekWheelPx > 0 && dy < 0) || (seekWheelPx < 0 && dy > 0)) seekWheelPx = 0;
-            seekWheelPx += dy;
-            if (Math.abs(seekWheelPx) < SEEK_WHEEL_CANCEL_PX) return;
-            seekWheelPx = 0;
-            cancelFlow();
-            programmaticUntil = Date.now() + 800;
-            blockTopMarkUntil = Date.now() + 1800;
-            clearUpIntent();
-            clearPendingNewer();
-            showPopup('searchCancelled', 2500);
-            log('Search', 'Scrollen bricht die Suche ab');
-            return;
-        }
-        seekWheelPx = 0;
+        if (phase !== 'idle') return;
         lastUserInputAt = Date.now();
         const dy = wheelPixels(event);
         if (dy < -1) noteUpIntent();
@@ -2904,7 +2887,7 @@
         await loadStoredBookmark();
         const account = readUserHandleFromNav() || cachedUserHandle;
         if (isPlausibleUserHandle(account)) bootedAccount = account;
-        log('Init', 'Lesestelle 2026.10.25e');
+        log('Init', 'Lesestelle 2026.10.25f');
         syncTab('boot');
         if (readingOn()) armNewPostCheck('start');
         showBookmark();
