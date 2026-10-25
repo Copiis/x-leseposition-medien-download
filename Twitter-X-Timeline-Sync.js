@@ -15,7 +15,7 @@
 // @description:ko Twitter/X에서 마지막 읽기 위치를 추적하고 동기화합니다. 수동 및 자동 옵션 포함. 새로운 게시물을 확인하면서 현재 위치를 잃지 않도록 이상적입니다. 트윗 ID를 사용하여 정확한 위치 지정을 하고, 리포스트를 지원합니다。
 // @icon https://x.com/favicon.ico
 // @namespace https://github.com/Copiis/x-leseposition-medien-download
-// @version 2026.10.25h
+// @version 2026.10.25i
 // @author Copiis
 // @license MIT
 // @match https://x.com/*
@@ -746,6 +746,43 @@
         return false;
     }
 
+    // Kopfzeile des äußeren Beitrags. Ein Video oder Zitat hat eine eigene.
+    function outerHeader(post) {
+        if (!post) return null;
+        let fallback = null;
+        for (const header of post.querySelectorAll("[data-testid='User-Name']")) {
+            if (isInsideQuote(header, post)) continue;
+            if (!fallback) fallback = header;
+            if (isMeasurable(header)) return header;
+        }
+        return fallback;
+    }
+
+    function isMeasurable(el) {
+        if (!el || !el.getBoundingClientRect) return false;
+        const rect = el.getBoundingClientRect();
+        return rect.width >= 2 && rect.height >= 2;
+    }
+
+    // Zitat, Video und Karte gehören nicht zum äußeren Post.
+    function isInsideEmbed(node, post) {
+        if (!node || !post) return false;
+        let parent = node.parentElement;
+        while (parent && parent !== post) {
+            const test = parent.getAttribute && parent.getAttribute('data-testid');
+            if (test === 'videoPlayer' || test === 'videoComponent' || test === 'card.wrapper'
+                || test === 'card.layoutLarge.media' || test === 'placementTracking') return true;
+            parent = parent.parentElement;
+        }
+        return false;
+    }
+
+    function statusIdFromLink(link) {
+        const href = (link && link.getAttribute && link.getAttribute('href')) || '';
+        const match = href.match(/\/status\/(\d+)/);
+        return match ? match[1] : null;
+    }
+
     // Zitat und verschachtelter Beitrag gehören nicht zum äußeren Post.
     function isInsideQuote(node, post) {
         if (!node || !post) return false;
@@ -762,12 +799,17 @@
 
     function ownTime(post) {
         if (!post) return null;
-        const times = Array.from(post.querySelectorAll('time[datetime]'));
-        const outer = times.filter((time) => !isInsideQuote(time, post));
-        const pool = outer.length ? outer : times;
+        const header = outerHeader(post);
+        if (header) {
+            const headerTime = header.querySelector('time[datetime]');
+            if (headerTime && !isInsideQuote(headerTime, post)) return headerTime;
+        }
+        const times = Array.from(post.querySelectorAll('time[datetime]')).filter((time) => {
+            return !isInsideQuote(time, post) && !isInsideEmbed(time, post) && isMeasurable(time);
+        });
         let best = null;
         let bestTop = Infinity;
-        for (const time of pool) {
+        for (const time of times) {
             const top = time.getBoundingClientRect().top;
             if (top < bestTop) {
                 bestTop = top;
@@ -779,25 +821,29 @@
 
     function getPostTweetId(post) {
         if (!post) return null;
+        const header = outerHeader(post);
+        if (header) {
+            const headerLink = header.querySelector("a[href*='/status/']");
+            const headerId = statusIdFromLink(headerLink);
+            if (headerId && !isInsideQuote(headerLink, post)) return headerId;
+        }
         const time = ownTime(post);
         const timeLink = time && time.closest("a[href*='/status/']");
-        let linkElement = timeLink && !isInsideQuote(timeLink, post) ? timeLink : null;
-        if (!linkElement) {
-            let bestTop = Infinity;
-            for (const link of post.querySelectorAll("a[href*='/status/']")) {
-                if (isInsideQuote(link, post)) continue;
-                const top = link.getBoundingClientRect().top;
-                if (top < bestTop) {
-                    bestTop = top;
-                    linkElement = link;
-                }
+        if (timeLink && !isInsideQuote(timeLink, post) && !isInsideEmbed(timeLink, post)) {
+            const timeId = statusIdFromLink(timeLink);
+            if (timeId) return timeId;
+        }
+        let linkElement = null;
+        let bestTop = Infinity;
+        for (const link of post.querySelectorAll("a[href*='/status/']")) {
+            if (isInsideQuote(link, post) || isInsideEmbed(link, post) || !isMeasurable(link)) continue;
+            const top = link.getBoundingClientRect().top;
+            if (top < bestTop) {
+                bestTop = top;
+                linkElement = link;
             }
         }
-        if (!linkElement) linkElement = post.querySelector("a[href*='/status/']");
-        if (!linkElement) return null;
-        const href = linkElement.getAttribute('href') || '';
-        const match = href.match(/\/status\/(\d+)/);
-        return match ? match[1] : null;
+        return statusIdFromLink(linkElement);
     }
 
     function isRepost(postElement) {
@@ -845,10 +891,17 @@
                 handlerElement = allLinks.find((link) => !socialContext || !socialContext.contains(link)) || null;
             }
         } else {
-            for (const link of post.querySelectorAll("a[href^='/']:not([href*='/status/'])")) {
-                if (isInsideQuote(link, post)) continue;
-                handlerElement = link;
-                break;
+            const header = outerHeader(post);
+            const pools = [];
+            if (header) pools.push(header.querySelectorAll("a[href^='/']:not([href*='/status/'])"));
+            pools.push(post.querySelectorAll("a[href^='/']:not([href*='/status/'])"));
+            for (const pool of pools) {
+                for (const link of pool) {
+                    if (isInsideQuote(link, post) || isInsideEmbed(link, post)) continue;
+                    handlerElement = link;
+                    break;
+                }
+                if (handlerElement) break;
             }
         }
         if (!handlerElement) return null;
@@ -1370,7 +1423,7 @@
             !!a.isRepost === !!b.isRepost;
     }
 
-    // Ein Beitrag wird nur einmal zur Lesestelle, auch wenn er nur Minuten älter ist.
+    // Eine knapp ältere Stelle nur einmal. Ein neuerer Beitrag darüber darf wieder gesetzt werden.
     const usedLesestellen = new Set();
 
     function lesestelleKey(post) {
@@ -1636,7 +1689,8 @@
             if (post.element) highlight(post.element);
             return true;
         }
-        if (wasLesestelle(record) && !(bookmark && samePost(record, bookmark))) {
+        const newerThanCurrent = !bookmark || isCandidateNewer(record, bookmark);
+        if (wasLesestelle(record) && !newerThanCurrent && !(bookmark && samePost(record, bookmark))) {
             log('Save', 'Lesestelle schon gesetzt', record.tweetId);
             return false;
         }
@@ -2762,10 +2816,10 @@
         const accept = (post) => {
             if (!post || !post.tweetId || !post.element) return null;
             if (bookmark && samePost(post, bookmark)) return null;
-            if (wasLesestelle(post)) return null;
             const newer = !bookmark || isCandidateNewer(post, bookmark);
             const close = !newer && scrollUpCloseEnough(post, bookmark);
             if (!newer && !close) return null;
+            if (!newer && wasLesestelle(post)) return null;
             return { post, close };
         };
         return accept(line) || accept(above);
@@ -3018,7 +3072,7 @@
         await loadStoredBookmark();
         const account = readUserHandleFromNav() || cachedUserHandle;
         if (isPlausibleUserHandle(account)) bootedAccount = account;
-        log('Init', 'Lesestelle 2026.10.25h');
+        log('Init', 'Lesestelle 2026.10.25i');
         syncTab('boot');
         if (readingOn()) armNewPostCheck('start');
         showBookmark();
