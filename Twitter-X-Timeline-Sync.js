@@ -15,7 +15,7 @@
 // @description:ko Twitter/X에서 마지막 읽기 위치를 추적하고 동기화합니다. 수동 및 자동 옵션 포함. 새로운 게시물을 확인하면서 현재 위치를 잃지 않도록 이상적입니다. 트윗 ID를 사용하여 정확한 위치 지정을 하고, 리포스트를 지원합니다。
 // @icon https://x.com/favicon.ico
 // @namespace https://github.com/Copiis/x-leseposition-medien-download
-// @version 2026.10.25d
+// @version 2026.10.25e
 // @author Copiis
 // @license MIT
 // @match https://x.com/*
@@ -1339,6 +1339,24 @@
             !!a.isRepost === !!b.isRepost;
     }
 
+    // Ein Beitrag wird nur einmal zur Lesestelle, auch wenn er nur Minuten älter ist.
+    const usedLesestellen = new Set();
+
+    function lesestelleKey(post) {
+        if (!post || !post.tweetId) return '';
+        return String(post.tweetId) + '-' + !!post.isRepost;
+    }
+
+    function rememberLesestelle(post) {
+        const key = lesestelleKey(post);
+        if (key) usedLesestellen.add(key);
+    }
+
+    function wasLesestelle(post) {
+        const key = lesestelleKey(post);
+        return !!key && usedLesestellen.has(key);
+    }
+
     // ---------- Landkarte, nur Gedächtnis und Export ----------
 
     function mapKeyOf(post) {
@@ -1562,6 +1580,7 @@
             if (history.length > HISTORY_MAX) history = history.slice(-HISTORY_MAX);
             GM_setValue(historyKey, history);
             rememberMap(record);
+            rememberLesestelle(record);
             return true;
         } catch (err) {
             log('Save', 'Fehler beim Speichern', err);
@@ -1585,6 +1604,10 @@
         if (!force && bookmark && samePost(record, bookmark)) {
             if (post.element) highlight(post.element);
             return true;
+        }
+        if (wasLesestelle(record) && !(bookmark && samePost(record, bookmark))) {
+            log('Save', 'Lesestelle schon gesetzt', record.tweetId);
+            return false;
         }
         if (!force && bookmark && !isCandidateNewer(record, bookmark)) return false;
         bookmark = record;
@@ -2609,6 +2632,7 @@
         const accept = (post) => {
             if (!post || !post.tweetId || !post.element) return null;
             if (bookmark && samePost(post, bookmark)) return null;
+            if (wasLesestelle(post)) return null;
             const newer = !bookmark || isCandidateNewer(post, bookmark);
             const close = !newer && scrollUpCloseEnough(post, bookmark);
             if (!newer && !close) return null;
@@ -2847,7 +2871,10 @@
         bookmark = position;
         try {
             const history = GM_getValue(HISTORY_KEY(account), []);
-            const revived = newerStoredMark(Array.isArray(history) ? history : [], bookmark);
+            const stored = Array.isArray(history) ? history : [];
+            for (const item of stored) rememberLesestelle(item);
+            rememberLesestelle(bookmark);
+            const revived = newerStoredMark(stored, bookmark);
             if (revived) {
                 bookmark = revived;
                 GM_setValue(STORAGE_KEY(account), JSON.stringify(revived));
@@ -2877,7 +2904,7 @@
         await loadStoredBookmark();
         const account = readUserHandleFromNav() || cachedUserHandle;
         if (isPlausibleUserHandle(account)) bootedAccount = account;
-        log('Init', 'Lesestelle 2026.10.25d');
+        log('Init', 'Lesestelle 2026.10.25e');
         syncTab('boot');
         if (readingOn()) armNewPostCheck('start');
         showBookmark();
