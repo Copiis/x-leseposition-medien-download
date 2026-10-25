@@ -15,7 +15,7 @@
 // @description:ko Twitter/X에서 마지막 읽기 위치를 추적하고 동기화합니다. 수동 및 자동 옵션 포함. 새로운 게시물을 확인하면서 현재 위치를 잃지 않도록 이상적입니다. 트윗 ID를 사용하여 정확한 위치 지정을 하고, 리포스트를 지원합니다。
 // @icon https://x.com/favicon.ico
 // @namespace https://github.com/Copiis/x-leseposition-medien-download
-// @version 2026.10.25b
+// @version 2026.10.25c
 // @author Copiis
 // @license MIT
 // @match https://x.com/*
@@ -439,6 +439,8 @@
     const SCROLL_DEAD_PX = 8;
     // Hochscrollen bleibt ein kurzes Stück gültig, auch wenn der Feed die Position danach nach unten schiebt.
     const UP_INTENT_MS = 1600;
+    // Hochscrollen setzt einen etwas älteren Post über der Lesestelle trotzdem.
+    const SCROLL_UP_OLDER_MS = 5 * 60 * 1000;
     const UP_RECHECK_MS = [400, 1000, 1500];
     const DOWN_WHEEL_CANCEL_PX = 80;
     // Ein leichtes Touchpad während der Suche scrollt mit, bricht sie aber nicht ab.
@@ -610,6 +612,20 @@
         }
         if (candIsRep && !currIsRep) return true;
         return false;
+    }
+
+    // Original über der Lesestelle, höchstens ein paar Minuten älter oder neuer nach ID und Zeit.
+    function scrollUpCloseEnough(post, bm) {
+        if (!post || !bm || post.isRepost || bm.isRepost || samePost(post, bm)) return false;
+        const gaps = [];
+        const postId = tweetIdMs(post.tweetId);
+        const bmId = tweetIdMs(bm.tweetId);
+        if (postId !== null && bmId !== null) gaps.push(Math.abs(postId - bmId));
+        const postClock = Date.parse(post.timestamp || '');
+        const bmClock = Date.parse(bm.timestamp || bm.readAt || '');
+        if (Number.isFinite(postClock) && Number.isFinite(bmClock)) gaps.push(Math.abs(postClock - bmClock));
+        if (!gaps.length) return false;
+        return Math.max.apply(null, gaps) <= SCROLL_UP_OLDER_MS;
     }
 
     function normalizeHomeTabLabel(text) {
@@ -2501,7 +2517,8 @@
         const top = rereadOnReadingLine();
         if (!top || !top.tweetId) return;
         const newer = !bookmark || isCandidateNewer(top, bookmark);
-        if (!newer) {
+        const close = !newer && scrollUpCloseEnough(top, bookmark);
+        if (!newer && !close) {
             clearPendingNewer();
             return;
         }
@@ -2515,7 +2532,8 @@
         const waiting = pendingNewerId === String(top.tweetId);
         if (!upIntentFresh() && !waiting) return;
         clearPendingNewer();
-        void adopt(top, false);
+        if (close) log('Save', 'Knapp ältere Stelle beim Hochscrollen', top.tweetId);
+        void adopt(top, close);
     }
 
     function armUpRecheck() {
@@ -2778,7 +2796,7 @@
         await loadStoredBookmark();
         const account = readUserHandleFromNav() || cachedUserHandle;
         if (isPlausibleUserHandle(account)) bootedAccount = account;
-        log('Init', 'Lesestelle 2026.10.25b');
+        log('Init', 'Lesestelle 2026.10.25c');
         syncTab('boot');
         if (readingOn()) armNewPostCheck('start');
         showBookmark();
