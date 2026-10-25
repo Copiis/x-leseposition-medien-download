@@ -15,7 +15,7 @@
 // @description:ko Twitter/X에서 마지막 읽기 위치를 추적하고 동기화합니다. 수동 및 자동 옵션 포함. 새로운 게시물을 확인하면서 현재 위치를 잃지 않도록 이상적입니다. 트윗 ID를 사용하여 정확한 위치 지정을 하고, 리포스트를 지원합니다。
 // @icon https://x.com/favicon.ico
 // @namespace https://github.com/Copiis/x-leseposition-medien-download
-// @version 2026.10.24a
+// @version 2026.10.25a
 // @author Copiis
 // @license MIT
 // @match https://x.com/*
@@ -534,6 +534,39 @@
         return Number.isFinite(parsed) ? parsed : null;
     }
 
+    // Anzeigezeit der gespeicherten Stelle, getrennt von der Tweet-ID.
+    function bookmarkClockMs(bm) {
+        if (!bm) return null;
+        const raw = bm.isRepost ? (bm.readAt || bm.timestamp || '') : (bm.timestamp || bm.readAt || '');
+        const parsed = Date.parse(raw);
+        return Number.isFinite(parsed) ? parsed : null;
+    }
+
+    // Liegt in der Historie eine deutlich neuere Stelle, war die aktuelle ein Rücksprung.
+    function newerStoredMark(history, current) {
+        const currentMs = bookmarkTargetMs(current);
+        if (currentMs === null || !Array.isArray(history)) return null;
+        let best = null;
+        let bestMs = currentMs;
+        for (const item of history) {
+            if (!item || !item.tweetId || !item.authorHandler || !item.timestamp) continue;
+            if (samePost(item, current)) continue;
+            const ms = bookmarkTargetMs(item);
+            if (ms === null || ms < bestMs) continue;
+            best = item;
+            bestMs = ms;
+        }
+        if (!best || bestMs < currentMs + NEAR_MS) return null;
+        return {
+            tweetId: best.tweetId,
+            authorHandler: best.authorHandler,
+            timestamp: best.timestamp,
+            isRepost: !!best.isRepost,
+            readAt: best.readAt || best.timestamp,
+            account: current.account || best.account
+        };
+    }
+
     function getComparisonTimestamp(postData) {
         if (!postData) return null;
         return postData.isRepost
@@ -591,14 +624,6 @@
         if (!values.length) return null;
         const sorted = values.slice().sort((a, b) => a - b);
         return sorted[Math.floor(sorted.length / 2)];
-    }
-
-    function windowReachedBookmark(visibleOriginalTimes, bm) {
-        const target = bookmarkTargetMs(bm);
-        if (target === null) return false;
-        const median = medianNumber(visibleOriginalTimes);
-        if (median === null) return false;
-        return median <= target;
     }
 
     // ---------- Account ----------
@@ -847,16 +872,6 @@
         return chosen ? readArticle(chosen) : null;
     }
 
-    function visibleOriginalTimes() {
-        const times = [];
-        for (const post of visibleParsed()) {
-            if (post.isRepost) continue;
-            const ms = tweetIdMs(post.tweetId);
-            if (ms !== null) times.push(ms);
-        }
-        return times;
-    }
-
     // ---------- Scroll ----------
 
     function isWindowScroller(node) {
@@ -932,7 +947,12 @@
             if (isRepost(post)) continue;
             const ms = tweetIdMs(getPostTweetId(post));
             if (ms === null) continue;
-            return ms + NEWER_SLACK_MS < target;
+            const stamp = Date.parse(getPostTimestamp(post) || '');
+            const idOlder = ms + NEWER_SLACK_MS < target;
+            const timeTarget = bookmarkClockMs(bookmark);
+            const timeOlder = !Number.isFinite(stamp) || timeTarget === null
+                || stamp + NEWER_SLACK_MS < timeTarget;
+            return idOlder && timeOlder;
         }
         return false;
     }
@@ -977,22 +997,62 @@
     }
 
     function ageSpan() {
-        const times = visibleOriginalTimes();
+        const idTimes = [];
+        const clockTimes = [];
+        for (const post of visibleParsed()) {
+            if (post.isRepost) continue;
+            const idMs = tweetIdMs(post.tweetId);
+            if (idMs !== null) idTimes.push(idMs);
+            const clock = Date.parse(post.timestamp || '');
+            if (Number.isFinite(clock)) clockTimes.push(clock);
+        }
         const target = bookmarkTargetMs(bookmark);
-        if (!times.length || target === null) return null;
+        if ((!idTimes.length && !clockTimes.length) || target === null) return null;
         return {
-            oldest: Math.min.apply(null, times),
-            newest: Math.max.apply(null, times),
-            target
+            oldest: idTimes.length ? Math.min.apply(null, idTimes) : null,
+            newest: idTimes.length ? Math.max.apply(null, idTimes) : null,
+            median: medianNumber(idTimes),
+            timeOldest: clockTimes.length ? Math.min.apply(null, clockTimes) : null,
+            timeNewest: clockTimes.length ? Math.max.apply(null, clockTimes) : null,
+            timeMedian: medianNumber(clockTimes),
+            target,
+            timeTarget: bookmarkClockMs(bookmark)
         };
     }
 
+    // Erreicht erst, wenn Tweet-ID und Anzeigezeit zusammenpassen.
+    // Eine einzelne alte ID im Fenster reicht nicht.
     function seekZone(span) {
         if (!span) return 'far';
-        if (span.newest + NEWER_SLACK_MS < span.target) return 'passed';
-        if (span.oldest <= span.target + NEWER_SLACK_MS) return 'band';
-        if (span.oldest - span.target < NEAR_ZONE_MS) return 'near';
+        const haveTime = span.timeMedian !== null && span.timeTarget !== null && span.timeNewest !== null;
+        const idPassed = span.newest !== null && span.newest + NEWER_SLACK_MS < span.target;
+        const timePassed = !haveTime || span.timeNewest + NEWER_SLACK_MS < span.timeTarget;
+        if (idPassed && timePassed) return 'passed';
+        const idBand = span.median !== null && span.median <= span.target + NEWER_SLACK_MS;
+        const timeBand = !haveTime || span.timeMedian <= span.timeTarget + NEWER_SLACK_MS;
+        if (idBand && timeBand) return 'band';
+        const idDelta = span.median === null ? Infinity : span.median - span.target;
+        const timeDelta = haveTime ? span.timeMedian - span.timeTarget : idDelta;
+        if (Math.max(idDelta, timeDelta) < NEAR_ZONE_MS) return 'near';
         return 'far';
+    }
+
+    // Tweet-ID oder Anzeigezeit ist im Mittel noch neuer als die Lesestelle.
+    function spanStillNewer(span) {
+        if (!span) return false;
+        const idNewer = span.median !== null && span.median > span.target + NEWER_SLACK_MS;
+        const haveTime = span.timeMedian !== null && span.timeTarget !== null;
+        if (!haveTime) return idNewer;
+        return idNewer || span.timeMedian > span.timeTarget + NEWER_SLACK_MS;
+    }
+
+    // Hochlaufen stoppt, wenn das typische Fenster auf beiden Uhren schon neuer ist.
+    function spanBothNewer(span) {
+        if (!span || span.median === null) return false;
+        if (span.median <= span.target + NEWER_SLACK_MS) return false;
+        const haveTime = span.timeMedian !== null && span.timeTarget !== null;
+        if (!haveTime) return true;
+        return span.timeMedian > span.timeTarget + NEWER_SLACK_MS;
     }
 
     async function placeOnReadingLine(el, gen) {
@@ -1062,8 +1122,7 @@
             await waitForFeedChange(JUMP_FOLLOW_MS, before, JUMP_GAP_MS);
             if (Math.abs(scrollOffset() - here) < 24) return findArticle(bookmark);
             if (direction < 0) {
-                const span = ageSpan();
-                if (span && span.oldest > span.target + NEWER_SLACK_MS) return findArticle(bookmark);
+                if (spanBothNewer(ageSpan())) return findArticle(bookmark);
             }
         }
         return findArticle(bookmark);
@@ -1762,6 +1821,18 @@
         return Math.abs(target - moment);
     }
 
+    // Ersatz nur, wenn Tweet-ID und Anzeigezeit höchstens 90 Minuten daneben liegen.
+    function nearEnough(post, bm) {
+        if (!post || !bm) return false;
+        if (String(post.tweetId) === String(bm.tweetId) && !!post.isRepost === !!bm.isRepost) return true;
+        const idGap = originalGap(post, bookmarkTargetMs(bm));
+        if (idGap === null || idGap > NEAR_MS) return false;
+        const timeTarget = bookmarkClockMs(bm);
+        const stamp = Date.parse(post.timestamp || '');
+        if (timeTarget !== null && Number.isFinite(stamp) && Math.abs(timeTarget - stamp) > NEAR_MS) return false;
+        return true;
+    }
+
     function elementOnReadingLine() {
         const vh = window.innerHeight || 800;
         let topmost = null;
@@ -1835,9 +1906,7 @@
         return 'same';
     }
 
-    // Die gespeicherte ID fehlt. Nimm dieselbe ID, sonst den Beitrag auf der
-    // Lesezeile, wenn er zeitlich mit dem nächsten gleichauf liegt, sonst den
-    // zeitnächsten sichtbaren Originalbeitrag.
+    // Dieselbe ID, sonst der nächste Originalbeitrag, der nach ID und Zeit nah genug ist.
     function chooseNearest(atBookmark) {
         if (!bookmark) return null;
         const same = visibleSameTweet(bookmark);
@@ -1847,17 +1916,16 @@
         let bestGap = Infinity;
         for (const post of visibleParsed()) {
             const gap = originalGap(post, target);
-            if (gap === null || gap >= bestGap) continue;
+            if (gap === null || gap >= bestGap || !nearEnough(post, bookmark)) continue;
             bestGap = gap;
             best = post;
         }
         const line = rereadOnReadingLine();
-        if (atBookmark && line) {
+        if (atBookmark && line && nearEnough(line, bookmark)) {
             const lineGap = originalGap(line, target);
-            if (lineGap === null || !best || lineGap <= bestGap + 2 * 60 * 1000) return line;
+            if (lineGap !== null && (!best || lineGap <= bestGap + 2 * 60 * 1000)) return line;
         }
-        if (best && (atBookmark || bestGap <= NEAR_MS)) return best;
-        return null;
+        return best;
     }
 
     async function settleOnNearest(gen, atBookmark) {
@@ -1865,11 +1933,17 @@
         let raw = null;
         if ((!post || !post.element) && atBookmark) {
             raw = elementOnReadingLine();
-            if (raw) post = readArticle(raw) || post;
+            const parsed = raw ? readArticle(raw) : null;
+            if (parsed && nearEnough(parsed, bookmark)) post = parsed;
+            else raw = null;
         }
         const el = (post && post.element) || raw;
         if (!el) return null;
         const same = !!(post && bookmark && String(post.tweetId) === String(bookmark.tweetId));
+        if (!same && post && !nearEnough(post, bookmark)) {
+            log('Search', 'Ersatz zu weit von der Lesestelle, gespeicherte Stelle bleibt', post.tweetId);
+            return null;
+        }
         highlight(el);
         await placeOnReadingLine(el, gen);
         if (gen !== generation || seekCancel || !readingOn()) return 'abort';
@@ -1906,6 +1980,10 @@
         if (live) highlight(live);
         if (!same && post && post.tweetId) {
             const fresh = (live && readArticle(live)) || post;
+            if (!nearEnough(fresh, bookmark)) {
+                log('Search', 'Ersatz zu weit von der Lesestelle, gespeicherte Stelle bleibt', fresh.tweetId);
+                return null;
+            }
             if (fresh.isRepost && bookmark && (bookmark.readAt || bookmark.timestamp)) {
                 fresh.readAt = bookmark.readAt || bookmark.timestamp;
             }
@@ -1966,6 +2044,7 @@
         let lastDir = 0;
         let placeMisses = 0;
         let probedBelow = false;
+        let bandMisses = 0;
         const still = () => gen === generation && !seekCancel && readingOn();
         const centerExact = async (el) => {
             const placed = await placeOnReadingLine(el, gen);
@@ -1999,9 +2078,14 @@
                 }
                 const zone = seekZone(ageSpan());
                 const vhNow = window.innerHeight || 800;
-                if (zone === 'passed' && scrollOffset() > AT_TOP_PX) {
+                if (zone === 'passed') {
+                    if (scrollOffset() <= AT_TOP_PX) {
+                        log('Search', 'Fenster älter als die Lesestelle, gespeicherte Stelle bleibt');
+                        if (gen === generation) finishFlow(gen);
+                        return;
+                    }
                     const hereUp = scrollOffset();
-                    const foundUp = await scanForBookmark(gen, -1, Math.round(vhNow * 0.9));
+                    const foundUp = await scanForBookmark(gen, -1, Math.round(vhNow * SEARCH_JUMP_VH));
                     if (!still()) break;
                     if (foundUp) {
                         const outcome = await centerExact(foundUp);
@@ -2011,25 +2095,22 @@
                         log('Search', 'Lesestelle oberhalb ausgerichtet');
                         return;
                     }
-                    const movedUp = Math.abs(scrollOffset() - hereUp) >= 24;
-                    if (movedUp) {
+                    if (Math.abs(scrollOffset() - hereUp) >= 24) {
                         emptyWaits = 0;
                         lastY = scrollOffset();
-                        if (lastDir === 1) bounces += 1;
-                        else bounces = 0;
                         lastDir = -1;
-                        if (bounces >= 3) break;
-                        ingestDomOrder();
                         continue;
                     }
                     emptyWaits += 1;
                     if (emptyWaits < EMPTY_WAITS_MAX) continue;
+                    log('Search', 'Fenster älter als die Lesestelle, kein Weiterkommen, gespeicherte Stelle bleibt');
+                    if (gen === generation) finishFlow(gen);
+                    return;
                 }
-                if (zone === 'passed' || zone === 'band') {
+                if (zone === 'band') {
                     const vh = vhNow;
-                    let found = null;
-                    if (zone !== 'passed') found = await scanForBookmark(gen, 1, Math.round(vh * 0.85));
-                    if (!found && zone !== 'passed' && !probedBelow && still() && scrollRoomBelow() > 80) {
+                    let found = await scanForBookmark(gen, 1, Math.round(vh * SEARCH_JUMP_VH));
+                    if (!found && !probedBelow && still() && scrollRoomBelow() > 80) {
                         probedBelow = true;
                         const probed = await probeBookmarkBelow(gen);
                         if (probed === 'abort') return;
@@ -2038,9 +2119,6 @@
                     if (!found && still()) {
                         const back = Math.max(Math.round(vh * 2), lastJump + Math.round(vh * 0.5));
                         found = await scanForBookmark(gen, -1, Math.min(back, Math.round(vh * 8)));
-                    }
-                    if (zone === 'passed' && !found && still()) {
-                        found = await scanForBookmark(gen, 1, Math.round(vh * 1.5));
                     }
                     if (!still()) break;
                     if (found) {
@@ -2051,12 +2129,30 @@
                         log('Search', 'Lesestelle in der Nähe ausgerichtet');
                         return;
                     }
+                    const hereBand = scrollOffset();
+                    const beforeBand = visibleSignature();
+                    const beforeTailBand = tailKey();
+                    scrollByDelta(FINE_STEP_PX);
+                    await waitForLoad(CLOSE_LOAD_WAIT_MS, beforeBand, beforeTailBand);
+                    const bandMoved = Math.abs(scrollOffset() - hereBand) >= 24
+                        || visibleSignature() !== beforeBand
+                        || tailKey() !== beforeTailBand;
+                    if (bandMoved && scrollRoomBelow() >= 80) {
+                        bandMisses = 0;
+                        emptyWaits = 0;
+                        lastY = scrollOffset();
+                        continue;
+                    }
+                    bandMisses += 1;
+                    if (bandMisses < 3) continue;
                     const settled = await settleOnNearest(gen, true);
                     if (settled === 'abort') return;
                     if (settled === 'nearest' && reportMiss) showPopup('tweetIdNotFound', 5000);
+                    if (!settled) log('Search', 'Lesestelle nicht in der Nähe, gespeicherte Stelle bleibt');
                     if (gen === generation) finishFlow(gen);
                     return;
                 }
+                bandMisses = 0;
                 const before = visibleSignature();
                 const beforeTail = tailKey();
                 const here = scrollOffset();
@@ -2075,16 +2171,23 @@
                     changed = await waitForLoad(atEdge ? LOAD_WAIT_MS : CLOSE_LOAD_WAIT_MS, before, beforeTail);
                 }
                 const y2 = scrollOffset();
+                const stillNewer = spanStillNewer(ageSpan());
+                const stuckBottom = !didMove && !changed && scrollRoomBelow() < 80;
                 if (changed) {
                     emptyWaits = 0;
-                } else if (atEdge) {
+                } else if (stuckBottom) {
                     emptyWaits += 1;
                     if (emptyWaits >= EMPTY_WAITS_MAX) break;
+                } else if (atEdge) {
+                    emptyWaits += 1;
+                    if (emptyWaits >= EMPTY_WAITS_MAX && !stillNewer) break;
+                    if (stillNewer) emptyWaits = 0;
                 }
                 if (zone === 'near') {
                     if (Math.abs(y2 - here) < 24) {
                         stagnant += 1;
-                        if (stagnant >= 4) break;
+                        if (stagnant >= 4 && !stillNewer) break;
+                        if (stillNewer) stagnant = 0;
                     } else {
                         stagnant = 0;
                     }
@@ -2094,7 +2197,8 @@
                     if (lastDir && dir !== lastDir) bounces += 1;
                     else bounces = 0;
                     lastDir = dir;
-                    if (bounces >= 3) break;
+                    if (bounces >= 3 && !stillNewer) break;
+                    if (bounces >= 3) bounces = 0;
                 }
                 lastY = y2;
                 ingestDomOrder();
@@ -2118,9 +2222,12 @@
             }
             if (!still()) return;
             const zoneNow = seekZone(ageSpan());
-            const atBookmark = zoneNow === 'band' || zoneNow === 'passed'
-                || windowReachedBookmark(visibleOriginalTimes(), bookmark);
-            const settled = await settleOnNearest(gen, atBookmark);
+            if (zoneNow !== 'band' || spanStillNewer(ageSpan())) {
+                log('Search', 'Suche beendet, gespeicherte Lesestelle bleibt');
+                if (gen === generation) finishFlow(gen);
+                return;
+            }
+            const settled = await settleOnNearest(gen, true);
             if (settled === 'abort') return;
             if (settled === 'nearest' && reportMiss) showPopup('tweetIdNotFound', 5000);
             if (!settled) log('Search', 'Suche beendet ohne Ersatz');
@@ -2503,6 +2610,12 @@
         bookmark = position;
         try {
             const history = GM_getValue(HISTORY_KEY(account), []);
+            const revived = newerStoredMark(Array.isArray(history) ? history : [], bookmark);
+            if (revived) {
+                bookmark = revived;
+                GM_setValue(STORAGE_KEY(account), JSON.stringify(revived));
+                log('Init', 'Zu alte Lesestelle verworfen, vorherige bleibt @' + revived.authorHandler, revived.tweetId);
+            }
             const cutoff = Date.now() - SEVEN_DAYS_MS;
             const filtered = (Array.isArray(history) ? history : []).filter((item) => {
                 const rawTime = item && (item.readAt || item.savedAt || item.timestamp);
@@ -2527,7 +2640,7 @@
         await loadStoredBookmark();
         const account = readUserHandleFromNav() || cachedUserHandle;
         if (isPlausibleUserHandle(account)) bootedAccount = account;
-        log('Init', 'Lesestelle 2026.10.24a');
+        log('Init', 'Lesestelle 2026.10.25a');
         syncTab('boot');
         if (readingOn()) armNewPostCheck('start');
         showBookmark();
