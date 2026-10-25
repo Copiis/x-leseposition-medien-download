@@ -15,7 +15,7 @@
 // @description:ko Twitter/X에서 마지막 읽기 위치를 추적하고 동기화합니다. 수동 및 자동 옵션 포함. 새로운 게시물을 확인하면서 현재 위치를 잃지 않도록 이상적입니다. 트윗 ID를 사용하여 정확한 위치 지정을 하고, 리포스트를 지원합니다。
 // @icon https://x.com/favicon.ico
 // @namespace https://github.com/Copiis/x-leseposition-medien-download
-// @version 2026.10.25f
+// @version 2026.10.25g
 // @author Copiis
 // @license MIT
 // @match https://x.com/*
@@ -433,6 +433,8 @@
     const NEWER_SLACK_MS = 60 * 1000;
     // Feinschritte erst, wenn der sichtbare Rand nah an der Lesestelle ist.
     const NEAR_ZONE_MS = 30 * 60 * 1000;
+    // Knapp hinter der Lesestelle nur so weit durch schon bekannte Posts weiter.
+    const PASSED_OVERSHOOT_VH = 6;
     const MAP_MAX = 2500;
     const HISTORY_MAX = 500;
     const REPOST_LOG_MAX = 500;
@@ -1014,7 +1016,7 @@
     }
 
     // Der letzte gezeichnete Originalbeitrag liegt schon hinter der Lesestelle.
-    // Dann nur eine Bildschirmhöhe, sonst würde der Sprung an den Schwanz vorbeiziehen.
+    // Dann nur ein Feinschritt, sonst springt die Suche an der Stelle vorbei.
     function renderedTailOlderThanBookmark() {
         const target = bookmarkTargetMs(bookmark);
         if (target === null) return false;
@@ -1036,10 +1038,10 @@
 
     function stepTowardBookmark() {
         const vh = window.innerHeight || 800;
-        const cap = Math.round(vh * 2);
+        const cap = Math.round(vh * SEARCH_JUMP_VH);
         let dy;
         if (renderedTailOlderThanBookmark()) {
-            dy = Math.round(vh * SEARCH_JUMP_VH);
+            dy = FINE_STEP_PX;
         } else {
             const posts = feedArticles();
             const last = posts[posts.length - 1];
@@ -1130,6 +1132,31 @@
         const haveTime = span.timeMedian !== null && span.timeTarget !== null;
         if (!haveTime) return true;
         return span.timeMedian > span.timeTarget + NEWER_SLACK_MS;
+    }
+
+    // Wie weit das neueste sichtbare Original hinter der Lesestelle liegt.
+    function passedDepthMs(span) {
+        if (!span || span.newest === null || span.target === null) return 0;
+        const idGap = span.target - span.newest;
+        const haveTime = span.timeNewest !== null && span.timeTarget !== null;
+        const timeGap = haveTime ? span.timeTarget - span.timeNewest : idGap;
+        return Math.max(idGap, timeGap, 0);
+    }
+
+    // Wohin, wenn das Fenster älter ist als die Lesestelle.
+    // Nach unten nur knapp dahinter, einmal, und nur durch schon bekannte Posts.
+    // Eine schon zu alte Stelle sucht nach oben, nicht noch tiefer.
+    function passedSeekMove(state) {
+        if (state.atTop) return 'keep';
+        const slight = state.depthMs <= state.nearMs;
+        const room = state.roomBelow >= 80;
+        if (state.sawNewer && state.visits === 1 && state.known && state.downPx < state.budgetPx
+            && slight && state.tailKnown && room) {
+            return 'down-fine';
+        }
+        if (state.sawNewer && state.known && !room && slight) return 'bottom';
+        if (state.depthMs > state.nearMs) return 'up-coarse';
+        return 'up-fine';
     }
 
     async function placeOnReadingLine(el, gen) {
@@ -2112,6 +2139,17 @@
         return id + '-' + !!isRepost(el);
     }
 
+    function tailWasKnown(knownAtStart) {
+        const posts = feedArticles();
+        for (let i = posts.length - 1; i >= 0; i -= 1) {
+            if (isRepost(posts[i])) continue;
+            const key = articleMapKey(posts[i]);
+            if (!key) continue;
+            return knownAtStart.has(key);
+        }
+        return false;
+    }
+
     // Höchster bekannter Beitrag im gezeichneten Stück. Die fehlende Lesestelle zählt nicht.
     function firstKnownArticle() {
         const skip = bookmarkMapKey(bookmark);
@@ -2212,7 +2250,12 @@
         let placeMisses = 0;
         let probedBelow = false;
         let bandMisses = 0;
-        let passedLookedUp = false;
+        let passedVisits = 0;
+        let wasPassed = false;
+        let sawNewer = false;
+        let passedDownPx = 0;
+        let recoverKnown = false;
+        const knownAtStart = new Set(orderedKeys);
         const still = () => gen === generation && !seekCancel && readingOn();
         const centerExact = async (el) => {
             const placed = await placeOnReadingLine(el, gen);
@@ -2246,39 +2289,88 @@
                 }
                 const zone = seekZone(ageSpan());
                 const vhNow = window.innerHeight || 800;
-                if (zone === 'passed' && !orderedKeys.length) {
-                    if (scrollOffset() <= AT_TOP_PX) {
+                if (zone === 'passed') {
+                    if (!wasPassed) {
+                        passedVisits += 1;
+                        wasPassed = true;
+                    }
+                } else {
+                    wasPassed = false;
+                    sawNewer = true;
+                }
+                // Liegt das Fenster schon hinter der Lesestelle, nicht weiter in die Vergangenheit springen.
+                // Die Lupe sucht von dort nach oben. Knapp dahinter bleibt ein kurzes Stück durch bekannte Posts.
+                if (zone === 'passed') {
+                    const depth = passedDepthMs(ageSpan());
+                    const move = passedSeekMove({
+                        atTop: scrollOffset() <= AT_TOP_PX,
+                        sawNewer,
+                        visits: passedVisits,
+                        known: knownAtStart.size > 0,
+                        downPx: passedDownPx,
+                        budgetPx: Math.round(vhNow * PASSED_OVERSHOOT_VH),
+                        depthMs: depth,
+                        nearMs: NEAR_ZONE_MS,
+                        tailKnown: tailWasKnown(knownAtStart),
+                        roomBelow: scrollRoomBelow()
+                    });
+                    if (move === 'keep') {
                         log('Search', 'Fenster älter als die Lesestelle, gespeicherte Stelle bleibt');
                         if (gen === generation) finishFlow(gen);
                         return;
                     }
-                    const hereUp = scrollOffset();
-                    const foundUp = await scanForBookmark(gen, -1, Math.round(vhNow * SEARCH_JUMP_VH));
-                    if (!still()) break;
-                    if (foundUp) {
-                        const outcome = await centerExact(foundUp);
-                        if (outcome === 'abort') return;
-                        if (outcome === 'retry' || outcome === 'gone') continue;
-                        finishFlow(gen);
-                        log('Search', 'Lesestelle oberhalb ausgerichtet');
-                        return;
+                    if (move === 'bottom') {
+                        recoverKnown = true;
+                        break;
                     }
-                    if (Math.abs(scrollOffset() - hereUp) >= 24) {
-                        emptyWaits = 0;
+                    if (move === 'down-fine') {
+                        const hereDown = scrollOffset();
+                        const beforeDown = visibleSignature();
+                        const beforeTailDown = tailKey();
+                        scrollByDelta(FINE_STEP_PX);
+                        const movedDown = scrollOffset() - hereDown;
+                        if (movedDown > 0) passedDownPx += movedDown;
+                        await waitForLoad(CLOSE_LOAD_WAIT_MS, beforeDown, beforeTailDown);
+                        if (!still()) break;
+                        const exactDown = findArticle(bookmark);
+                        if (exactDown) {
+                            const outcome = await centerExact(exactDown);
+                            if (outcome === 'abort') return;
+                            if (outcome === 'retry' || outcome === 'gone') continue;
+                            finishFlow(gen);
+                            log('Search', 'Lesestelle unter den bekannten Posts');
+                            return;
+                        }
+                        if (movedDown < 24) {
+                            emptyWaits += 1;
+                            if (emptyWaits >= EMPTY_WAITS_MAX) {
+                                log('Search', 'Fenster älter als die Lesestelle, kein Weiterkommen, gespeicherte Stelle bleibt');
+                                if (gen === generation) finishFlow(gen);
+                                return;
+                            }
+                        } else {
+                            emptyWaits = 0;
+                        }
+                        lastJump = FINE_STEP_PX;
                         lastY = scrollOffset();
-                        lastDir = -1;
+                        lastDir = 1;
                         continue;
                     }
-                    emptyWaits += 1;
-                    if (emptyWaits < EMPTY_WAITS_MAX) continue;
-                    log('Search', 'Fenster älter als die Lesestelle, kein Weiterkommen, gespeicherte Stelle bleibt');
-                    if (gen === generation) finishFlow(gen);
-                    return;
-                }
-                // Bekannte Posts können nach einem Neuladen weiter unten stehen. Dann nach unten weiter.
-                if (zone === 'passed' && !passedLookedUp) {
-                    passedLookedUp = true;
-                    const foundUp = await scanForBookmark(gen, -1, Math.round(vhNow * SEARCH_JUMP_VH));
+                    const hereUp = scrollOffset();
+                    let foundUp = null;
+                    if (move === 'up-coarse') {
+                        const beforeUp = visibleSignature();
+                        lastJump = Math.round(vhNow * SEARCH_JUMP_VH);
+                        scrollByDelta(-lastJump);
+                        await waitForFeedChange(JUMP_FOLLOW_MS, beforeUp, JUMP_GAP_MS);
+                        if (!still()) break;
+                        foundUp = findArticle(bookmark);
+                        if (!foundUp && seekZone(ageSpan()) !== 'passed') {
+                            foundUp = await scanForBookmark(gen, 1, Math.abs(scrollOffset() - hereUp) + FINE_STEP_PX);
+                        }
+                    } else {
+                        foundUp = await scanForBookmark(gen, -1, Math.max(lastJump, Math.round(vhNow * SEARCH_JUMP_VH)));
+                    }
                     if (!still()) break;
                     if (foundUp) {
                         const outcome = await centerExact(foundUp);
@@ -2288,6 +2380,25 @@
                         log('Search', 'Lesestelle oberhalb ausgerichtet');
                         return;
                     }
+                    const movedUp = Math.abs(scrollOffset() - hereUp) >= 24;
+                    if (!movedUp) {
+                        emptyWaits += 1;
+                        if (emptyWaits >= EMPTY_WAITS_MAX) {
+                            log('Search', 'Fenster älter als die Lesestelle, kein Weiterkommen, gespeicherte Stelle bleibt');
+                            if (gen === generation) finishFlow(gen);
+                            return;
+                        }
+                        continue;
+                    }
+                    emptyWaits = 0;
+                    lastY = scrollOffset();
+                    lastDir = -1;
+                    if (passedVisits > 2 && seekZone(ageSpan()) === 'passed') {
+                        log('Search', 'Nicht weiter in die Vergangenheit, gespeicherte Lesestelle bleibt');
+                        if (gen === generation) finishFlow(gen);
+                        return;
+                    }
+                    continue;
                 }
                 if (zone === 'band') {
                     const vh = vhNow;
@@ -2335,6 +2446,22 @@
                         if (gen === generation) finishFlow(gen);
                         return;
                     }
+                }
+                if (passedVisits > 0 && !spanStillNewer(ageSpan())) {
+                    const foundBack = await scanForBookmark(gen, -1, Math.max(lastJump, Math.round(vhNow * SEARCH_JUMP_VH)));
+                    if (!still()) break;
+                    if (foundBack) {
+                        const outcome = await centerExact(foundBack);
+                        if (outcome === 'abort') return;
+                        if (outcome === 'retry' || outcome === 'gone') continue;
+                        finishFlow(gen);
+                        log('Search', 'Lesestelle oberhalb ausgerichtet');
+                        return;
+                    }
+                    if (seekZone(ageSpan()) === 'passed') continue;
+                    log('Search', 'Nicht weiter in die Vergangenheit, gespeicherte Lesestelle bleibt');
+                    if (gen === generation) finishFlow(gen);
+                    return;
                 }
                 bandMisses = 0;
                 const before = visibleSignature();
@@ -2395,7 +2522,9 @@
             const vh = window.innerHeight || 800;
             let found = findArticle(bookmark);
             if (!found) found = await scanForBookmark(gen, -1, Math.round(vh * 2));
-            if (!found && still()) found = await scanForBookmark(gen, 1, Math.round(vh * 1.5));
+            if (!found && still() && seekZone(ageSpan()) !== 'passed') {
+                found = await scanForBookmark(gen, 1, Math.round(vh * 1.5));
+            }
             if (found && still()) {
                 const outcome = await centerExact(found);
                 if (outcome === 'abort') return;
@@ -2406,7 +2535,12 @@
                 }
             }
             if (!still()) return;
-            if (orderedKeys.length && scrollRoomBelow() < 80) {
+            if (orderedKeys.length && (recoverKnown || scrollRoomBelow() < 80)) {
+                if (!recoverKnown && passedDepthMs(ageSpan()) > NEAR_ZONE_MS) {
+                    log('Search', 'Zu weit unter der Lesestelle, gespeicherte Stelle bleibt');
+                    if (gen === generation) finishFlow(gen);
+                    return;
+                }
                 log('Search', 'Lesestelle fehlt, obersten bekannten Post markieren');
                 const picked = await findTopmostKnown(gen);
                 if (!still()) return;
@@ -2887,7 +3021,7 @@
         await loadStoredBookmark();
         const account = readUserHandleFromNav() || cachedUserHandle;
         if (isPlausibleUserHandle(account)) bootedAccount = account;
-        log('Init', 'Lesestelle 2026.10.25f');
+        log('Init', 'Lesestelle 2026.10.25g');
         syncTab('boot');
         if (readingOn()) armNewPostCheck('start');
         showBookmark();
