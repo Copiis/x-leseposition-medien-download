@@ -15,7 +15,7 @@
 // @description:ko Twitter/X에서 마지막 읽기 위치를 추적하고 동기화합니다. 수동 및 자동 옵션 포함. 새로운 게시물을 확인하면서 현재 위치를 잃지 않도록 이상적입니다. 트윗 ID를 사용하여 정확한 위치 지정을 하고, 리포스트를 지원합니다。
 // @icon https://x.com/favicon.ico
 // @namespace https://github.com/Copiis/x-leseposition-medien-download
-// @version 2026.10.25g
+// @version 2026.10.25h
 // @author Copiis
 // @license MIT
 // @match https://x.com/*
@@ -435,6 +435,8 @@
     const NEAR_ZONE_MS = 30 * 60 * 1000;
     // Knapp hinter der Lesestelle nur so weit durch schon bekannte Posts weiter.
     const PASSED_OVERSHOOT_VH = 6;
+    // In der Zeit der Lesestelle nur so weit in Feinschritten suchen, dann melden.
+    const BAND_TRAVEL_MAX_VH = 8;
     const MAP_MAX = 2500;
     const HISTORY_MAX = 500;
     const REPOST_LOG_MAX = 500;
@@ -462,11 +464,13 @@
     const EXTRA = {
         de: {
             needFollowing: 'ℹ️ Bitte den Reiter „Folge ich“ wählen.',
-            searchCancelled: 'ℹ️ Suche abgebrochen.'
+            searchCancelled: 'ℹ️ Suche abgebrochen.',
+            searchKept: 'ℹ️ Lesestelle nicht gefunden. Die gespeicherte Stelle bleibt.'
         },
         en: {
             needFollowing: 'ℹ️ Switch to the Following tab.',
-            searchCancelled: 'ℹ️ Search cancelled.'
+            searchCancelled: 'ℹ️ Search cancelled.',
+            searchKept: 'ℹ️ Reading position not found. The saved position stays.'
         }
     };
 
@@ -2250,6 +2254,7 @@
         let placeMisses = 0;
         let probedBelow = false;
         let bandMisses = 0;
+        let bandTravel = 0;
         let passedVisits = 0;
         let wasPassed = false;
         let sawNewer = false;
@@ -2270,6 +2275,11 @@
             if (placeMisses < 3) return 'retry';
             highlight(live);
             return 'marked';
+        };
+        const keepSaved = (why) => {
+            log('Search', why);
+            if (reportMiss) showPopup('searchKept', 5000);
+            if (gen === generation) finishFlow(gen);
         };
         try {
             for (let step = 0; step < SEARCH_MAX_STEPS; step += 1) {
@@ -2315,8 +2325,7 @@
                         roomBelow: scrollRoomBelow()
                     });
                     if (move === 'keep') {
-                        log('Search', 'Fenster älter als die Lesestelle, gespeicherte Stelle bleibt');
-                        if (gen === generation) finishFlow(gen);
+                        keepSaved('Fenster älter als die Lesestelle, gespeicherte Stelle bleibt');
                         return;
                     }
                     if (move === 'bottom') {
@@ -2344,8 +2353,7 @@
                         if (movedDown < 24) {
                             emptyWaits += 1;
                             if (emptyWaits >= EMPTY_WAITS_MAX) {
-                                log('Search', 'Fenster älter als die Lesestelle, kein Weiterkommen, gespeicherte Stelle bleibt');
-                                if (gen === generation) finishFlow(gen);
+                                keepSaved('Fenster älter als die Lesestelle, kein Weiterkommen, gespeicherte Stelle bleibt');
                                 return;
                             }
                         } else {
@@ -2384,8 +2392,7 @@
                     if (!movedUp) {
                         emptyWaits += 1;
                         if (emptyWaits >= EMPTY_WAITS_MAX) {
-                            log('Search', 'Fenster älter als die Lesestelle, kein Weiterkommen, gespeicherte Stelle bleibt');
-                            if (gen === generation) finishFlow(gen);
+                            keepSaved('Fenster älter als die Lesestelle, kein Weiterkommen, gespeicherte Stelle bleibt');
                             return;
                         }
                         continue;
@@ -2394,8 +2401,7 @@
                     lastY = scrollOffset();
                     lastDir = -1;
                     if (passedVisits > 2 && seekZone(ageSpan()) === 'passed') {
-                        log('Search', 'Nicht weiter in die Vergangenheit, gespeicherte Lesestelle bleibt');
-                        if (gen === generation) finishFlow(gen);
+                        keepSaved('Nicht weiter in die Vergangenheit, gespeicherte Lesestelle bleibt');
                         return;
                     }
                     continue;
@@ -2409,9 +2415,9 @@
                         if (probed === 'abort') return;
                         if (probed) found = probed;
                     }
-                    if (!found && !orderedKeys.length && still()) {
+                    if (!found && still()) {
                         const back = Math.max(Math.round(vh * 2), lastJump + Math.round(vh * 0.5));
-                        found = await scanForBookmark(gen, -1, Math.min(back, Math.round(vh * 8)));
+                        found = await scanForBookmark(gen, -1, Math.min(back, Math.round(vh * 4)));
                     }
                     if (!still()) break;
                     if (found) {
@@ -2422,45 +2428,40 @@
                         log('Search', 'Lesestelle in der Nähe ausgerichtet');
                         return;
                     }
-                    if (!orderedKeys.length) {
-                        const hereBand = scrollOffset();
-                        const beforeBand = visibleSignature();
-                        const beforeTailBand = tailKey();
+                    const hereBand = scrollOffset();
+                    const beforeBand = visibleSignature();
+                    const beforeTailBand = tailKey();
+                    const bandBudget = Math.round(vh * BAND_TRAVEL_MAX_VH);
+                    if (bandTravel < bandBudget && scrollRoomBelow() >= 80) {
                         scrollByDelta(FINE_STEP_PX);
                         await waitForLoad(CLOSE_LOAD_WAIT_MS, beforeBand, beforeTailBand);
                         const bandMoved = Math.abs(scrollOffset() - hereBand) >= 24
                             || visibleSignature() !== beforeBand
                             || tailKey() !== beforeTailBand;
-                        if (bandMoved && scrollRoomBelow() >= 80) {
+                        if (bandMoved) {
+                            bandTravel += Math.abs(scrollOffset() - hereBand);
                             bandMisses = 0;
                             emptyWaits = 0;
                             lastY = scrollOffset();
-                            continue;
+                            if (bandTravel < bandBudget) continue;
+                        } else {
+                            bandMisses += 1;
+                            if (bandMisses < 3) continue;
                         }
-                        bandMisses += 1;
-                        if (bandMisses < 3) continue;
+                    }
+                    if (!orderedKeys.length) {
                         const settled = await settleOnNearest(gen, true);
                         if (settled === 'abort') return;
                         if (settled === 'nearest' && reportMiss) showPopup('tweetIdNotFound', 5000);
-                        if (!settled) log('Search', 'Lesestelle nicht in der Nähe, gespeicherte Stelle bleibt');
-                        if (gen === generation) finishFlow(gen);
+                        if (!settled) keepSaved('Lesestelle nicht in der Nähe, gespeicherte Stelle bleibt');
+                        else if (gen === generation) finishFlow(gen);
                         return;
                     }
-                }
-                if (passedVisits > 0 && !spanStillNewer(ageSpan())) {
-                    const foundBack = await scanForBookmark(gen, -1, Math.max(lastJump, Math.round(vhNow * SEARCH_JUMP_VH)));
-                    if (!still()) break;
-                    if (foundBack) {
-                        const outcome = await centerExact(foundBack);
-                        if (outcome === 'abort') return;
-                        if (outcome === 'retry' || outcome === 'gone') continue;
-                        finishFlow(gen);
-                        log('Search', 'Lesestelle oberhalb ausgerichtet');
-                        return;
+                    if (scrollRoomBelow() < 80) {
+                        recoverKnown = true;
+                        break;
                     }
-                    if (seekZone(ageSpan()) === 'passed') continue;
-                    log('Search', 'Nicht weiter in die Vergangenheit, gespeicherte Lesestelle bleibt');
-                    if (gen === generation) finishFlow(gen);
+                    keepSaved('Lesestelle nicht in der Nähe, gespeicherte Stelle bleibt');
                     return;
                 }
                 bandMisses = 0;
@@ -2537,8 +2538,7 @@
             if (!still()) return;
             if (orderedKeys.length && (recoverKnown || scrollRoomBelow() < 80)) {
                 if (!recoverKnown && passedDepthMs(ageSpan()) > NEAR_ZONE_MS) {
-                    log('Search', 'Zu weit unter der Lesestelle, gespeicherte Stelle bleibt');
-                    if (gen === generation) finishFlow(gen);
+                    keepSaved('Zu weit unter der Lesestelle, gespeicherte Stelle bleibt');
                     return;
                 }
                 log('Search', 'Lesestelle fehlt, obersten bekannten Post markieren');
@@ -2572,26 +2572,23 @@
                     if (gen === generation) finishFlow(gen);
                     return;
                 }
-                log('Search', 'Lesestelle fehlt, kein bekannter Post, gespeicherte Stelle bleibt');
-                if (gen === generation) finishFlow(gen);
+                keepSaved('Lesestelle fehlt, kein bekannter Post, gespeicherte Stelle bleibt');
                 return;
             }
             if (orderedKeys.length) {
-                log('Search', 'Suche beendet, gespeicherte Lesestelle bleibt');
-                if (gen === generation) finishFlow(gen);
+                keepSaved('Suche beendet, gespeicherte Lesestelle bleibt');
                 return;
             }
             const zoneNow = seekZone(ageSpan());
             if (zoneNow !== 'band' || spanStillNewer(ageSpan())) {
-                log('Search', 'Suche beendet, gespeicherte Lesestelle bleibt');
-                if (gen === generation) finishFlow(gen);
+                keepSaved('Suche beendet, gespeicherte Lesestelle bleibt');
                 return;
             }
             const settled = await settleOnNearest(gen, true);
             if (settled === 'abort') return;
             if (settled === 'nearest' && reportMiss) showPopup('tweetIdNotFound', 5000);
-            if (!settled) log('Search', 'Suche beendet ohne Ersatz');
-            if (gen === generation) finishFlow(gen);
+            if (!settled) keepSaved('Suche beendet ohne Ersatz');
+            else if (gen === generation) finishFlow(gen);
         } finally {
             releaseAnchor();
             if (gen === generation && phase === 'seek') finishFlow(gen);
@@ -3021,7 +3018,7 @@
         await loadStoredBookmark();
         const account = readUserHandleFromNav() || cachedUserHandle;
         if (isPlausibleUserHandle(account)) bootedAccount = account;
-        log('Init', 'Lesestelle 2026.10.25g');
+        log('Init', 'Lesestelle 2026.10.25h');
         syncTab('boot');
         if (readingOn()) armNewPostCheck('start');
         showBookmark();
