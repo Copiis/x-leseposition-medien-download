@@ -15,7 +15,7 @@
 // @description:ko Twitter/X에서 마지막 읽기 위치를 추적하고 동기화합니다. 수동 및 자동 옵션 포함. 새로운 게시물을 확인하면서 현재 위치를 잃지 않도록 이상적입니다. 트윗 ID를 사용하여 정확한 위치 지정을 하고, 리포스트를 지원합니다。
 // @icon https://x.com/favicon.ico
 // @namespace https://github.com/Copiis/x-leseposition-medien-download
-// @version 2026.10.25i
+// @version 2026.11.18b
 // @author Copiis
 // @license MIT
 // @match https://x.com/*
@@ -1272,6 +1272,7 @@
         let moved = 0;
         while (moved < maxPx) {
             if (gen !== generation || seekCancel || !readingOn()) return null;
+            if (await openMorePostsCell(gen)) continue;
             const exact = findArticle(bookmark);
             if (exact) return exact;
             const here = scrollOffset();
@@ -1384,6 +1385,8 @@
     let pillClicks = 0;
     let pillClickLabel = '';
     let pillClickedAt = 0;
+    let morePostsClicks = 0;
+    let morePostsClickedAt = 0;
     let followingTab = null;
     let followingArmAt = 0;
     let autoDownloadEnabled = false;
@@ -1871,6 +1874,8 @@
         const matches = (text) => {
             const normalized = (text || '').toLowerCase().replace(/\s+/g, ' ').trim();
             if (!normalized || normalized.length > 80) return false;
+            // „Weitere Posts anzeigen“ ist die mitscrollende Zelle, nicht die obere Pille.
+            if (MORE_POSTS_LABELS.has(normalized)) return false;
             return pattern.test(normalized) && !exclude.test(normalized) && !gap.test(normalized);
         };
         const smallTop = (host) => {
@@ -1922,6 +1927,98 @@
         return null;
     }
 
+    // Nach langem Hintergrund zeigt X den blauen Text „Weitere Posts anzeigen“.
+    // Der sitzt oft als Fläche in der Timeline, nicht als kleine Pille ganz oben.
+    // Gleicher Ablauf wie neue Beiträge: klicken, laden, Lesestelle suchen und zentrieren.
+    const MORE_POSTS_LABELS = new Set([
+        'weitere posts anzeigen',
+        'weitere beiträge anzeigen',
+        'mehr posts anzeigen',
+        'show more posts',
+        'see more posts'
+    ]);
+
+    function morePostsBlue(host) {
+        if (!host) return false;
+        const styleAttr = host.getAttribute && host.getAttribute('style') || '';
+        if (styleAttr.indexOf('29, 155, 240') !== -1 || styleAttr.indexOf('29,155,240') !== -1) return true;
+        try {
+            const style = getComputedStyle(host);
+            const color = (style.color || '').replace(/\s+/g, '');
+            const background = (style.backgroundColor || '').replace(/\s+/g, '');
+            if (color === 'rgb(29,155,240)' || color.indexOf('rgba(29,155,240,') === 0) return true;
+            if (background === 'rgb(29,155,240)' || background.indexOf('rgba(29,155,240,') === 0) return true;
+        } catch (e) { /* weiter */ }
+        return false;
+    }
+
+    // Die Fläche ist eine Timeline-Zelle (cellInnerDiv, position absolute, translateY).
+    // Sie scrollt mit dem Feed und ist kein festes Element am oberen Rand.
+    function findMorePosts() {
+        const column = document.querySelector("[data-testid='primaryColumn']") || document.querySelector('main');
+        if (!column) return null;
+        const buttons = column.querySelectorAll('[data-testid="cellInnerDiv"] button, [data-testid="cellInnerDiv"] [role="button"]');
+        const vh = window.innerHeight || 800;
+        let best = null;
+        let bestDist = Infinity;
+        for (const button of buttons) {
+            if (button.closest('article')) continue;
+            if (!pillHostIsShown(button)) continue;
+            const raw = (button.innerText || button.textContent || '')
+                .replace(/[\u200b\u200c\u200d\ufeff]/g, '')
+                .replace(/\s+/g, ' ')
+                .trim();
+            if (!MORE_POSTS_LABELS.has(raw.toLowerCase())) continue;
+            const blueNode = button.querySelector('[style*="29, 155, 240"], [style*="29,155,240"]');
+            let blue = !!blueNode || morePostsBlue(button);
+            if (!blue) {
+                const labelled = button.querySelectorAll('div, span');
+                for (const node of labelled) {
+                    if (morePostsBlue(node)) {
+                        blue = true;
+                        break;
+                    }
+                }
+            }
+            if (!blue) continue;
+            const rect = button.getBoundingClientRect();
+            if (rect.width < 40 || rect.height < 12) continue;
+            const dist = rect.bottom < 0 ? -rect.bottom : (rect.top > vh ? rect.top - vh : 0);
+            if (dist < bestDist) {
+                bestDist = dist;
+                best = { host: button, text: raw, more: true };
+            }
+        }
+        return best;
+    }
+
+    // Klick während der Suche. Die laufende Suche bleibt, die Zelle lädt die fehlenden Posts.
+    async function openMorePostsCell(gen) {
+        if (gen !== generation || seekCancel || !readingOn()) return false;
+        const pill = findMorePosts();
+        if (!pill) {
+            if (Date.now() - morePostsClickedAt >= PILL_RETRY_MS) morePostsClicks = 0;
+            return false;
+        }
+        if (morePostsClicks >= 8) return false;
+        if (Date.now() - morePostsClickedAt < 1200) return false;
+        morePostsClicks += 1;
+        morePostsClickedAt = Date.now();
+        const before = visibleSignature();
+        const beforeTail = tailKey();
+        log('NewPosts', 'Weitere Posts', pill.text);
+        try {
+            pill.host.click();
+        } catch (e) {
+            log('NewPosts', 'Klick fehlgeschlagen', e);
+        }
+        if (gen !== generation || seekCancel || !readingOn()) return false;
+        const changed = await waitForLoad(800, before, beforeTail);
+        if (gen !== generation || seekCancel || !readingOn()) return false;
+        if (changed) await waitForSignatureSettle(700);
+        return true;
+    }
+
     function tryPill() {
         if (!readingOn()) return;
         // Suche und Pille laufen zu Ende. Eine zweite Pille bricht das Wiederfinden nicht ab.
@@ -1929,8 +2026,10 @@
         const watch = Date.now() < pillWatchUntil;
         // Im Leerlauf nur ganz oben. Nach Fokus liegt die Pille am Viewport,
         // auch wenn die Timeline weiter unten steht.
-        if (!watch && !atTop()) return;
-        const pill = findPill();
+        // „Weitere Posts anzeigen“ gilt auch weiter unten und ohne Fokus-Fenster.
+        let pill = null;
+        if (watch || atTop()) pill = findPill();
+        if (!pill) pill = findMorePosts();
         if (!pill) {
             if (Date.now() - pillClickedAt >= PILL_RETRY_MS) {
                 pillClicks = 0;
@@ -2048,6 +2147,7 @@
         log('Search', 'Unter dem Fallback noch nach der Lesestelle sehen');
         while (advanced < FALLBACK_LOOKAHEAD_POSTS && moved < cap) {
             if (gen !== generation || seekCancel || !readingOn()) return 'abort';
+            if (await openMorePostsCell(gen)) continue;
             const exact = findArticle(bookmark);
             if (exact) return exact;
             const here = scrollOffset();
@@ -2338,6 +2438,7 @@
         try {
             for (let step = 0; step < SEARCH_MAX_STEPS; step += 1) {
                 if (!still()) break;
+                if (await openMorePostsCell(gen)) continue;
                 const exact = findArticle(bookmark);
                 if (exact) {
                     const outcome = await centerExact(exact);
@@ -3072,7 +3173,7 @@
         await loadStoredBookmark();
         const account = readUserHandleFromNav() || cachedUserHandle;
         if (isPlausibleUserHandle(account)) bootedAccount = account;
-        log('Init', 'Lesestelle 2026.10.25i');
+        log('Init', 'Lesestelle 2026.11.18b');
         syncTab('boot');
         if (readingOn()) armNewPostCheck('start');
         showBookmark();
